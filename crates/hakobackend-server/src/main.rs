@@ -712,6 +712,13 @@ async fn create(
             }
             let db = s.db.read().await.clone();
             let _ = db.ensure_collection(&collection).await;
+            // Atomics collapse (legacy parity) + createdAt/updatedAt stamping.
+            let incoming = Doc {
+                id: incoming.id,
+                data: hakobackend_core::atomics::stamp_new(
+                    hakobackend_core::atomics::resolve_for_create(incoming.data),
+                ),
+            };
             match db.insert(&collection, incoming).await {
                 Ok(doc) => Json(serde_json::to_value(doc).unwrap()).into_response(),
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
@@ -754,8 +761,30 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
                 return forbidden();
             }
+            // Legacy parity: PATCH on a missing doc is 404 (use PUT to create).
+            if merge && existing.is_none() {
+                return err(StatusCode::NOT_FOUND, "Document not found");
+            }
             let _ = db.ensure_collection(&collection).await;
-            match db.set(&collection, &id, incoming_doc(&id, body), merge).await {
+            let created_at = existing.as_ref().and_then(|d| d.data.get("createdAt").cloned());
+            let is_new = existing.is_none();
+            let body = incoming_doc(&id, body).data;
+            let data = if merge {
+                hakobackend_core::atomics::apply_update(
+                    existing.map(|d| d.data).unwrap_or_default(),
+                    body,
+                )
+            } else {
+                hakobackend_core::atomics::resolve_for_create(body)
+            };
+            // New doc (PUT-create): both stamps. Rewrite: preserve createdAt.
+            let data = if is_new {
+                hakobackend_core::atomics::stamp_new(data)
+            } else {
+                hakobackend_core::atomics::stamp_update(data, created_at)
+            };
+            // Merge already applied above; store the final body as-is.
+            match db.set(&collection, &id, Doc { id: id.clone(), data }, false).await {
                 Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -853,6 +882,7 @@ async fn run_ops(
         body: BatchOpBody,
         id: String,
         existed: bool,
+        existing: Option<Doc>,
     }
     let mut gated = Vec::with_capacity(ops.len());
     for op in ops {
@@ -872,7 +902,7 @@ async fn run_ops(
             ));
         }
         let _ = db.ensure_collection(&op.collection).await;
-        gated.push(Gated { body: op, id, existed });
+        gated.push(Gated { body: op, id, existed, existing });
     }
     // Phase 2: one atomic transaction.
     if !db.capabilities().supports_transactions {
@@ -882,33 +912,51 @@ async fn run_ops(
             "bad-request",
         ));
     }
+    // Phase 2: one atomic transaction. Put bodies are preprocessed first
+    // (atomics + stamps, same as the single-write paths), so drivers store
+    // exactly what they receive — no second merge inside the tx.
     let tx_ops: Vec<TxOp> = gated
         .iter()
         .map(|g| {
             let t = g.body.op_type.to_ascii_lowercase();
+            let merge = match t.as_str() {
+                "add" | "update" => true,
+                "set" => g.body.options.as_ref().is_some_and(|o| o.merge),
+                _ => g.existed,
+            };
+            let raw = g.body.data.as_ref().map(|v| incoming_doc(&g.id, v.clone()).data).unwrap_or_default();
+            let created_at = g.existing.as_ref().and_then(|d| d.data.get("createdAt").cloned());
+            let data = if t == "get" || t == "delete" {
+                raw
+            } else if merge {
+                hakobackend_core::atomics::stamp_update(
+                    hakobackend_core::atomics::apply_update(
+                        g.existing.as_ref().map(|d| d.data.clone()).unwrap_or_default(),
+                        raw,
+                    ),
+                    created_at,
+                )
+            } else if g.existed {
+                hakobackend_core::atomics::stamp_update(
+                    hakobackend_core::atomics::resolve_for_create(raw),
+                    created_at,
+                )
+            } else {
+                // Brand-new doc inside the batch: both stamps, like POST.
+                hakobackend_core::atomics::stamp_new(hakobackend_core::atomics::resolve_for_create(raw))
+            };
             let kind = match t.as_str() {
                 "get" => TxOpKind::Read,
                 "delete" => TxOpKind::Delete,
-                "add" => TxOpKind::Put { merge: true, must_exist: false },
-                "set" => TxOpKind::Put {
-                    merge: g.body.options.as_ref().is_some_and(|o| o.merge),
-                    must_exist: false,
-                },
-                "update" => TxOpKind::Put { merge: true, must_exist: true },
-                _ if is_tx => {
-                    if g.existed {
-                        TxOpKind::Put { merge: true, must_exist: true }
-                    } else {
-                        TxOpKind::Put { merge: false, must_exist: false }
-                    }
-                }
+                "update" => TxOpKind::Put { merge: false, must_exist: true },
+                _ if is_tx && g.existed && t != "set" && t != "add" => TxOpKind::Put { merge: false, must_exist: true },
                 _ => TxOpKind::Put { merge: false, must_exist: false },
             };
             TxOp {
                 collection: g.body.collection.clone(),
                 id: g.id.clone(),
                 kind,
-                doc: g.body.data.as_ref().map(|v| incoming_doc(&g.id, v.clone())),
+                doc: Some(Doc { id: g.id.clone(), data }),
             }
         })
         .collect();
@@ -1630,6 +1678,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res[0].get("age"), Some(&serde_json::json!(1)));
+
+        // Atomics + stamps flow through batch writes (legacy __type__ wire).
+        let res = run_ops(
+            &db,
+            &policy,
+            None,
+            vec![batch_op(
+                "update",
+                "w",
+                "a",
+                serde_json::json!({
+                    "age": {"__type__": "increment", "n": 5},
+                    "nick": {"__type__": "serverTimestamp"},
+                    "gone": {"__type__": "deleteField"},
+                    "profile.city": "bdg",
+                }),
+            )],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res[0].get("success"), Some(&serde_json::json!(true)));
+        let a = db.get("w", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("age"), Some(&serde_json::json!(6)));
+        assert!(a.data.get("nick").and_then(|v| v.as_str()).is_some());
+        assert!(!a.data.contains_key("gone"));
+        assert_eq!(
+            a.data.get("profile"),
+            Some(&serde_json::json!({"city": "bdg"})),
+        );
+        assert!(a.data.get("createdAt").and_then(|v| v.as_str()).is_some());
+        assert!(a.data.get("updatedAt").and_then(|v| v.as_str()).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

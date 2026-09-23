@@ -16,7 +16,7 @@ must produce exactly the same behavior.
 | `GET /api/collections` | — (ungated) | `list_collections` | 200 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
-| `PATCH` document | Update | `set(merge=true)` = shallow merge | 200 / 400 |
+| `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
 | `DELETE` document | Delete | `delete` (returns prev) | 200 / 400 |
 | `POST /api/batch {operations[]}` | per-op (see §8) | one `run_transaction` (atomic) | 200 / 400 / 500 `{error}` |
 | `POST /api/transaction {operations[]}` | per-op (see §8) | one `run_transaction` (atomic) | 200 / 400 / mapped `{error, code}` |
@@ -55,8 +55,24 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
 - Legacy-shim exception: a collection genuinely named `index` as the
   last segment is NOT hijacked — use the new `/api/indexes` form.
 
-## 4. Universal query (`?options=` JSON)
+## 4. FieldValue atomics + stamps (legacy `__type__` wire, unchanged)
 
+A value of `{"__type__": <op>, ...}` is a sentinel, resolved gateway-side
+for every driver. Top-level update keys may be dot-paths (`"a.b.c"`).
+
+| Sentinel | Create/replace | Merge (PATCH) |
+|---|---|---|
+| `{"__type__":"serverTimestamp"}` | ISO-8601 UTC now | set to now |
+| `{"__type__":"increment","n":2}` | `2` | current + 2 (ints stay integral) |
+| `{"__type__":"arrayUnion","elements":[...]}` | the elements | append missing (JSON deep-equal) |
+| `{"__type__":"arrayRemove","elements":[...]}` | `[]` | remove matching (JSON deep-equal) |
+| `{"__type__":"deleteField"}` | key dropped | key removed (dot-path aware) |
+
+Nested sentinels (inside objects/arrays of plain values) resolve deep.
+Every create stamps `createdAt` + `updatedAt` (user values win); every
+rewrite preserves `createdAt` and refreshes `updatedAt` (ISO-8601 UTC).
+
+## 5. Universal query (`?options=` JSON)
 `filters[]` (`field`, `op`, `value`), `fields[]`, `orderBy[]`, `limit`, `offset` (new, HakoDB-style),
 `startAt/startAfter/endAt/endBefore`. Wire operators = legacy symbolic
 (`== != > < >= <= array-contains array-contains-any in`) — word forms
@@ -68,14 +84,14 @@ yet contract (future reserve). Reference semantics:
 native drivers translate, the rest emulate with the same helpers
 (identical results).
 
-## 5. Auth & admin
+## 6. Auth & admin
 
 `Authorization: Bearer …` else `__Host-ub_at` cookie → `Extension<Option<AuthContext>>`.
 No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_CONTRACT).
 `/api/admin/reload` is locked behind `--admin-role`.
 `/api/auth/*` see AUTH_CONTRACT (local BFF, GitHub OAuth, DPoP).
 
-## 6. Realtime (WS + SSE)
+## 7. Realtime (WS + SSE)
 
 - `GET /ws` (upgrade): `subscribe{key, collection, options?, group?, token?}`,
   `unsubscribe{key}`, `ping`, `auth{token}` messages; `ready{key}`,
@@ -90,7 +106,7 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
   (one list per collection per 2 s tick no matter the watcher count;
   single-instance; Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
 
-## 7. TLS
+## 8. TLS
 
 `--tls-cert/--tls-key` (PEM, both required) → rustls + HSTS
 (`max-age=31536000; includeSubDomains`). DPoP `htu` scheme + `Secure` cookies

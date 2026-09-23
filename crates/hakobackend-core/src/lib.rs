@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub mod atomics;
+
 // --- Document: id + flexible fields (schemaless, like Firestore) ---
 
 /// One document: identical to the JSON shape used by the legacy wire protocol
