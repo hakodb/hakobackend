@@ -154,10 +154,18 @@ impl LocalAuth {
     }
 
     fn ctx_of(&self, uid: &str, doc: &Doc) -> AuthContext {
+        // Tenant comes from the admin-managed user doc (never from login
+        // input); invalid slugs are dropped so they can never namespace.
+        let tenant = doc
+            .data
+            .get("tenant")
+            .and_then(|v| v.as_str())
+            .filter(|t| hakobackend_core::tenant::is_valid_tenant_slug(t))
+            .map(str::to_string);
         AuthContext {
             uid: uid.into(),
             roles: self.identity.roles_of(doc),
-            tenant: None,
+            tenant,
             extra: match doc.data.get("email").and_then(|v| v.as_str()) {
                 Some(e) => [("email".to_string(), serde_json::Value::String(e.into()))].into_iter().collect(),
                 None => HashMap::new(),

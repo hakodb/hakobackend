@@ -15,6 +15,8 @@ must produce exactly the same behavior.
 | `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
 | `GET /api/collections` | — (ungated) | `list_collections` | 200 |
 | `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
+| `POST /api/tenants {slug}` | admin role | `insert` into `__tenants` (conflict = taken) | 200 / 400 / 403 |
+| `GET /api/tenants` | admin role | list `__tenants` ids | 200 / 403 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
@@ -110,7 +112,6 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
   single-instance; Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
 
 ## 8. TLS
-
 `--tls-cert/--tls-key` (PEM, both required) → rustls + HSTS
 (`max-age=31536000; includeSubDomains`). DPoP `htu` scheme + `Secure` cookies
 follow automatically. Neither = plain http. Port/listen changes need a restart
@@ -122,3 +123,22 @@ follow automatically. Neither = plain http. Port/listen changes need a restart
   `/ws` — compression would buffer flushes and add event latency).
 - Ctrl+C / SIGTERM drains in-flight requests before sockets close
   (TLS and plain paths alike); subscriptions abort with their tasks.
+
+## 10. Tenants (prefix design)
+
+One backend serves many consumers: tenant `acme` reads/writes `users`,
+stored as `acme__users`. The prefix comes ONLY from the authenticated
+identity (`AuthContext.tenant`, e.g. the `tenant` field on local user
+docs) — never from client input; no tenant = legacy unprefixed namespace.
+
+- Slugs: `^[a-z0-9][a-z0-9-]{0,62}$` (no underscore, so `__` unambiguously
+  marks scoped names). Provision via `POST /api/tenants` (admin);
+  uniqueness is structural (`insert` conflicts when taken).
+- Policy is evaluated on LOGICAL names: one file serves all tenants.
+  Applies uniformly to CRUD, batch/transaction, indexes, aggregates,
+  collection groups, and WS/SSE subscriptions.
+- Internal `__*` collections (incl. `__tenants`) are never addressable
+  over HTTP, even under an open policy.
+- Scaling note: collections multiply by tenant count (lazy-created, no
+  per-collection background work). Comfortable into the low thousands;
+  beyond that, split backends per tenant.

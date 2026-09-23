@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub mod atomics;
+pub mod tenant;
 
 // --- Document: id + flexible fields (schemaless, like Firestore) ---
 
@@ -812,6 +813,17 @@ pub mod conformance {
 
         // 8. subscribe must not error.
         assert!(db.subscribe(&coll).await.is_ok());
+
+        // 8b. Subcollections: slash paths are exact collections — a doc in
+        // `posts/123/revisions` never leaks into `posts` or bare `revisions`.
+        let sub = format!("{coll}/doc1/revisions");
+        db.set(&sub, "r1", mk(serde_json::json!({"t": 1})), false).await.unwrap();
+        assert!(db.get(&sub, "r1").await.unwrap().is_some());
+        let top = db.list(&coll, &q0).await.unwrap();
+        assert!(!top.iter().any(|d| d.id == "r1"), "sub doc must not leak into parent list");
+        let grp = db.list(&sub, &q0).await.unwrap();
+        assert_eq!(grp.len(), 1);
+        db.delete(&sub, "r1").await.unwrap();
 
         // 9. run_transaction: read-your-writes, must_exist, atomic rollback.
         let txc = format!("{coll}_tx");

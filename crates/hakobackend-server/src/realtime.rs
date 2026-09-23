@@ -184,24 +184,44 @@ fn transition(old_match: bool, new_match: bool) -> Option<ChangeKind> {
     }
 }
 
+/// Stored collection name → logical name for policy evaluation.
+fn logical_name<'a>(map: &'a HashMap<String, String>, stored: &'a str) -> &'a str {
+    map.get(stored).map(|s| s.as_str()).unwrap_or(stored)
+}
+
 /// Open subscription: List gate → snapshot → per-collection watch/poll source.
+/// Tenant-aware: gates and group matching run on LOGICAL names; storage and
+/// snapshot keys use STORED (prefixed) names. Tenantless callers keep the
+/// legacy unprefixed namespace.
 pub async fn subscribe(
     db: Arc<dyn Database>,
     policy: Arc<PolicyFile>,
     auth: Option<AuthContext>,
     spec: SubSpec,
 ) -> Result<Subscription, AppError> {
+    use hakobackend_core::tenant;
+    let owned_tenant = tenant::tenant_of(auth.as_ref());
+    let tenant = owned_tenant.as_deref();
     if !policy.allow(auth.as_ref(), &spec.collection, Method::List, None) {
         return Err(AppError::PermissionDenied);
     }
-    let mut collections = if spec.group {
+    // (stored, logical) pairs downstream; policy always sees logical.
+    let pairs: Vec<(String, String)> = if spec.group {
         let all = db.list_collections().await?;
-        all.into_iter().filter(|t| matches_group(t, &spec.collection)).collect::<Vec<_>>()
+        tenant::visible_collections(all, tenant)
+            .into_iter()
+            .filter(|(_, logical)| matches_group(logical, &spec.collection))
+            .collect()
     } else {
-        vec![spec.collection.clone()]
+        let stored = tenant::resolve_collection(tenant, &spec.collection);
+        vec![(stored, spec.collection.clone())]
     };
+    let mut collections: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
+    let mut logical_of: HashMap<String, String> = pairs.into_iter().collect();
     if collections.is_empty() {
-        collections.push(spec.collection.clone());
+        let stored = tenant::resolve_collection(tenant, &spec.collection);
+        logical_of.insert(stored.clone(), spec.collection.clone());
+        collections.push(stored);
     }
     // Initial snapshot (no burst to client — client GETs first like legacy).
     let snap_q = snapshot_options(&spec.options);
@@ -220,7 +240,9 @@ pub async fn subscribe(
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let watch = db.capabilities().supports_watch;
-    let handle = tokio::spawn(run_source(db, policy, auth, spec.options, collections, snapshot, watch, tx));
+    let handle = tokio::spawn(run_source(
+        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx,
+    ));
     Ok(Subscription { rx, handle })
 }
 
@@ -231,10 +253,13 @@ async fn run_source(
     auth: Option<AuthContext>,
     options: QueryOptions,
     collections: Vec<String>,
+    logical_of: HashMap<String, String>,
     mut snapshot: HashMap<String, Doc>,
     watch: bool,
     tx: tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) {
+    // Policy sees logical names; storage/snapshot use stored names.
+    let lf = &logical_of;
     if watch {
         // One stream per collection in a StreamMap: true push (no polling
         // sleep, no added latency), keyed so a lagged collection resyncs
@@ -255,8 +280,17 @@ async fn run_source(
             match map.next().await {
                 // (collection, Ok(change)): normal path.
                 Some((coll, Ok(change))) => {
-                    let sent =
-                        ingest_change(&policy, auth.as_ref(), &options, &mut snapshot, &coll, change, &tx).await;
+                    let sent = ingest_change(
+                        &policy,
+                        auth.as_ref(),
+                        &options,
+                        &mut snapshot,
+                        &coll,
+                        logical_name(lf, &coll),
+                        change,
+                        &tx,
+                    )
+                    .await;
                     // Flood: drop the burst, resync, keep consistency.
                     if sent && gate.observe(1) {
                         resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
@@ -286,7 +320,7 @@ async fn run_source(
             match map.next().await {
                 Some((coll, Ok(docs))) => {
                     let sent =
-                        apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, {
+                        apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, &logical_of, {
                             let mut fresh: HashMap<String, Doc> = HashMap::new();
                             for doc in docs {
                                 fresh.insert(format!("{coll}\0{}", doc.id), doc);
@@ -314,12 +348,14 @@ async fn run_source(
 
 /// Diff a fresh full-state list against the subscription snapshot,
 /// delivering Add/Change/Remove per the subscription's own filters.
+/// Snapshot keys are stored names; policy sees logical names.
 /// Returns the number of delivered events (for the flood guard).
 async fn apply_diff(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
     options: &QueryOptions,
     snapshot: &mut HashMap<String, Doc>,
+    logical_of: &HashMap<String, String>,
     fresh: HashMap<String, Doc>,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) -> u64 {
@@ -330,7 +366,7 @@ async fn apply_diff(
         let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
         let new_match = matches_full(doc, options);
         if old.map(|d| &d.data) != Some(&doc.data) || !old_match || !new_match {
-            if deliver_in(policy, auth, coll, old, Some(doc), old_match, new_match, tx).await {
+            if deliver_in(policy, auth, logical_name(logical_of, coll), old, Some(doc), old_match, new_match, tx).await {
                 sent += 1;
             }
         }
@@ -339,7 +375,7 @@ async fn apply_diff(
         if !fresh.contains_key(key) {
             let coll = key.split('\0').next().unwrap_or("");
             if matches_full(old, options) {
-                if deliver_in(policy, auth, coll, Some(old), None, true, false, tx).await {
+                if deliver_in(policy, auth, logical_name(logical_of, coll), Some(old), None, true, false, tx).await {
                     sent += 1;
                 }
             }
@@ -350,13 +386,16 @@ async fn apply_diff(
 }
 
 /// Apply one watch change to the snapshot + send on match.
-/// Returns true when an event was actually delivered.
+/// `collection` is the stored name (snapshot keys); `policy_coll` is the
+/// logical name policy rules are written against. Returns true when an
+/// event was actually delivered.
 async fn ingest_change(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
     options: &QueryOptions,
     snapshot: &mut HashMap<String, Doc>,
     collection: &str,
+    policy_coll: &str,
     change: hakobackend_core::Change,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) -> bool {
@@ -366,7 +405,7 @@ async fn ingest_change(
         ChangeKind::Remove => {
             if let Some(old) = snapshot.remove(&key) {
                 if matches_full(&old, options) {
-                    return deliver_in(policy, auth, collection, Some(&old), None, true, false, tx).await;
+                    return deliver_in(policy, auth, policy_coll, Some(&old), None, true, false, tx).await;
                 }
             }
             false
@@ -377,7 +416,7 @@ async fn ingest_change(
                 let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
                 let new_match = matches_full(&doc, options);
                 let sent =
-                    deliver_in(policy, auth, collection, old, Some(&doc), old_match, new_match, tx).await;
+                    deliver_in(policy, auth, policy_coll, old, Some(&doc), old_match, new_match, tx).await;
                 snapshot.insert(key, doc);
                 return sent;
             }

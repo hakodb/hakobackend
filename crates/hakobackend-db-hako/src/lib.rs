@@ -187,6 +187,12 @@ impl Database for HakoDb {
         if doc.id.is_empty() {
             doc.id = uuid_like();
         }
+        // Contract: explicit id that already exists = AlreadyExists (matches
+        // the SQL drivers' ON CONFLICT DO NOTHING). Structural uniqueness
+        // (e.g. tenant provisioning) depends on this.
+        if self.get(collection, &doc.id).await?.is_some() {
+            return Err(AppError::AlreadyExists);
+        }
         self.set(collection, &doc.id.clone(), doc, false).await
     }
 

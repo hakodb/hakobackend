@@ -216,6 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/transaction", post(transaction))
         .route("/api/collectionGroup/{name}", get(collection_group))
         .route("/api/aggregate/{*path}", post(aggregate))
+        .route("/api/tenants", post(tenant_create).get(tenant_list))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler))
@@ -511,6 +512,26 @@ fn err_code(status: StatusCode, msg: impl ToString, code: &str) -> Response {
         .into_response()
 }
 
+/// Caller tenant from identity only (never client input); None = legacy ns.
+fn caller_tenant(auth: Option<&AuthContext>) -> Option<String> {
+    hakobackend_core::tenant::tenant_of(auth)
+}
+
+/// Logical path → stored name for this caller.
+fn stored(tenant: Option<&str>, logical: &str) -> String {
+    hakobackend_core::tenant::resolve_collection(tenant, logical)
+}
+
+/// Internal collections (`__*`, incl. `__tenants`) are never addressable
+/// over HTTP — fail-closed even under an open policy (S1 audit).
+fn denied_internal(logical: &str) -> Option<Response> {
+    if logical.split('/').next().is_some_and(|s| s.starts_with("__")) {
+        Some(err(StatusCode::FORBIDDEN, "internal collection"))
+    } else {
+        None
+    }
+}
+
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "db": "hakodb" }))
 }
@@ -558,9 +579,74 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     msg.into_response()
 }
 
-async fn list_collections(State(s): State<AppState>) -> impl IntoResponse {
+async fn list_collections(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> impl IntoResponse {
+    // Tenant callers see their own namespace as logical names; internals
+    // never leak. Tenantless callers keep the legacy full list.
+    let tenant = caller_tenant(auth.as_ref());
     match s.db.read().await.list_collections().await {
-        Ok(c) => Json(serde_json::json!(c)).into_response(),
+        Ok(c) => {
+            let out: Vec<String> = hakobackend_core::tenant::visible_collections(c, tenant.as_deref())
+                .into_iter()
+                .map(|(_, logical)| logical)
+                .collect();
+            Json(serde_json::to_value(out).unwrap()).into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+// --- Tenants (admin): provision + list. Uniqueness is structural —
+// provisioning uses insert (conflict = slug taken). Slugs are validated;
+// the stored prefix is the slug itself, so no two tenants can collide.
+async fn tenant_create(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    let slug = match body.get("slug").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => return err(StatusCode::BAD_REQUEST, "body requires {slug}"),
+    };
+    if !hakobackend_core::tenant::is_valid_tenant_slug(&slug) {
+        return err(StatusCode::BAD_REQUEST, "slug must match ^[a-z0-9][a-z0-9-]{0,62}$");
+    }
+    let db = s.db.read().await.clone();
+    match db
+        .insert(
+            hakobackend_core::tenant::TENANTS_COLLECTION,
+            Doc { id: slug.clone(), data: Default::default() },
+        )
+        .await
+    {
+        Ok(_) => Json(serde_json::json!({ "success": true, "slug": slug })).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+async fn tenant_list(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    match s
+        .db
+        .read()
+        .await
+        .list(hakobackend_core::tenant::TENANTS_COLLECTION, &QueryOptions::default())
+        .await
+    {
+        Ok(docs) => {
+            let slugs: Vec<_> = docs.into_iter().map(|d| d.id).collect();
+            Json(serde_json::to_value(slugs).unwrap()).into_response()
+        }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -580,33 +666,47 @@ async fn get_or_list(
 ) -> impl IntoResponse {
     let policy = s.policy.get().await;
     let db = s.db.read().await.clone();
+    let tenant = caller_tenant(auth.as_ref());
     match parse_collection_path(&path) {
-        PathKind::Document { collection, id } => match db.get(&collection, &id).await {
-            Ok(Some(doc)) => {
-                if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
-                    return forbidden();
-                }
-                Json(serde_json::to_value(doc).unwrap()).into_response()
+        PathKind::Document { collection, id } => {
+            if let Some(r) = denied_internal(&collection) {
+                return r;
             }
-            Ok(None) => err(StatusCode::NOT_FOUND, "Document not found"),
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        },
-        PathKind::Collection { collection } => match parse_options(&q) {
-            Err(msg) => err(StatusCode::BAD_REQUEST, msg),
-            Ok(opts) => match db.list(&collection, &opts).await {
-                // Per-doc filter (replacement for the server.ts:233 loop): documents
-                // failing the rule are excluded from the response, with no extra N+1
-                // queries when drivers push rules into queries (phase 3).
-                Ok(docs) => {
-                    let visible: Vec<_> = docs
-                        .into_iter()
-                        .filter(|d| policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
-                        .collect();
-                    Json(serde_json::to_value(visible).unwrap()).into_response()
+            let stored = stored(tenant.as_deref(), &collection);
+            match db.get(&stored, &id).await {
+                Ok(Some(doc)) => {
+                    if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
+                        return forbidden();
+                    }
+                    Json(serde_json::to_value(doc).unwrap()).into_response()
                 }
+                Ok(None) => err(StatusCode::NOT_FOUND, "Document not found"),
                 Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            },
-        },
+            }
+        }
+        PathKind::Collection { collection } => {
+            if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
+            let stored = stored(tenant.as_deref(), &collection);
+            match parse_options(&q) {
+                Err(msg) => err(StatusCode::BAD_REQUEST, msg),
+                Ok(opts) => match db.list(&stored, &opts).await {
+                    // Per-doc filter (replacement for the server.ts:233 loop): documents
+                    // failing the rule are excluded from the response, with no extra N+1
+                    // queries when drivers push rules into queries (phase 3).
+                    // Policy sees logical names: one file serves all tenants.
+                    Ok(docs) => {
+                        let visible: Vec<_> = docs
+                            .into_iter()
+                            .filter(|d| policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
+                            .collect();
+                        Json(serde_json::to_value(visible).unwrap()).into_response()
+                    }
+                    Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                },
+            }
+        }
     }
 }
 
@@ -662,6 +762,9 @@ async fn index_create_inner(
     collection: String,
     body: serde_json::Value,
 ) -> Response {
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "internal collection");
+    }
     let spec = match parse_index_spec(&body) {
         Ok(spec) => spec,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
@@ -671,8 +774,10 @@ async fn index_create_inner(
         return forbidden();
     }
     let db = s.db.read().await.clone();
-    let _ = db.ensure_collection(&collection).await;
-    match db.create_index(&collection, &spec).await {
+    let tenant = caller_tenant(auth.as_ref());
+    let stored = stored(tenant.as_deref(), &collection);
+    let _ = db.ensure_collection(&stored).await;
+    match db.create_index(&stored, &spec).await {
         Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -687,11 +792,15 @@ async fn index_list(
         Some(c) if !c.is_empty() => c.to_string(),
         _ => return err(StatusCode::BAD_REQUEST, "query ?collection= required"),
     };
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "internal collection");
+    }
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
-    match s.db.read().await.list_indexes(&collection).await {
+    let tenant = caller_tenant(auth.as_ref());
+    match s.db.read().await.list_indexes(&stored(tenant.as_deref(), &collection)).await {
         Ok(indexes) => Json(serde_json::to_value(indexes).unwrap()).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -706,11 +815,15 @@ async fn index_drop(
         (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => (c.clone(), n.clone()),
         _ => return err(StatusCode::BAD_REQUEST, "query ?collection= & ?name= required"),
     };
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "internal collection");
+    }
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
         return forbidden();
     }
-    match s.db.read().await.drop_index(&collection, &name).await {
+    let tenant = caller_tenant(auth.as_ref());
+    match s.db.read().await.drop_index(&stored(tenant.as_deref(), &collection), &name).await {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -735,13 +848,18 @@ async fn create(
         )
             .into_response(),
         PathKind::Collection { collection } => {
+            if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
             let policy = s.policy.get().await;
+            let tenant = caller_tenant(auth.as_ref());
             let incoming = incoming_doc("", body);
             if !policy.allow(auth.as_ref(), &collection, Method::Create, Some(&incoming)) {
                 return forbidden();
             }
             let db = s.db.read().await.clone();
-            let _ = db.ensure_collection(&collection).await;
+            let stored = stored(tenant.as_deref(), &collection);
+            let _ = db.ensure_collection(&stored).await;
             // Atomics collapse (legacy parity) + createdAt/updatedAt stamping.
             let incoming = Doc {
                 id: incoming.id,
@@ -749,7 +867,7 @@ async fn create(
                     hakobackend_core::atomics::resolve_for_create(incoming.data),
                 ),
             };
-            match db.insert(&collection, incoming).await {
+            match db.insert(&stored, incoming).await {
                 Ok(doc) => Json(serde_json::to_value(doc).unwrap()).into_response(),
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -784,9 +902,14 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
         )
             .into_response(),
         PathKind::Document { collection, id } => {
+            if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
             let policy = s.policy.get().await;
             let db = s.db.read().await.clone();
-            let existing = db.get(&collection, &id).await.ok().flatten();
+            let tenant = caller_tenant(auth.as_ref());
+            let stored = stored(tenant.as_deref(), &collection);
+            let existing = db.get(&stored, &id).await.ok().flatten();
             // Owner rule evaluated against the existing document (who owns this data?).
             if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
                 return forbidden();
@@ -795,7 +918,7 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             if merge && existing.is_none() {
                 return err(StatusCode::NOT_FOUND, "Document not found");
             }
-            let _ = db.ensure_collection(&collection).await;
+            let _ = db.ensure_collection(&stored).await;
             let created_at = existing.as_ref().and_then(|d| d.data.get("createdAt").cloned());
             let is_new = existing.is_none();
             let body = incoming_doc(&id, body).data;
@@ -814,7 +937,7 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
                 hakobackend_core::atomics::stamp_update(data, created_at)
             };
             // Merge already applied above; store the final body as-is.
-            match db.set(&collection, &id, Doc { id: id.clone(), data }, false).await {
+            match db.set(&stored, &id, Doc { id: id.clone(), data }, false).await {
                 Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -834,14 +957,19 @@ async fn remove(
         )
             .into_response(),
         PathKind::Document { collection, id } => {
+            if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
             let policy = s.policy.get().await;
             let db = s.db.read().await.clone();
-            let existing = db.get(&collection, &id).await.ok().flatten();
+            let tenant = caller_tenant(auth.as_ref());
+            let stored = stored(tenant.as_deref(), &collection);
+            let existing = db.get(&stored, &id).await.ok().flatten();
             if !policy.allow(auth.as_ref(), &collection, Method::Delete, existing.as_ref()) {
                 return forbidden();
             }
-            let _ = db.ensure_collection(&collection).await;
-            match db.delete(&collection, &id).await {
+            let _ = db.ensure_collection(&stored).await;
+            match db.delete(&stored, &id).await {
                 Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -908,22 +1036,43 @@ async fn run_ops(
 ) -> Result<Vec<serde_json::Value>, (StatusCode, String, &'static str)> {
     use hakobackend_core::{TxOp, TxOpKind};
     // Phase 1: resolve + gate each op (reads tolerate missing tables).
+    // Unknown op types are rejected outright (fail-closed: an unknown type
+    // must never silently become a write, e.g. dodging an Update-deny via
+    // the legacy create-fallback).
+    const KNOWN: &[&str] = &["get", "set", "add", "update", "delete", "create"];
     struct Gated {
         body: BatchOpBody,
         id: String,
         existed: bool,
         existing: Option<Doc>,
+        stored: String,
     }
+    let tenant = caller_tenant(auth);
     let mut gated = Vec::with_capacity(ops.len());
     for op in ops {
+        let t = op.op_type.to_ascii_lowercase();
+        // Transaction maps any other string by existence (legacy compat);
+        // batch is strict.
+        let mapped_unknown = is_tx && !KNOWN.contains(&t.as_str());
+        if !KNOWN.contains(&t.as_str()) && !mapped_unknown {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown op type: {}", op.op_type),
+                "bad-request",
+            ));
+        }
         let id = op
             .id
             .clone()
             .filter(|s| !s.is_empty())
             .ok_or((StatusCode::BAD_REQUEST, "op requires id".to_string(), "bad-request"))?;
-        let existing = db.get(&op.collection, &id).await.ok().flatten();
+        if denied_internal(&op.collection).is_some() {
+            return Err((StatusCode::FORBIDDEN, "internal collection".to_string(), "permission-denied"));
+        }
+        let stored = stored(tenant.as_deref(), &op.collection);
+        let existing = db.get(&stored, &id).await.ok().flatten();
         let existed = existing.is_some();
-        let method = op_method(&op.op_type.to_ascii_lowercase(), existed, is_tx);
+        let method = op_method(&t, existed, is_tx);
         if !policy.allow(auth, &op.collection, method, existing.as_ref()) {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -931,8 +1080,8 @@ async fn run_ops(
                 "permission-denied",
             ));
         }
-        let _ = db.ensure_collection(&op.collection).await;
-        gated.push(Gated { body: op, id, existed, existing });
+        let _ = db.ensure_collection(&stored).await;
+        gated.push(Gated { body: op, id, existed, existing, stored });
     }
     // Phase 2: one atomic transaction.
     if !db.capabilities().supports_transactions {
@@ -983,7 +1132,7 @@ async fn run_ops(
                 _ => TxOpKind::Put { merge: false, must_exist: false },
             };
             TxOp {
-                collection: g.body.collection.clone(),
+                collection: g.stored.clone(),
                 id: g.id.clone(),
                 kind,
                 doc: Some(Doc { id: g.id.clone(), data }),
@@ -1075,19 +1224,20 @@ async fn collection_group(
     };
     let policy = s.policy.get().await;
     let db = s.db.read().await.clone();
+    let tenant = caller_tenant(auth.as_ref());
     let collections = match db.list_collections().await {
         Ok(c) => c,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let mut out = Vec::new();
-    for coll in collections {
-        if !realtime::matches_group(&coll, &name) {
+    for (stored, logical) in hakobackend_core::tenant::visible_collections(collections, tenant.as_deref()) {
+        if !realtime::matches_group(&logical, &name) {
             continue;
         }
-        if !policy.allow(auth.as_ref(), &coll, Method::List, None) {
+        if !policy.allow(auth.as_ref(), &logical, Method::List, None) {
             continue;
         }
-        let docs = match db.list(&coll, &opts).await {
+        let docs = match db.list(&stored, &opts).await {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -1096,7 +1246,7 @@ async fn collection_group(
                 .data
                 .get("_collectionPath")
                 .and_then(|v| v.as_str())
-                .unwrap_or(&coll);
+                .unwrap_or(&logical);
             if policy.allow(auth.as_ref(), doc_coll, Method::Get, Some(&doc)) {
                 out.push(doc);
             }
@@ -1144,11 +1294,16 @@ async fn aggregate(
     if collection.is_empty() {
         return err(StatusCode::BAD_REQUEST, "aggregate needs a collection path");
     }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "internal collection");
+    }
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
     let db = s.db.read().await.clone();
+    let tenant = caller_tenant(auth.as_ref());
+    let stored = stored(tenant.as_deref(), &collection);
     // Aggregates ignore paging (legacy passes options through to count/sum/avg).
     let mut opts = body.options.clone();
     opts.limit = None;
@@ -1161,7 +1316,7 @@ async fn aggregate(
             _ => format!("{t}_{}", agg.field.as_deref().unwrap_or("count")),
         });
         let value = match t.as_str() {
-            "count" => match db.count(&collection, &opts).await {
+            "count" => match db.count(&stored, &opts).await {
                 Ok(n) => serde_json::json!(n),
                 Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
             },
@@ -1170,7 +1325,7 @@ async fn aggregate(
                     Some(f) => f,
                     None => return err(StatusCode::BAD_REQUEST, format!("{t} needs a field")),
                 };
-                let docs = match db.list(&collection, &opts).await {
+                let docs = match db.list(&stored, &opts).await {
                     Ok(d) => d,
                     Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
                 };
@@ -1637,8 +1792,7 @@ mod tests {
     }
 
     #[test]
-    fn op_method_mapping() {
-        use Method::*;
+    fn op_method_mapping() {        use Method::*;
         assert_eq!(op_method("get", false, false), Get);
         assert_eq!(op_method("delete", true, true), Delete);
         assert_eq!(op_method("update", true, false), Update);
@@ -1680,7 +1834,7 @@ mod tests {
             vec![
                 batch_op("set", "w", "a", d(1)),
                 batch_op("add", "w", "b", d(2)),
-                batch_op("bogus", "w", "c", d(3)),
+                batch_op("create", "w", "c", d(3)),
                 batch_op("get", "w", "a", d(0)),
             ],
             false,
@@ -1690,6 +1844,9 @@ mod tests {
         assert_eq!(res.len(), 4);
         assert!(res.iter().all(|r| r.get("success") == Some(&serde_json::json!(true))));
         assert_eq!(res[0].get("id"), Some(&serde_json::json!("a")));
+        // Unknown op types are rejected, never silently created.
+        let bad_type = run_ops(&db, &policy, None, vec![batch_op("bogus", "w", "z", d(0))], false).await;
+        assert!(bad_type.is_err());
 
         // must_exist failure aborts the whole batch (d is untouched).
         let bad = run_ops(
@@ -1740,6 +1897,65 @@ mod tests {
         );
         assert!(a.data.get("createdAt").and_then(|v| v.as_str()).is_some());
         assert!(a.data.get("updatedAt").and_then(|v| v.as_str()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn authed(tenant: Option<&str>) -> Option<AuthContext> {
+        Some(AuthContext {
+            uid: "tester".into(),
+            roles: vec![],
+            tenant: tenant.map(str::to_string),
+            extra: Default::default(),
+        })
+    }
+
+    /// Tenant isolation on sqlite: same logical `users` in two tenants +
+    /// anonymous land in three disjoint namespaces; internal `__tenants`
+    /// is unreachable over the resolved paths.
+    #[tokio::test]
+    async fn tenant_isolation_sqlite() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_tenant_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let d = |v: &str| serde_json::json!({"v": v});
+        let set = |t: Option<&str>, id: &str| {
+            batch_op("set", "users", id, d(t.unwrap_or("anon")))
+        };
+
+        run_ops(&db, &policy, authed(Some("acme")).as_ref(), vec![set(Some("acme"), "a")], false)
+            .await
+            .unwrap();
+        run_ops(&db, &policy, authed(Some("beta")).as_ref(), vec![set(Some("beta"), "a")], false)
+            .await
+            .unwrap();
+        run_ops(&db, &policy, None, vec![set(None, "a")], false).await.unwrap();
+
+        // Stored names are namespaced.
+        assert!(db.get("acme__users", "a").await.unwrap().is_some());
+        assert!(db.get("beta__users", "a").await.unwrap().is_some());
+        // Each tenant reads only its own doc back through run_ops.
+        let ra = run_ops(&db, &policy, authed(Some("acme")).as_ref(), vec![batch_op("get", "users", "a", d(""))], true)
+            .await
+            .unwrap();
+        assert_eq!(ra[0].get("v"), Some(&serde_json::json!("acme")));
+        let rb = run_ops(&db, &policy, authed(Some("beta")).as_ref(), vec![batch_op("get", "users", "a", d(""))], true)
+            .await
+            .unwrap();
+        assert_eq!(rb[0].get("v"), Some(&serde_json::json!("beta")));
+        // Tenant callers cannot address internals, even by stored name.
+        let evil = run_ops(
+            &db,
+            &policy,
+            authed(Some("acme")).as_ref(),
+            vec![batch_op("get", "__tenants", "acme", d(""))],
+            true,
+        )
+        .await;
+        assert!(evil.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
