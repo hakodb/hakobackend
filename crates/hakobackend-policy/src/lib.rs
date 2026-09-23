@@ -196,21 +196,16 @@ impl PolicyFile {
         toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
     }
 
-    /// Collection resolution follows route flexibility (Firestore-style
-    /// "most specific wins", like the old engine in `rules.ts:evaluateRule`):
-    /// exact (`posts/abc/revisions`) → last segment (`revisions`) →
-    /// root (`posts`) → `[defaults]`.
+    /// Collection resolution: exact (`posts/abc/revisions`) → root
+    /// (`posts`) → `[defaults]`. Deliberately NO last-segment fallback: a
+    /// permissive generic rule (e.g. open `revisions`) must never silently
+    /// cover every hierarchy (S3 audit). Name the full path or the root.
     fn find(&self, collection: &str) -> Option<&CollectionPolicy> {
         if let Some(p) = self.collections.get(collection) {
             return Some(p);
         }
         if collection.contains('/') {
             let segments: Vec<&str> = collection.split('/').collect();
-            if let Some(last) = segments.last() {
-                if let Some(p) = self.collections.get(*last) {
-                    return Some(p);
-                }
-            }
             if let Some(root) = segments.first() {
                 if let Some(p) = self.collections.get(*root) {
                     return Some(p);
@@ -337,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn hierarchy_exact_last_root() {
+    fn hierarchy_exact_root() {
         let p = policy(
             r#"
             [defaults]
@@ -351,10 +346,11 @@ mod tests {
             read = "public"
             "#,
         );
-        // exact wins over the last segment
+        // exact wins over everything
         assert!(p.allow(None, "posts/p1/revisions", Method::Get, None));
-        // last segment wins over root
-        assert!(!p.allow(None, "posts/p9/revisions", Method::Get, None));
+        // NO last-segment fallback (S3 audit): a generic `revisions` rule
+        // must not silently cover hierarchies — root `posts` applies instead.
+        assert!(p.allow(None, "posts/p9/revisions", Method::Get, None));
         assert!(p.allow(Some(&auth("u1")), "posts/p9/revisions", Method::Get, None));
         // root for subcollections without their own rule
         assert!(p.allow(None, "posts/p1/comments", Method::Get, None));
@@ -363,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_milik_user() {
+    fn identity_user_owned() {
         // Free-form roles (not reserved names), custom users_collection & fields.
         let p: PolicyFile = toml::from_str(
             r#"

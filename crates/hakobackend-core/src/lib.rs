@@ -155,10 +155,36 @@ pub fn parse_collection_path(raw: &str) -> PathKind {
     }
 }
 
+/// Collection path charset: segments of `[A-Za-z0-9_-]`, 1–128 chars each,
+/// no `.`/`..`/empty/control segments. Kills table-flood (10 KB names) and
+/// path-traversal probes at the HTTP edge; drivers never see hostile names.
+pub fn valid_collection_path(s: &str) -> bool {
+    if s.is_empty() || s.len() > 1024 {
+        return false;
+    }
+    let mut segs = 0;
+    for seg in s.split('/').filter(|x| !x.is_empty()) {
+        segs += 1;
+        if seg.len() > 128
+            || seg == "."
+            || seg == ".."
+            || !seg.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        {
+            return false;
+        }
+    }
+    segs > 0
+}
+
+/// Document id charset: anything except `/`, control chars, and emptiness
+/// (≤512 chars). Unicode ids stay legal; traversal is impossible.
+pub fn valid_doc_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 512 && !s.bytes().any(|c| c == b'/' || c < 0x20 || c == 0x7f)
+}
+
 /// `posts/123/revisions` -> `posts_revisions` (ported from `getFlatTableName`).
 /// SQL drivers use this; HakoDB uses the original hierarchical path.
-pub fn flat_table_name(collection_path: &str) -> String {
-    if !collection_path.contains('/') {
+pub fn flat_table_name(collection_path: &str) -> String {    if !collection_path.contains('/') {
         return collection_path.to_string();
     }
     collection_path

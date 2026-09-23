@@ -22,12 +22,13 @@ Implementation: `crates/hakobackend-policy` + `policy.toml` (hot-reload). Ready-
 ```
 method slot (get/list/create/update/delete)
   → alias read (get/list) / write (create/update/delete)
-    → exact collection → last segment → root → [defaults] → deny
+    → exact collection → root → [defaults] → deny
 ```
 
 Example: `posts/p1/revisions` uses the `posts/p1/revisions` rules; when absent
-falls back to `revisions`, then `posts`, then defaults.
-(Same semantics as the legacy engine's `rules.ts:evaluateRule`.)
+falls back to `posts`, then defaults. There is deliberately NO last-segment
+fallback: a permissive generic rule must never silently cover hierarchies
+(S3 audit) — name the full path or the root.
 
 ## 3. Roles & user collections: user-owned, not core
 

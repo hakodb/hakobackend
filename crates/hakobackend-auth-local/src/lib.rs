@@ -385,7 +385,7 @@ impl LocalAuth {
         let v = dpop::verify_proof(proof, method, uri, Some(access_token))
             .map_err(|_| AppError::PermissionDenied)?;
         if let Some(exp) = expected_jkt {
-            if v.jkt != exp {
+            if !timing_safe_eq(&v.jkt, exp) {
                 return Err(AppError::PermissionDenied);
             }
         }
@@ -493,6 +493,12 @@ fn rand_hex(nbytes: usize) -> String {
 }
 
 async fn hash_password(password: String) -> Result<String, AppError> {
+    // Argon2id (~19 MiB, t=2) is deliberately CPU/RAM-heavy: cap concurrent
+    // hashes process-wide so a login flood can't saturate the pool (the
+    // per-IP rate limit is the first line; this is the second).
+    static HASH_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let sem = HASH_SEM.get_or_init(|| tokio::sync::Semaphore::new(4));
+    let _permit = sem.acquire().await.map_err(|_| AppError::Internal("hash failed".into()))?;
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
         Argon2::default()
@@ -505,6 +511,13 @@ async fn hash_password(password: String) -> Result<String, AppError> {
 }
 
 async fn verify_password(password: String, hash: String) -> bool {
+    // Same semaphore as hashing: verification burns identical CPU.
+    static VERIFY_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let sem = VERIFY_SEM.get_or_init(|| tokio::sync::Semaphore::new(8));
+    let _permit = match sem.acquire().await {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
     tokio::task::spawn_blocking(move || {
         PasswordHash::new(&hash)
             .map(|p| Argon2::default().verify_password(password.as_bytes(), &p).is_ok())
@@ -512,6 +525,15 @@ async fn verify_password(password: String, hash: String) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Timing-safe string compare (jkts, hashes — never `==` on secrets).
+fn timing_safe_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

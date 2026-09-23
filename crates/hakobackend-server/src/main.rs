@@ -557,6 +557,13 @@ fn err(status: StatusCode, msg: impl ToString) -> Response {
     (status, Json(serde_json::json!({ "error": msg.to_string() }))).into_response()
 }
 
+/// 500 without driver internals: DB errors carry table/DSN hints an
+/// unauthenticated prober must never see (S3 audit). Validation messages
+/// stay specific; only the opaque Internal variant is scrubbed here.
+fn err_internal() -> Response {
+    err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
 fn err_code(status: StatusCode, msg: impl ToString, code: &str) -> Response {
     (
         status,
@@ -583,6 +590,21 @@ fn denied_internal(logical: &str) -> Option<Response> {
     } else {
         None
     }
+}
+
+/// Name charset gate (table-flood + traversal): applied to the LOGICAL
+/// path before tenant resolution. Legacy names with dots/spaces/unicode
+/// are rejected — documented tightening, see HTTP_CONTRACT.
+fn valid_names(collection: &str, id: Option<&str>) -> Option<Response> {
+    if !hakobackend_core::valid_collection_path(collection) {
+        return Some(err(StatusCode::BAD_REQUEST, "invalid collection name"));
+    }
+    if let Some(i) = id {
+        if !hakobackend_core::valid_doc_id(i) {
+            return Some(err(StatusCode::BAD_REQUEST, "invalid document id"));
+        }
+    }
+    None
 }
 
 async fn health() -> impl IntoResponse {
@@ -647,7 +669,7 @@ async fn list_collections(
                 .collect();
             Json(serde_json::to_value(out).unwrap()).into_response()
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
     }
 }
 
@@ -673,7 +695,7 @@ async fn create_collection(
     let tenant = caller_tenant(auth.as_ref());
     match s.db.read().await.ensure_collection(&stored(tenant.as_deref(), &name)).await {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
     }
 }
 
@@ -726,7 +748,7 @@ async fn tenant_list(
             let slugs: Vec<_> = docs.into_iter().map(|d| d.id).collect();
             Json(serde_json::to_value(slugs).unwrap()).into_response()
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
     }
 }
 
@@ -751,6 +773,9 @@ async fn get_or_list(
             if let Some(r) = denied_internal(&collection) {
                 return r;
             }
+            if let Some(r) = valid_names(&collection, Some(&id)) {
+                return r;
+            }
             let stored = stored(tenant.as_deref(), &collection);
             match db.get(&stored, &id).await {
                 Ok(Some(doc)) => {
@@ -760,11 +785,14 @@ async fn get_or_list(
                     Json(serde_json::to_value(doc).unwrap()).into_response()
                 }
                 Ok(None) => err(StatusCode::NOT_FOUND, "Document not found"),
-                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
             }
         }
         PathKind::Collection { collection } => {
             if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
+            if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
             let stored = stored(tenant.as_deref(), &collection);
@@ -782,7 +810,7 @@ async fn get_or_list(
                             .collect();
                         Json(serde_json::to_value(visible).unwrap()).into_response()
                     }
-                    Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                    Err(_) => err_internal(),
                 },
             }
         }
@@ -844,6 +872,9 @@ async fn index_create_inner(
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
     let spec = match parse_index_spec(&body) {
         Ok(spec) => spec,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
@@ -874,6 +905,9 @@ async fn index_list(
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
@@ -881,7 +915,7 @@ async fn index_list(
     let tenant = caller_tenant(auth.as_ref());
     match s.db.read().await.list_indexes(&stored(tenant.as_deref(), &collection)).await {
         Ok(indexes) => Json(serde_json::to_value(indexes).unwrap()).into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
     }
 }
 
@@ -928,6 +962,9 @@ async fn create(
             .into_response(),
         PathKind::Collection { collection } => {
             if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
+            if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
             let policy = s.policy.get().await;
@@ -984,6 +1021,9 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             if let Some(r) = denied_internal(&collection) {
                 return r;
             }
+            if let Some(r) = valid_names(&collection, Some(&id)) {
+                return r;
+            }
             let policy = s.policy.get().await;
             let db = s.db.read().await.clone();
             let tenant = caller_tenant(auth.as_ref());
@@ -1037,6 +1077,9 @@ async fn remove(
             .into_response(),
         PathKind::Document { collection, id } => {
             if let Some(r) = denied_internal(&collection) {
+                return r;
+            }
+            if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
             let policy = s.policy.get().await;
@@ -1154,6 +1197,12 @@ async fn run_ops(
             .ok_or((StatusCode::BAD_REQUEST, "op requires id".to_string(), "bad-request"))?;
         if denied_internal(&op.collection).is_some() {
             return Err((StatusCode::FORBIDDEN, "internal collection".to_string(), "permission-denied"));
+        }
+        if !hakobackend_core::valid_collection_path(&op.collection) {
+            return Err((StatusCode::BAD_REQUEST, "invalid collection name".to_string(), "bad-request"));
+        }
+        if !hakobackend_core::valid_doc_id(&id) {
+            return Err((StatusCode::BAD_REQUEST, "invalid document id".to_string(), "bad-request"));
         }
         let stored = stored(tenant.as_deref(), &op.collection);
         let existing = db.get(&stored, &id).await.ok().flatten();
@@ -1308,12 +1357,15 @@ async fn collection_group(
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
         Ok(o) => o,
     };
+    if let Some(r) = valid_names(&name, None) {
+        return r;
+    }
     let policy = s.policy.get().await;
     let db = s.db.read().await.clone();
     let tenant = caller_tenant(auth.as_ref());
     let collections = match db.list_collections().await {
         Ok(c) => c,
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(_) => return err_internal(),
     };
     let mut out = Vec::new();
     for (stored, logical) in hakobackend_core::tenant::visible_collections(collections, tenant.as_deref()) {
@@ -1382,6 +1434,9 @@ async fn aggregate(
     }
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
     }
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
@@ -1862,7 +1917,7 @@ async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
                 );
                 (StatusCode::FOUND, h, Redirect::to(&url)).into_response()
             }
-            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            Err(_) => err_internal(),
         },
     }
 }
@@ -1902,7 +1957,7 @@ async fn github_callback(
             h.insert(header::LOCATION, g.after_login().parse().unwrap());
             (StatusCode::FOUND, h).into_response()
         }
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+                Err(_) => err_internal(),
     }
 }
 

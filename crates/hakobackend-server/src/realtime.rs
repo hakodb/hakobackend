@@ -209,6 +209,9 @@ pub async fn subscribe(
     spec: SubSpec,
 ) -> Result<Subscription, AppError> {
     use hakobackend_core::tenant;
+    if !hakobackend_core::valid_collection_path(&spec.collection) {
+        return Err(AppError::BadRequest("invalid collection name".into()));
+    }
     let owned_tenant = tenant::tenant_of(auth.as_ref());
     let tenant = owned_tenant.as_deref();
     if !policy.allow(auth.as_ref(), &spec.collection, Method::List, None) {
