@@ -1,9 +1,9 @@
-//! hakobackend-auth-github: verifier-only token GitHub (tanpa alur OAuth).
+//! hakobackend-auth-github: GitHub token verifier-only (no OAuth flow).
 //!
-//! Token dicek ke `GET {api}/user` (cache 60 dtk) → `uid = "github:<id>"`.
-//! Alur login OAuth penuh (code exchange di server, pola BFF) menyusul fase E.
-//! Konfig via env: `UB_GITHUB_API` (opsional, default api.github.com,
-//! override untuk test). Tanpa secret — secret OAuth hanya dibutuhkan fase E.
+//! Tokens are checked via `GET {api}/user` (60s cache) → `uid = "github:<id>"`.
+//! The full OAuth login flow (server-side code exchange, BFF pattern) follows in phase E.
+//! Config via env: `UB_GITHUB_API` (optional, defaults to api.github.com,
+//! override for tests). No secret — the OAuth secret is only needed in phase E.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,7 +16,7 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 pub struct GithubVerifier {
     api_base: String,
     client: reqwest::Client,
-    /// Token → klaim. Memori saja, 60 dtk; tidak pernah dipersisten/di-log.
+    /// Token → claims. In-memory only, 60s; never persisted/logged.
     cache: tokio::sync::RwLock<HashMap<String, (Claims, Instant)>>,
 }
 
@@ -79,16 +79,16 @@ impl AuthProvider for GithubVerifier {
     }
 }
 
-// --- OAuth login penuh, pola BFF (fase E) ---
+// --- Full OAuth login, BFF pattern (phase E) ---
 //
-// Browser hanya melihat redirect + session cookie; code↔token terjadi di server.
-// Koleksi pending internal `__oauth_pending` (prefix `__`, tak diekspos HTTP).
-// Secret HANYA via env (`UB_GITHUB_CLIENT_SECRET`), tak pernah di file config/log.
+// Browser only sees redirects + session cookie; code↔token happens on the server.
+// Internal pending collection `__oauth_pending` (`__` prefix, never exposed over HTTP).
+// Secret ONLY via env (`UB_GITHUB_CLIENT_SECRET`), never in config files/logs.
 
 const GITHUB_AUTHORIZE: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN: &str = "https://github.com/login/oauth/access_token";
 const PENDING_COLLECTION: &str = "__oauth_pending";
-/// Umur state+verifier pending (detik).
+/// Pending state+verifier lifetime (seconds).
 const PENDING_TTL_SECS: u64 = 600;
 
 pub struct GithubOAuth {
@@ -104,16 +104,16 @@ pub struct GithubOAuth {
 }
 
 impl GithubOAuth {
-    /// `Ok(None)` = fitur mati (tanpa client id); `Err` = konfigurasi timpang (fail-closed).
+    /// `Ok(None)` = feature disabled (no client id); `Err` = lopsided config (fail-closed).
     pub fn from_env(db: Arc<dyn hakobackend_core::Database>) -> Result<Option<Arc<Self>>, String> {
         let Some(client_id) = env_nonempty("UB_GITHUB_CLIENT_ID") else {
             return Ok(None);
         };
         let Some(secret) = env_nonempty("UB_GITHUB_CLIENT_SECRET") else {
-            return Err("UB_GITHUB_CLIENT_ID terisi tapi UB_GITHUB_CLIENT_SECRET kosong".to_string());
+            return Err("UB_GITHUB_CLIENT_ID is set but UB_GITHUB_CLIENT_SECRET is empty".to_string());
         };
         let Some(public) = env_nonempty("UB_PUBLIC_URL") else {
-            return Err("OAuth github butuh UB_PUBLIC_URL (asal callback https://…)".to_string());
+            return Err("OAuth github requires UB_PUBLIC_URL (callback origin https://…)".to_string());
         };
         let api_base = std::env::var("UB_GITHUB_API").unwrap_or_else(|_| GITHUB_API.into());
         let token_url = std::env::var("UB_GITHUB_TOKEN_URL").unwrap_or_else(|_| GITHUB_TOKEN.into());
@@ -122,7 +122,7 @@ impl GithubOAuth {
         Ok(Some(Self::new(client_id, secret, public, api_base, token_url, authorize_url, after_login, db)))
     }
 
-    /// Konstruktor eksplisit (dipakai test — tanpa env, hermetis).
+    /// Explicit constructor (used by tests — no env, hermetic).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_id: String,
@@ -151,7 +151,7 @@ impl GithubOAuth {
         &self.after_login
     }
 
-    /// URL redirect ke github.com + simpan state/PKCE pending (sekali pakai, 10 mnt).
+    /// Redirect URL to github.com + store pending state/PKCE (single-use, 10 min).
     pub async fn login_url(&self) -> Result<String, AppError> {
         let state = rand_hex(16);
         let verifier = rand_hex(64);
@@ -177,12 +177,12 @@ impl GithubOAuth {
         ))
     }
 
-    /// Hasil callback: (uid-namespaced, email, login-github). Sesi diterbitkan
-    /// server via `LocalAuth::login_external` (terpisah agar crate tak sirkular).
+    /// Callback result: (namespaced uid, email, github login). Sessions are issued
+    /// server-side via `LocalAuth::login_external` (kept separate to avoid a circular crate).
     pub async fn callback(&self, code: &str, state: &str) -> Result<(String, Option<String>, Option<String>), AppError> {
         let pending = self.db.get(PENDING_COLLECTION, state).await.map_err(|_| AppError::Internal("oauth store error".into()))?
             .ok_or(AppError::PermissionDenied)?;
-        // Sekali pakai + kedaluwarsa (fail-closed; stale dibuang).
+        // Single-use + expiry (fail-closed; stale entries discarded).
         self.db.delete(PENDING_COLLECTION, state).await.map_err(|_| AppError::Internal("oauth store error".into()))?;
         let fresh = pending
             .data
@@ -200,7 +200,7 @@ impl GithubOAuth {
     }
 
     async fn exchange(&self, code: &str, verifier: &str) -> Result<String, AppError> {
-        // Secret tak pernah masuk pesan error (anti bocor).
+        // Secret never goes into error messages (anti-leak).
         let body: HashMap<String, serde_json::Value> = self
             .client
             .post(&self.token_url)
@@ -214,10 +214,10 @@ impl GithubOAuth {
             ])
             .send()
             .await
-            .map_err(|_| AppError::BadRequest("tukar code gagal".into()))?
+            .map_err(|_| AppError::BadRequest("code exchange failed".into()))?
             .json()
             .await
-            .map_err(|_| AppError::BadRequest("tukar code gagal".into()))?;
+            .map_err(|_| AppError::BadRequest("code exchange failed".into()))?;
         if body.get("error").is_some() {
             return Err(AppError::PermissionDenied);
         }
@@ -238,7 +238,7 @@ fn pkce_challenge(verifier: &str) -> String {
     B64.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// Persen-encode minimal untuk query OAuth (tanpa crate tambahan).
+/// Minimal percent-encoding for OAuth queries (no extra crate).
 fn urlenc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -270,8 +270,8 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Baca satu request HTTP utuh (header + body sesuai Content-Length).
-    /// Single-read rawan partial-read TCP (sumber flaky); framing benar di sini.
+    /// Read one full HTTP request (headers + body per Content-Length).
+    /// Single-read risks TCP partial reads (flaky source); correct framing here.
     fn read_request(s: &mut std::net::TcpStream) -> String {
         use std::io::Read;
         let mut raw = Vec::new();
@@ -311,8 +311,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Mock api.github.com: `/user` valid untuk "tok-bagus", 401 untuk lainnya.
-    /// Menghitung hit agar cache terbukti; berhenti via flag.
+    /// Mock api.github.com: `/user` valid for "tok-bagus", 401 for the rest.
+    /// Counts hits to prove caching; stops via a flag.
     fn mock_github() -> (String, Arc<AtomicUsize>, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -324,8 +324,8 @@ mod tests {
             while !s2.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut s, _)) => {
-                        // Soket hasil accept mewarisi nonblocking dari listener —
-                        // kembalikan ke blocking agar read_request tak pernah WouldBlock.
+                        // Accepted sockets inherit nonblocking mode from the listener —
+                        // switch back to blocking so read_request never sees WouldBlock.
                         let _ = s.set_nonblocking(false);
                         let req = read_request(&mut s);
                         let (status, body) = if req.contains("Bearer tok-bagus") {
@@ -348,26 +348,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_cache_dan_tolak() {
+    async fn verify_cache_and_reject() {
         let (url, hits, stop, server) = mock_github();
-        // Konstruktor eksplisit — tanpa env, hermetis antar-test paralel.
+        // Explicit constructor — no env, hermetic across parallel tests.
         let v = GithubVerifier::with_api_base(url);
 
         let c = v.verify("tok-bagus").await.unwrap();
         assert_eq!((c.provider, c.uid.as_str()), ("github", "42"));
         assert_eq!(c.email.as_deref(), Some("o@x.io"));
-        // Panggilan kedua dari cache (hits tetap 1).
+        // Second call served from cache (hits stays 1).
         let c2 = v.verify("tok-bagus").await.unwrap();
         assert_eq!(c2.uid, "42");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
-        // Token asing → Err (chain lanjut ke provider berikut).
+        // Unknown token → Err (chain continues to the next provider).
         assert!(v.verify("tok-jelek").await.is_err());
 
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
     }
 
-    /// Fake DB minimal: pending store butuh get/insert/delete sungguhan.
+    /// Minimal fake DB: the pending store needs working get/insert/delete.
     struct FakeDb {
         store: std::sync::Mutex<HashMap<String, HashMap<String, hakobackend_core::Doc>>>,
     }
@@ -407,17 +407,17 @@ mod tests {
             Ok(tokio::sync::broadcast::channel(1).0.subscribe())
         }
         async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, hakobackend_core::AppError> {
-            Err(hakobackend_core::AppError::BadRequest("fake tanpa index".into()))
+            Err(hakobackend_core::AppError::BadRequest("fake without index".into()))
         }
         async fn list_indexes(&self, _c: &str) -> Result<Vec<hakobackend_core::IndexInfo>, hakobackend_core::AppError> {
             Ok(vec![])
         }
         async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), hakobackend_core::AppError> {
-            Err(hakobackend_core::AppError::BadRequest("fake tanpa index".into()))
+            Err(hakobackend_core::AppError::BadRequest("fake without index".into()))
         }
     }
 
-    /// Mock server OAuth: token endpoint (POST) + /user (GET) dalam satu server.
+    /// Mock OAuth server: token endpoint (POST) + /user (GET) in one server.
     fn mock_oauth() -> (String, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -458,8 +458,8 @@ mod tests {
     fn oauth_handle(base: &str, db: Arc<dyn hakobackend_core::Database>) -> Arc<GithubOAuth> {
         GithubOAuth::new(
             "cid-123".into(),
-            "sekret-jangan-bocor".into(),
-            "https://app.contoh.id".into(),
+            "do-not-leak-secret".into(),
+            "https://app.example.test".into(),
             base.into(),
             format!("{base}/login/oauth/access_token"),
             "https://github.com/login/oauth/authorize".into(),
@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_login_url_dan_callback() {
+    async fn oauth_login_url_and_callback() {
         let (base, stop, server) = mock_oauth();
         let db: Arc<dyn hakobackend_core::Database> = Arc::new(FakeDb { store: std::sync::Mutex::new(HashMap::new()) });
         let h = oauth_handle(&base, db);
@@ -482,17 +482,17 @@ mod tests {
         assert!(url.contains("client_id=cid-123"));
         assert!(url.contains("code_challenge=") && url.contains("code_challenge_method=S256"));
         assert!(url.contains("state="));
-        assert!(!url.contains("sekret-jangan-bocor"), "secret tak boleh bocor ke URL");
+        assert!(!url.contains("do-not-leak-secret"), "secret must not leak into URL");
 
-        // Callback bahagia: code baik + state benar → triple identitas.
+        // Happy-path callback: good code + correct state → identity triple.
         let (uid, email, login) = h.callback("good-code", &state_of(&url)).await.unwrap();
         assert_eq!(uid, "github:7");
         assert_eq!(email, None);
         assert_eq!(login.as_deref(), Some("octocat"));
 
-        // State sekali pakai: ulangi → tolak.
+        // Single-use state: retry → rejected.
         assert!(h.callback("good-code", &state_of(&url)).await.is_err());
-        // State asing / code jelek → tolak.
+        // Unknown state / bad code → rejected.
         assert!(h.callback("good-code", "state-asing").await.is_err());
         let url2 = h.login_url().await.unwrap();
         assert!(h.callback("bad-code", &state_of(&url2)).await.is_err());
@@ -502,11 +502,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_pending_kedaluwarsa_ditolak() {
+    async fn oauth_pending_expired_rejected() {
         let (base, stop, server) = mock_oauth();
         let db: Arc<dyn hakobackend_core::Database> = Arc::new(FakeDb { store: std::sync::Mutex::new(HashMap::new()) });
         let h = oauth_handle(&base, db.clone());
-        // Tanam pending basi manual (created_at 1 jam lalu).
+        // Plant a stale pending entry manually (created_at 1 hour ago).
         db.insert(
             "__oauth_pending",
             hakobackend_core::Doc {
@@ -534,9 +534,9 @@ mod tests {
             std::env::remove_var(k);
         }
         let db: Arc<dyn hakobackend_core::Database> = Arc::new(FakeDb { store: std::sync::Mutex::new(HashMap::new()) });
-        // Tanpa client id = fitur mati (bukan error).
+        // No client id = feature disabled (not an error).
         assert!(GithubOAuth::from_env(db.clone()).unwrap().is_none());
-        // Id tanpa secret, atau tanpa public URL = error jelas.
+        // Id without secret, or without public URL = clear error.
         std::env::set_var("UB_GITHUB_CLIENT_ID", "x");
         assert!(GithubOAuth::from_env(db.clone()).is_err());
         std::env::set_var("UB_GITHUB_CLIENT_SECRET", "y");

@@ -1,8 +1,8 @@
-# policy.standard.toml — TEMPLATE rujukan SECURITY_RULES.md, bukan ketentuan.
-# Nama peran & koleksi di bawah ini contoh; ganti sesukanya via [identity].
-# Salin menjadi policy.toml lalu sesuaikan per aplikasi.
+# policy.standard.toml — reference TEMPLATE for SECURITY_RULES.md, not binding rules.
+# The role & collection names below are examples; change them freely via [identity].
+# Copy to policy.toml then adjust per app.
 
-# Identitas milik Anda: koleksi user yang mana, field peran/pemilik yang mana.
+# Your identity: which user collection, which role/owner fields.
 [identity]
 users_collection = "users"
 role_field = "role"
@@ -12,7 +12,7 @@ owner_field = "ownerId"
 read = "deny"
 write = "deny"
 
-# Konten publik: baca bebas, tulis peran pengelola (nama peran contoh saja).
+# Public content: free reads, maintainer-role writes (role names are just examples).
 [collections.posts]
 read = "public"
 create = "role:maintainer"
@@ -23,25 +23,25 @@ delete = "role:admin"
 read = "public"
 write = "role:maintainer"
 
-# Unggahan user terautentikasi.
+# Authenticated user uploads.
 [collections.media]
 read = "public"
 create = "auth"
 delete = "role:maintainer"
 
-# Profil: pemilik saja.
+# Profiles: owners only.
 [collections.profiles]
 read = "owner"
 write = "owner"
 owner_field = "ownerId"
 
-# Kredensial / konfigurasi provider: admin saja (SECURITY_RULES §4).
+# Provider credentials / config: admins only (SECURITY_RULES §4).
 [collections.ai_configs]
 read = "role:admin"
 write = "role:admin"
 
-# Koleksi internal (__*) tidak diekspos HTTP (ditegakkan server fase 2);
-# ditulis di sini agar eksplisit bila suatu saat dibutuhkan audit.
+# Internal (__*) collections are not exposed over HTTP (enforced by the phase-2 server);
+# listed here to stay explicit should an audit ever need it.
 [collections.__users]
 read = "deny"
 write = "deny"

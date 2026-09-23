@@ -1,17 +1,17 @@
-# custom.example.toml — template `--auth ./custom.toml`.
-# Rantai provider + pemetaan klaim ke peran bebas milik Anda. Tanpa kode.
-# Salin lalu sesuaikan. Lihat AUTH_CONTRACT.md §4.
+# custom.example.toml — `--auth ./custom.toml` template.
+# Provider chain + claim-to-role mapping for your own free-form roles. No code.
+# Copy then adjust. See AUTH_CONTRACT.md §4.
 
 providers = ["github", "local"]
 
-# Mode DPoP untuk anggota `local` (off|accept|require; menang atas UB_LOCAL_DPOP).
+# DPoP mode for `local` members (off|accept|require; wins over UB_LOCAL_DPOP).
 # dpop = "accept"
 
 [mapping]
 # uid_field = "sub"
 # email_field = "email"
 
-# Klaim → peran: cocok bila klaim string == equals atau array memuatnya.
+# Claim → role: matches when a string claim == equals or an array contains it.
 [[rules]]
 claim = "groups"
 equals = "ops"

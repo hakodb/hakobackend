@@ -1,91 +1,93 @@
-# Universal Backend (`hakobackend`)
+# hakobackend
+Universal HTTP backend gateway + plug-and-play databases (Rust + Axum)
 
-Gateway HTTP universal + plug-and-play database, dibangun dengan Rust + Axum.
-Penerus `rethink-firestore/backend` — wire-protocol kompatibel agar SDK lama tetap jalan.
+> Part of [**HakoDB**](https://github.com/hakodb/hakodb) — embedded Firestore-style document DB in Rust. The engine + C ABI live in `hakodb/hakodb`; this repo holds the universal HTTP backend gateway.
 
-- Kajian lengkap: [`KAJIAN.md`](KAJIAN.md)
-- Kontrak addon database: [`DRIVER_CONTRACT.md`](DRIVER_CONTRACT.md) (+ `driver.example.toml`)
-- Kontrak provider auth: [`AUTH_CONTRACT.md`](AUTH_CONTRACT.md) (+ `custom.example.toml`)
-- Kontrak translasi HTTP: [`HTTP_CONTRACT.md`](HTTP_CONTRACT.md)
-- Security rules standar: [`SECURITY_RULES.md`](SECURITY_RULES.md) (+ `policy.standard.toml`)
-- Contoh config: [`config/hakobackend.example.toml`](config/hakobackend.example.toml)
+Successor to `rethink-firestore/backend` — wire-protocol compatible so existing SDKs keep working.
 
-## Struktur
+- Full design notes: [`KAJIAN.md`](KAJIAN.md)
+- Database addon contract: [`DRIVER_CONTRACT.md`](DRIVER_CONTRACT.md) (+ `driver.example.toml`)
+- Auth provider contract: [`AUTH_CONTRACT.md`](AUTH_CONTRACT.md) (+ `custom.example.toml`)
+- HTTP translation contract: [`HTTP_CONTRACT.md`](HTTP_CONTRACT.md)
+- Standard security rules: [`SECURITY_RULES.md`](SECURITY_RULES.md) (+ `policy.standard.toml`)
+- Sample config: [`config/hakobackend.example.toml`](config/hakobackend.example.toml)
+
+## Layout
 
 ```text
 crates/
-  hakobackend-core/       kontrak: Doc, QueryOptions, trait Database/Auth, Claims, AppError
-  hakobackend-db-hako/    adapter HakoDB (driver default; path-dep ke ../hakodb)
-  hakobackend-db-postgres/  addon PostgreSQL via sqlx (pool, JSONB, FTS GIN)
-  hakobackend-db-sqlite/    addon SQLite via sqlx (file/:memory:, FTS5)
-  hakobackend-db-mysql/     addon MySQL/MariaDB via sqlx (pool, JSON, FTS generated)
-  hakobackend-policy/     policy.toml + [identity] milik user (hot-reload)
-  hakobackend-auth-core/  resolusi --auth: chain + custom.toml mapping + union peran
-  hakobackend-auth-local/ issuer BFF (dual-token, DPoP, argon2)
-  hakobackend-auth-firebase|github|oidc/  verifier-only eksternal (+ OAuth GitHub BFF)
-  hakobackend-ratelimit/  token-bucket in-process 2 lapis (tanpa redis)
-  hakobackend-server/     gateway Axum + CLI + WS/SSE + TLS
+  hakobackend-core/       contracts: Doc, QueryOptions, Database/Auth traits, Claims, AppError
+  hakobackend-db-hako/    HakoDB adapter (default driver; path-dep on ../hakodb)
+  hakobackend-db-postgres/  PostgreSQL addon via sqlx (pool, JSONB, GIN FTS)
+  hakobackend-db-sqlite/    SQLite addon via sqlx (file/:memory:, FTS5)
+  hakobackend-db-mysql/     MySQL/MariaDB addon via sqlx (pool, JSON, generated FTS)
+  hakobackend-policy/     user-owned policy.toml + [identity] (hot-reload)
+  hakobackend-auth-core/  --auth resolution: chain + custom.toml mapping + role union
+  hakobackend-auth-local/ BFF issuer (dual-token, DPoP, argon2)
+  hakobackend-auth-firebase|github|oidc/  external verifier-only (+ GitHub OAuth BFF)
+  hakobackend-ratelimit/  2-layer in-process token bucket (no redis)
+  hakobackend-server/     Axum gateway + CLI + WS/SSE + TLS
 ```
 
-## Jalan cepat
+## Quick start
 
 ```powershell
 cargo run -p hakobackend-server -- --driver hako --data ./data/hako.ub --rules ./policy.example.toml --port 8080
-cargo run -p hakobackend-server -- --config hakobackend.example.toml   # atau via file
-cargo run -p hakobackend-server -- --config hakobackend.example.toml --validate   # cek kering
-cargo run -p hakobackend-server -- --print-default-config     # cetak template
+cargo run -p hakobackend-server -- --config hakobackend.example.toml   # or via file
+cargo run -p hakobackend-server -- --config hakobackend.example.toml --validate   # dry-check
+cargo run -p hakobackend-server -- --print-default-config     # print template
 ```
 
-Prioritas: flag CLI > file config > default. Bentuk config lama
-(`[server] listen`, `[database]`, `policy_file`) tetap dibaca (deprecated).
+Precedence: CLI flags > config file > defaults. The legacy config shape
+(`[server] listen`, `[database]`, `policy_file`) is still read (deprecated).
 
-Endpoint (sama seperti backend lama):
+Endpoints (same as the legacy backend):
 
 - `GET /api/health`
-- `GET /api/collections` — daftar koleksi
-- `GET /api/collections/{*path}` — dokumen (segmen genap) / list + `?options=<json>` (ganjil)
-- `POST /api/collections/{*path}` — tambah (koleksi saja)
-- `PUT /api/collections/{*path}` — set (dokumen saja)
-- `PATCH /api/collections/{*path}` — merge (dokumen saja)
-- `DELETE /api/collections/{*path}` — hapus (dokumen saja)
-- `POST /api/indexes {collection, fields[], name?, unique?, kind?}` — buat index
-- `GET /api/indexes?collection=` — daftar index
-- `DELETE /api/indexes?collection=&name=` — hapus index
-- `GET /ws` — websocket realtime (subscribe/unsubscribe/ping/auth)
-- `GET /api/stream/{koleksi}?options=&group=` — SSE realtime
-- TLS: `--tls-cert/--tls-key` (HSTS otomatis); skema DPoP mengikuti
+- `GET /api/collections` — list collections
+- `GET /api/collections/{*path}` — document (even segments) / list + `?options=<json>` (odd)
+- `POST /api/collections/{*path}` — add (collections only)
+- `PUT /api/collections/{*path}` — set (documents only)
+- `PATCH /api/collections/{*path}` — merge (documents only)
+- `DELETE /api/collections/{*path}` — remove (documents only)
+- `POST /api/indexes {collection, fields[], name?, unique?, kind?}` — create index
+- `GET /api/indexes?collection=` — list indexes
+- `DELETE /api/indexes?collection=&name=` — drop index
+- `GET /ws` — realtime websocket (subscribe/unsubscribe/ping/auth)
+- `GET /api/stream/{collection}?options=&group=` — realtime SSE
+- TLS: `--tls-cert/--tls-key` (HSTS automatic); DPoP scheme follows
 
-## Catatan build
+## Build notes
 
-`hakobackend-db-hako` menarik seluruh HakoDB + dependensi C-nya (`zstd-sys`, `aws-lc-sys`);
-`cargo check/build` pertama lama — itu normal, bukan error. Fokus saat ini pengembangan,
-build penuh belakangan.
+`hakobackend-db-hako` pulls in all of HakoDB plus its C dependencies (`zstd-sys`, `aws-lc-sys`);
+the first `cargo check/build` is slow — that is normal, not an error. Current focus is development;
+full builds come later.
 
-## Plug-and-play database & endpoint fleksibel
+## Plug-and-play databases & flexible endpoints
 
-- **Ganti DB saat server jalan:** edit `driver` / `data` di config,
-  lalu `POST /api/admin/reload`. Tanpa rebuild/restart. Driver baru = crate `hakobackend-db-*`
-  yang mengimpl `hakobackend_core::Database` + 1 arm di `open_driver` (`crates/hakobackend-server/src/main.rs`).
-  Contoh: `cp hakobackend.example.toml hakobackend.toml`.
-- **Ganti auth saat server jalan:** edit `auth` (`off | local | chain:a,b | ./custom.toml`)
-  lalu reload yang sama. Rantai + mapping di `hakobackend-auth-core`; provider yang belum
-  tersedia gagal cepat (fail-closed). Contoh: `custom.example.toml`.
-- **`local` (issuer BFF):** `POST /api/auth/register|login|refresh|logout`, `GET /api/auth/me`;
-  dua cookie `__Host-` HttpOnly+Secure+SameSite=Strict; refresh rotasi + reuse-detection;
-  DPoP (`UB_LOCAL_DPOP`/`dpop`: off|accept|require, RSA/EC) mengikat token ke kunci klien;
-  butuh env `UB_LOCAL_JWT_SECRET`. `/api/admin/reload` terkunci peran `--admin-role`.
-- **OAuth GitHub (BFF):** `GET /api/auth/github/login|callback`; code↔token di server
-  (PKCE S256, state sekali-pakai); browser terima cookie sesi + redirect, tanpa token.
-  Env: `UB_GITHUB_CLIENT_ID/SECRET`, `UB_PUBLIC_URL`. User terprovisi tanpa peran.
-- **Ubah rule endpoint saat server jalan:** edit `policy.toml` — langsung berlaku
-  (hot-reload via pantau mtime, tanpa restart). Nilai: `public | auth | owner | deny | role:<nama>`,
+- **Swap databases while the server runs:** edit `driver` / `data` in the config,
+  then `POST /api/admin/reload`. No rebuild/restart. A new driver is a `hakobackend-db-*`
+  crate implementing `hakobackend_core::Database` plus one arm in `open_driver` (`crates/hakobackend-server/src/main.rs`).
+  Example: `cp hakobackend.example.toml hakobackend.toml`.
+- **Swap auth while the server runs:** edit `auth` (`off | local | chain:a,b | ./custom.toml`)
+  then the same reload. Chaining + mapping live in `hakobackend-auth-core`; providers that are
+  unavailable fail fast (fail-closed). Example: `custom.example.toml`.
+- **`local` (BFF issuer):** `POST /api/auth/register|login|refresh|logout`, `GET /api/auth/me`;
+  two `__Host-` cookies, HttpOnly+Secure+SameSite=Strict; refresh rotation + reuse detection;
+  DPoP (`UB_LOCAL_DPOP`/`dpop`: off|accept|require, RSA/EC) binds tokens to the client key;
+  requires env `UB_LOCAL_JWT_SECRET`. `/api/admin/reload` is locked behind `--admin-role`.
+- **GitHub OAuth (BFF):** `GET /api/auth/github/login|callback`; code↔token exchange on the server
+  (PKCE S256, single-use state); the browser gets a session cookie + redirect, never a token.
+  Env: `UB_GITHUB_CLIENT_ID/SECRET`, `UB_PUBLIC_URL`. Users are provisioned role-less.
+- **Change endpoint rules while the server runs:** edit `policy.toml` — takes effect immediately
+  (hot-reload via mtime watch, no restart). Values: `public | auth | owner | deny | role:<name>`,
   per slot `get list create update delete` (fallback `read`/`write` → `[defaults]`).
-  Typo / gagal parse = deny (fail-closed), policy lama tetap dipakai. Contoh: `policy.example.toml`.
-- List difilter per-dokumen (pengganti loop `server.ts:233` di backend lama).
-- **Flood protection 2 lapis (tanpa redis):** global longgar + `/api/auth/*` ketat,
-  429 + `Retry-After` jujur, `/api/health` dikecualikan. Angka hot-reload via reload.
-  Kunci = IP peer (atau X-Forwarded-For pertama bila `--trust-proxy`).
+  Typos / parse failures = deny (fail-closed), the old policy stays in force. Example: `policy.example.toml`.
+- Lists are filtered per document (replaces the `server.ts:233` loop in the legacy backend).
+- **2-layer flood protection (no redis):** loose global + strict `/api/auth/*`,
+  honest 429 + `Retry-After`, `/api/health` exempt. Numbers hot-reload via reload.
+  Key = peer IP (or first X-Forwarded-For when `--trust-proxy`).
 
-Fase 0 kontrak → 1 REST inti → 2 auth internal dual-token + `policy.toml` →
-3 driver mysql + Redis → 4 WS/SSE realtime → 5 firebase/oidc →
-6 hardening. Detail di `KAJIAN.md §7`.
+Phase 0 contracts → 1 core REST → 2 internal dual-token auth + `policy.toml` →
+3 mysql driver + Redis → 4 WS/SSE realtime → 5 firebase/oidc →
+6 hardening. Details in `KAJIAN.md §7`.

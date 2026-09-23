@@ -1,8 +1,8 @@
-# policy.toml — aturan endpoint. EDIT SAAT SERVER JALAN, langsung berlaku.
-# Nilai rule: public | auth | owner | deny | role:<nama>
-# Slot per koleksi: get list create update delete (opsional), fallback read/write,
-# fallback terakhir [defaults]. Typo = deny (fail-closed).
-# Slot `owner` menilai field owner_field (default ownerId, fallback uid).
+# policy.toml — endpoint rules. EDIT WHILE THE SERVER RUNS, applies immediately.
+# Rule values: public | auth | owner | deny | role:<name>
+# Per-collection slots: get list create update delete (optional), read/write fallback,
+# final fallback [defaults]. Typo = deny (fail-closed).
+# The `owner` slot checks the owner_field (default ownerId, fallback uid).
 
 [defaults]
 read = "public"

@@ -1,23 +1,23 @@
-# Manifest addon driver MySQL/MariaDB (lihat DRIVER_CONTRACT.md).
+# MySQL/MariaDB driver addon manifest (see DRIVER_CONTRACT.md).
 [driver]
 name = "mysql"
 version = "0.1.0"
 hakobackend_core = "0.1"
-description = "MySQL/MariaDB via sqlx (pool). Dialek JSON_UNQUOTE(JSON_EXTRACT) + kolom generated untuk FTS."
+description = "MySQL/MariaDB via sqlx (pool). JSON_UNQUOTE(JSON_EXTRACT) dialect + generated columns for FTS."
 
 [capabilities]
-watch = false            # polling oleh core
+watch = false            # polled by core
 transactions = true
 composite = true
-fts = true               # FULLTEXT di atas kolom generated STORED (dikelola driver)
+fts = true               # FULLTEXT over STORED generated columns (managed by the driver)
 drop_index = true
 
 [config]
-# data = DSN, contoh: path = "mysql://user:pass@localhost:3306/ub"
+# data = DSN, example: path = "mysql://user:pass@localhost:3306/ub"
 
 [notes]
-nested = "Subkoleksi diflatten (posts_revisions) + _collectionPath di JSON (dilepas saat baca)"
-cursor = "startAt/startAfter/endAt/endBefore + offset didukung (CAST(? AS JSON) type-strict)"
-compare = "JSON vs CAST(? AS JSON): type-strict lintas angka/string/bool (paritas kontrak)"
-ne_null = "Ne atas field hilang = true (paritas kontrak) via OR ... IS NULL"
-internal = "Koleksi/tabel prefix `__` (sesi, registry) + kolom `__fts_*` disembunyikan"
+nested = "Subcollections flattened (posts_revisions) + _collectionPath in JSON (stripped on read)"
+cursor = "startAt/startAfter/endAt/endBefore + offset supported (CAST(? AS JSON) type-strict)"
+compare = "JSON vs CAST(? AS JSON): type-strict across numbers/strings/bools (contract parity)"
+ne_null = "Ne over a missing field = true (contract parity) via OR ... IS NULL"
+internal = "Collections/tables with the `__` prefix (sessions, registry) + `__fts_*` columns hidden"

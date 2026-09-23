@@ -1,9 +1,9 @@
-//! hakobackend-db-mysql: addon MySQL/MariaDB via sqlx (pool).
+//! hakobackend-db-mysql: MySQL/MariaDB addon via sqlx (pool).
 //!
-//! Difusi pola Postgres: tabel JSON generik per koleksi (flat name).
-//! Dialek: perbandingan `JSON_EXTRACT(data, path) = CAST(? AS JSON)`
-//! (type-strict lintas angka/string/bool — paritas kontrak).
-//! FTS via kolom generated STORED + FULLTEXT (dikelola driver, prefix `__fts_`).
+//! Postgres-pattern diffusion: generic JSON table per collection (flat name).
+//! Dialect: `JSON_EXTRACT(data, path) = CAST(? AS JSON)` comparison
+//! (type-strict across numbers/strings/bools — contract parity).
+//! FTS via generated STORED columns + FULLTEXT (managed by the driver, `__fts_` prefix).
 
 use std::collections::{HashMap, HashSet};
 use hakobackend_core::{AppError, Capabilities, Change, Database, Direction, Doc, Filter, FilterOp, IndexInfo, IndexKind, IndexSpec, QueryOptions};
@@ -34,7 +34,7 @@ impl MysqlDb {
         .execute(&self.pool)
         .await
         .map_err(|_| AppError::Internal("db error".into()))?;
-        // Migrasi toleran: tabel lama tanpa kolom ddl.
+        // Tolerant migration: legacy tables without the ddl column.
         let has: Option<String> = sqlx::query(
             "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '__ub_indexes' AND COLUMN_NAME = 'ddl'",
         )
@@ -54,7 +54,7 @@ impl MysqlDb {
         Ok(())
     }
 
-    /// Cari index by nama logis (dipakai create idempoten).
+    /// Find an index by logical name (used for idempotent create).
     async fn find_index(&self, collection: &str, name: &str) -> Result<Option<IndexInfo>, AppError> {
         self.ensure_registry().await?;
         let row: Option<(String, String, i8, String)> =
@@ -102,24 +102,24 @@ impl MysqlDb {
     }
 }
 
-// --- Helper SQL murni (diuji unit tanpa DB) ---
+// --- Pure SQL helpers (unit-tested without a DB) ---
 
 fn qi(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-/// Path JSON: "a.b" → `$."a"."b"`.
+/// JSON path: "a.b" → `$."a"."b"`.
 fn jpath(field: &str) -> String {
     let segs: Vec<String> = field.split('.').map(|s| format!("\"{}\"", s.replace('"', "\\\""))).collect();
     format!("$.{}", segs.join("."))
 }
 
-/// Ekstraksi: `JSON_EXTRACT(data, '$."a"."b"')`.
+/// Extraction: `JSON_EXTRACT(data, '$."a"."b"')`.
 fn jcol(field: &str) -> String {
     format!("JSON_EXTRACT(data, '{}')", jpath(field).replace('\'', "''"))
 }
 
-/// Nilai sebagai teks JSON untuk `CAST(? AS JSON)` (perbandingan type-strict).
+/// Value as JSON text for `CAST(? AS JSON)` (type-strict comparison).
 fn json_text(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
@@ -136,11 +136,11 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<String>) -> Result
     match f.op {
         FilterOp::Eq => match json_text(&f.value) {
             Some(_) => cmp(sql, "=", &f.value, params),
-            // Eq null/objek: NULL tak pernah == ; objek/array tak didukung banding.
+            // Eq null/object: NULL is never == ; objects/arrays lack comparison support.
             None if f.value.is_null() => sql.push_str(&format!("{col} IS NULL")),
             None => sql.push_str("FALSE"),
         },
-        // Paritas kontrak: field hilang = true untuk Ne.
+        // Contract parity: a missing field = true for Ne.
         FilterOp::Ne => match json_text(&f.value) {
             Some(_) => {
                 sql.push_str(&format!("({col} <> CAST(? AS JSON) OR {col} IS NULL)"));
@@ -149,23 +149,23 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<String>) -> Result
             None => sql.push_str(&format!("{col} IS NOT NULL")),
         },
         FilterOp::Gt => {
-            json_text(&f.value).ok_or_else(|| AppError::BadRequest("perbandingan butuh skalar".into()))?;
+            json_text(&f.value).ok_or_else(|| AppError::BadRequest("comparison needs a scalar".into()))?;
             cmp(sql, ">", &f.value, params);
         }
         FilterOp::Gte => {
-            json_text(&f.value).ok_or_else(|| AppError::BadRequest("perbandingan butuh skalar".into()))?;
+            json_text(&f.value).ok_or_else(|| AppError::BadRequest("comparison needs a scalar".into()))?;
             cmp(sql, ">=", &f.value, params);
         }
         FilterOp::Lt => {
-            json_text(&f.value).ok_or_else(|| AppError::BadRequest("perbandingan butuh skalar".into()))?;
+            json_text(&f.value).ok_or_else(|| AppError::BadRequest("comparison needs a scalar".into()))?;
             cmp(sql, "<", &f.value, params);
         }
         FilterOp::Lte => {
-            json_text(&f.value).ok_or_else(|| AppError::BadRequest("perbandingan butuh skalar".into()))?;
+            json_text(&f.value).ok_or_else(|| AppError::BadRequest("comparison needs a scalar".into()))?;
             cmp(sql, "<=", &f.value, params);
         }
         FilterOp::In => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in needs an array".into()))?;
             let mut parts = Vec::new();
             for v in arr {
                 match json_text(v) {
@@ -182,21 +182,21 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<String>) -> Result
                 sql.push_str(&format!("({})", parts.join(" OR ")));
             }
         }
-        // JSON_CONTAINS uniform (tanpa asumsi string).
+        // Uniform JSON_CONTAINS (no string assumption).
         FilterOp::ArrayContains => {
-            json_text(&f.value).ok_or_else(|| AppError::BadRequest("array-contains butuh skalar".into()))?;
+            json_text(&f.value).ok_or_else(|| AppError::BadRequest("array-contains needs a scalar".into()))?;
             sql.push_str(&format!("JSON_CONTAINS({col}, CAST(? AS JSON))"));
             params.push(f.value.to_string());
         }
         FilterOp::ArrayContainsAny => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any needs an array".into()))?;
             if arr.is_empty() {
                 sql.push_str("FALSE");
                 return Ok(());
             }
             let mut parts = Vec::new();
             for v in arr {
-                json_text(v).ok_or_else(|| AppError::BadRequest("array-contains-any butuh skalar".into()))?;
+                json_text(v).ok_or_else(|| AppError::BadRequest("array-contains-any needs scalars".into()))?;
                 parts.push(format!("JSON_CONTAINS({col}, CAST(? AS JSON))"));
                 params.push(v.to_string());
             }
@@ -223,8 +223,8 @@ fn build_where(collection: &str, q: &QueryOptions) -> Result<(String, Vec<String
     Ok((where_, params))
 }
 
-/// Fragmen cursor: `col OP CAST(? AS JSON)` (type-strict, paritas kontrak).
-/// Bound null/objek → FALSE. `id` = kolom teks biasa.
+/// Cursor fragment: `col OP CAST(? AS JSON)` (type-strict, contract parity).
+/// Null/object bounds → FALSE. `id` = a plain text column.
 fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<String>) {
     let field = hakobackend_core::conformance::cursor_field(q);
     let mut bound = |op: &str, v: &serde_json::Value| {
@@ -260,7 +260,7 @@ fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<Str
     }
 }
 
-/// LIMIT/OFFSET MySQL: tanpa count pakai 2^64-1 (tanpa batas).
+/// LIMIT/OFFSET for MySQL: without count use 2^64-1 (unbounded).
 fn build_page(q: &QueryOptions) -> String {
     match (q.limit, q.offset) {
         (Some(n), Some(o)) => format!(" LIMIT {n} OFFSET {o}"),
@@ -316,7 +316,7 @@ fn uuid_like() -> String {
     format!("my{nanos:x}{:x}", std::process::id())
 }
 
-/// Nama fisik aman (<=60 char). FTS memakai kolom generated `__fts_*` per index.
+/// Safe physical name (<=60 chars). FTS uses a `__fts_*` generated column per index.
 fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
     let base = spec.name.clone().unwrap_or_else(|| match spec.kind {
         IndexKind::Simple => format!("idx_{}_{}", table, spec.fields.join("_")),
@@ -350,7 +350,7 @@ impl Database for MysqlDb {
     }
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
-        // Koleksi internal `__*` tak diekspos HTTP.
+        // Internal `__*` collections are not exposed over HTTP.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '\\_%' ESCAPE '\\'",
         )
@@ -431,7 +431,7 @@ impl Database for MysqlDb {
         self.ensure_table(&table).await?;
         inject_path(&mut doc.data, collection);
         if merge {
-            // Gabung dangkal di Rust (semantik kontrak eksak).
+            // Shallow merge in Rust (exact contract semantics).
             let mut base = self
                 .get(collection, id)
                 .await?
@@ -506,9 +506,9 @@ impl Database for MysqlDb {
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError> {
         hakobackend_core::conformance::validate_spec(self.capabilities(), spec)?;
         if spec.unique && spec.kind == IndexKind::FullText {
-            return Err(AppError::BadRequest("fts tak bisa unique".into()));
+            return Err(AppError::BadRequest("fts cannot be unique".into()));
         }
-        // Idempoten: nama logis sudah ada → kembalikan info tersimpan (tanpa DDL ulang).
+        // Idempotent: a logical name that already exists → return the stored info (no DDL rerun).
         let logical_want = spec.name.clone().unwrap_or_else(|| hakobackend_core::conformance::auto_index_name(spec));
         if let Some(info) = self.find_index(collection, &logical_want).await? {
             return Ok(info);
@@ -520,7 +520,7 @@ impl Database for MysqlDb {
         let unique = if spec.unique { "UNIQUE " } else { "" };
         match spec.kind {
             IndexKind::Simple | IndexKind::Composite => {
-                // Kunci fungsional CAST CHAR(255) agar muat di batas panjang index.
+                // Functional key CAST CHAR(255) to fit the index length limit.
                 sqlx::query(&format!(
                     "CREATE {unique}INDEX {name} ON {table} ({exprs})",
                     name = qi(&physical),
@@ -537,7 +537,7 @@ impl Database for MysqlDb {
                 .map_err(|_| AppError::Internal("db error".into()))?;
             }
             IndexKind::FullText => {
-                // FULLTEXT butuh kolom generated STORED (dikelola driver, prefix internal).
+                // FULLTEXT needs a STORED generated column (managed by the driver, internal prefix).
                 let f = &spec.fields[0];
                 let col = fts_column(&physical);
                 sqlx::query(&format!(
@@ -548,7 +548,7 @@ impl Database for MysqlDb {
                 ))
                 .execute(&self.pool)
                 .await
-                .map_err(|_| AppError::Internal("db error (generated column butuh MySQL 5.7+/MariaDB 10.2+)".into()))?;
+                .map_err(|_| AppError::Internal("db error (generated columns need MySQL 5.7+/MariaDB 10.2+)".into()))?;
                 sqlx::query(&format!("CREATE FULLTEXT INDEX {name} ON {table} ({col})", name = qi(&physical), table = qi(&table), col = qi(&col)))
                     .execute(&self.pool)
                     .await
@@ -618,7 +618,7 @@ impl Database for MysqlDb {
             _ => return Err(AppError::NotFound),
         };
         if kind == "fts" {
-            // Hapus index dulu, lalu kolom generated-nya.
+            // Drop the index first, then its generated column.
             sqlx::query(&format!("ALTER TABLE {} DROP INDEX {}", qi(&hakobackend_core::flat_table_name(collection)), qi(&ddl)))
                 .execute(&self.pool)
                 .await
@@ -660,36 +660,36 @@ mod tests {
 
     #[test]
     fn filter_mysql_parity() {
-        // Perbandingan JSON vs CAST(? AS JSON): type-strict lintas tipe.
+        // JSON vs CAST(? AS JSON) comparison: type-strict across types.
         let (s, p) = frag(&filter("age", FilterOp::Eq, serde_json::json!(30)));
         assert_eq!(s, "JSON_EXTRACT(data, '$.\"age\"') = CAST(? AS JSON)");
         assert_eq!(p, vec!["30"]);
-        // String tetap string JSON ("x" dengan kutip).
+        // Strings stay JSON strings ("x" with quotes).
         let (s, p) = frag(&filter("n", FilterOp::Eq, serde_json::json!("x")));
         assert_eq!(p, vec!["\"x\""]);
         assert!(s.contains("CAST(? AS JSON)"));
-        // Ne field hilang = true.
+        // Ne over a missing field = true.
         let (s, _) = frag(&filter("x", FilterOp::Ne, serde_json::json!(1)));
         assert!(s.contains("OR") && s.contains("IS NULL"));
-        // Array-contains via JSON_CONTAINS uniform.
+        // Array-contains via uniform JSON_CONTAINS.
         let (s, p) = frag(&filter("tags", FilterOp::ArrayContains, serde_json::json!("a")));
         assert_eq!(s, "JSON_CONTAINS(JSON_EXTRACT(data, '$.\"tags\"'), CAST(? AS JSON))");
         assert_eq!(p, vec!["\"a\""]);
-        // Bool ikut jalur CAST (true → "true").
+        // Bools take the CAST path too (false → "false").
         let (s, p) = frag(&filter("b", FilterOp::Gt, serde_json::json!(false)));
         assert!(s.contains(">"));
         assert_eq!(p, vec!["false"]);
     }
 
     #[test]
-    fn identifier_dikutip() {
+    fn identifier_quoted() {
         assert_eq!(qi("a`b"), "`a``b`");
         assert_eq!(jpath("a.b"), "$.\"a\".\"b\"");
     }
 
-    /// Konformansi penuh butuh MySQL/MariaDB live — via env UB_MYSQL_DSN, ignore default.
+    /// Full conformance needs live MySQL/MariaDB — via env UB_MYSQL_DSN, ignored by default.
     #[tokio::test]
-    #[ignore = "butuh MySQL live (UB_MYSQL_DSN)"]
+    #[ignore = "needs live MySQL (UB_MYSQL_DSN)"]
     async fn conformance_mysql() {
         let dsn = std::env::var("UB_MYSQL_DSN").expect("UB_MYSQL_DSN");
         let db = MysqlDb::open(&dsn).await.unwrap();

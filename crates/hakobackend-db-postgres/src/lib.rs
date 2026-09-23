@@ -1,8 +1,8 @@
-//! hakobackend-db-postgres: addon PostgreSQL via sqlx (async native, pool).
+//! hakobackend-db-postgres: PostgreSQL addon via sqlx (native async, pool).
 //!
-//! Pola tabel JSON generik (diport dari `sql.ts` backend lama):
-//! satu tabel per koleksi (flat name) — `id TEXT PK, data JSONB`.
-//! Subkoleksi diflatten + `_collectionPath` di JSON (dilepas saat baca).
+//! Generic JSON table pattern (ported from the legacy `sql.ts` backend):
+//! one table per collection (flat name) — `id TEXT PK, data JSONB`.
+//! Subcollections flattened + `_collectionPath` in JSON (stripped on read).
 
 use std::collections::{HashMap, HashSet};
 use hakobackend_core::{AppError, Capabilities, Change, Database, Direction, Doc, Filter, FilterOp, IndexInfo, IndexKind, IndexSpec, QueryOptions};
@@ -33,7 +33,7 @@ impl PgDb {
         .execute(&self.pool)
         .await
         .map_err(|e| AppError::Internal(safe_db_err(e)))?;
-        // Migrasi toleran: tabel lama tanpa kolom ddl.
+        // Tolerant migration: legacy tables without the ddl column.
         sqlx::query("ALTER TABLE \"__ub_indexes\" ADD COLUMN IF NOT EXISTS ddl TEXT NOT NULL DEFAULT ''")
             .execute(&self.pool)
             .await
@@ -60,14 +60,14 @@ impl PgDb {
     }
 }
 
-// --- Helper SQL murni (diuji unit tanpa DB) ---
+// --- Pure SQL helpers (unit-tested without a DB) ---
 
-/// Kutip identifier (kebal injeksi via kutip-ganda).
+/// Quote an identifier (injection-proof via double-quoting).
 fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Akses JSON: "a.b" → `(data#>'{a,b}')` (perbandingan jsonb, type-strict).
+/// JSON access: "a.b" → `(data#>'{a,b}')` (jsonb comparison, type-strict).
 fn jpath(field: &str) -> String {
     let segs: Vec<String> = field.split('.').map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect();
     format!("(data#>'{{{}}}')", segs.join(","))
@@ -105,7 +105,7 @@ fn push_filter(sql: &mut String, f: &Filter, n: &mut i32, params: &mut Vec<serde
             params.push(f.value.clone());
         }
         FilterOp::In => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in needs an array".into()))?;
             if arr.is_empty() {
                 sql.push_str("FALSE");
                 return Ok(());
@@ -119,12 +119,12 @@ fn push_filter(sql: &mut String, f: &Filter, n: &mut i32, params: &mut Vec<serde
             params.push(f.value.clone());
         }
         FilterOp::ArrayContainsAny => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any needs an array".into()))?;
             if arr.is_empty() {
                 sql.push_str("FALSE");
                 return Ok(());
             }
-            // OR @> seragam (tanpa asumsi string seperti ?|) — selalu tepat.
+            // Uniform OR @> (no string assumption like ?|) — always exact.
             let parts: Vec<String> = arr.iter().map(|_| format!("{col} @> {}", ph())).collect();
             sql.push_str(&format!("({})", parts.join(" OR ")));
             params.extend(arr.iter().cloned());
@@ -133,9 +133,9 @@ fn push_filter(sql: &mut String, f: &Filter, n: &mut i32, params: &mut Vec<serde
     Ok(())
 }
 
-/// Fragmen cursor: bound pada field acuan (order_by[0] atau id) — paritas kontrak.
-/// `id` adalah kolom; lainnya JSON (param serde_json terikat langsung sebagai jsonb).
-/// NULL gugur otomatis (jsonb NULL → baris hilang).
+/// Cursor fragment: bound on the reference field (order_by[0] or id) — contract parity.
+/// `id` is a column; everything else is JSON (serde_json params bound directly as jsonb).
+/// NULL drops automatically (jsonb NULL → row gone).
 fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, n: &mut i32, params: &mut Vec<serde_json::Value>) {
     let field = hakobackend_core::conformance::cursor_field(q);
     let col = if field == "id" { "id".to_string() } else { jpath(field) };
@@ -158,7 +158,7 @@ fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, n: &mut i32, params:
     }
 }
 
-/// Bangun klausa WHERE (+params jsonb): scope path + filter + cursor.
+/// Build the WHERE clause (+jsonb params): path scope + filters + cursor.
 fn build_where(collection: &str, q: &QueryOptions) -> Result<(String, Vec<serde_json::Value>), AppError> {
     let mut filters = Vec::new();
     let mut params = Vec::new();
@@ -199,7 +199,7 @@ fn build_order(q: &QueryOptions) -> String {
     format!(" ORDER BY {}", parts.join(", "))
 }
 
-/// Samarkan detail koneksi (DSN/password tak boleh bocor ke respons).
+/// Scrub connection details (DSN/password must never leak into responses).
 fn safe_db_err(e: sqlx::Error) -> String {
     match e.as_database_error() {
         Some(d) => format!("db error {}", d.code().map(|c| c.to_string()).unwrap_or_default()),
@@ -228,7 +228,7 @@ fn uuid_like() -> String {
     format!("pg{nanos:x}{:x}", std::process::id())
 }
 
-/// Nama index aman (<=60 char, alnum+underscore).
+/// Safe index name (<=60 chars, alnum+underscore).
 fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
     let base = spec.name.clone().unwrap_or_else(|| match spec.kind {
         IndexKind::Simple => format!("idx_{}_{}", table, spec.fields.join("_")),
@@ -244,7 +244,7 @@ impl Database for PgDb {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             driver: "postgres",
-            supports_watch: false, // polling oleh core (LISTEN/NOTIFY menyusul)
+            supports_watch: false, // polled by core (LISTEN/NOTIFY to follow)
             supports_transactions: true,
             supports_composite: true,
             supports_fts: true,
@@ -259,7 +259,7 @@ impl Database for PgDb {
     }
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
-        // Koleksi internal `__*` (registry, sesi) tak diekspos HTTP.
+        // Internal `__*` collections (registry, sessions) are not exposed over HTTP.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename NOT LIKE '\\_%' ESCAPE '\\'",
         )
@@ -420,18 +420,18 @@ impl Database for PgDb {
     }
 
     async fn subscribe(&self, _collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
-        // ponytail: polling oleh core sampai LISTEN/NOTIFY mendarat.
+        // ponytail: polled by core until LISTEN/NOTIFY lands.
         Ok(tokio::sync::broadcast::channel(256).0.subscribe())
     }
 
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError> {
         hakobackend_core::conformance::validate_spec(self.capabilities(), spec)?;
         if spec.unique && spec.kind == IndexKind::FullText {
-            return Err(AppError::BadRequest("fts tak bisa unique".into()));
+            return Err(AppError::BadRequest("fts cannot be unique".into()));
         }
         let table = hakobackend_core::flat_table_name(collection);
         self.ensure_table(&table).await?;
-        // Nama logis (kontrak) vs fisik (DDL per tabel).
+        // Logical name (contract) vs physical (DDL per table).
         let logical = spec.name.clone().unwrap_or_else(|| hakobackend_core::conformance::auto_index_name(spec));
         let physical = safe_index_name(&table, spec);
         let unique = if spec.unique { "UNIQUE " } else { "" };
@@ -555,18 +555,18 @@ mod tests {
 
     #[test]
     fn filter_sql_parity() {
-        // jsonb type-strict: angka tetap angka ($n = jsonb), bukan teks.
+        // jsonb type-strict: numbers stay numbers ($n = jsonb), not text.
         let (s, p) = frag(&filter("age", FilterOp::Eq, serde_json::json!(30)));
         assert_eq!(s, "(data#>'{\"age\"}') = $1");
         assert_eq!(p, vec![serde_json::json!(30)]);
-        // Nested dot-notation → operator #>.
+        // Nested dot-notation → the #> operator.
         let (s, _) = frag(&filter("a.b", FilterOp::Gt, serde_json::json!(1)));
         assert_eq!(s, "(data#>'{\"a\",\"b\"}') > $1");
-        // In berekspansi placeholder per elemen.
+        // In expands one placeholder per element.
         let (s, p) = frag(&filter("age", FilterOp::In, serde_json::json!([1, 2])));
         assert_eq!(s, "(data#>'{\"age\"}') IN ($1,$2)");
         assert_eq!(p.len(), 2);
-        // Array-contains via @> (uniform, tanpa asumsi string).
+        // Array-contains via @> (uniform, no string assumption).
         let (s, _) = frag(&filter("tags", FilterOp::ArrayContains, serde_json::json!("x")));
         assert_eq!(s, "(data#>'{\"tags\"}') @> $1");
         let (s, p) = frag(&filter("tags", FilterOp::ArrayContainsAny, serde_json::json!(["x", "y"])));
@@ -575,19 +575,19 @@ mod tests {
     }
 
     #[test]
-    fn where_scope_dan_cursor() {
+    fn where_scope_and_cursor() {
         let mut q = QueryOptions::default();
         let (w, p) = build_where("posts/1/revisions", &q).unwrap();
         assert!(w.contains(PATH_FIELD) && p.len() == 1);
         let (w2, _) = build_where("posts", &q).unwrap();
         assert!(w2.is_empty());
-        // Cursor: bound pada order_by[0], NULL gugur otomatis (tanpa patch IS NULL).
+        // Cursor: bound on order_by[0], NULL drops automatically (no IS NULL patch).
         q.order_by.push(hakobackend_core::OrderBy { field: "age".into(), direction: hakobackend_core::Direction::Asc });
         q.start_after = Some(serde_json::json!(25));
         q.end_at = Some(serde_json::json!(35));
         let (w3, p3) = build_where("posts", &q).unwrap();
         assert!(w3.contains('>') && w3.contains("<=") && p3.len() == 2);
-        // Acuan id = kolom (bukan JSON).
+        // id reference = column (not JSON).
         let mut qi = QueryOptions::default();
         qi.start_at = Some(serde_json::json!("abc"));
         let (w4, _) = build_where("posts", &qi).unwrap();
@@ -595,14 +595,14 @@ mod tests {
     }
 
     #[test]
-    fn identifier_dikutip() {
+    fn identifier_quoted() {
         assert_eq!(qi("weird\"name"), "\"weird\"\"name\"");
         assert_eq!(jpath("a.b"), "(data#>'{\"a\",\"b\"}')");
     }
 
-    /// Konformansi penuh butuh Postgres live — via env UB_PG_DSN, ignore default.
+    /// Full conformance needs live Postgres — via env UB_PG_DSN, ignored by default.
     #[tokio::test]
-    #[ignore = "butuh Postgres live (UB_PG_DSN)"]
+    #[ignore = "needs live Postgres (UB_PG_DSN)"]
     async fn conformance_pg() {
         let dsn = std::env::var("UB_PG_DSN").expect("UB_PG_DSN");
         let db = PgDb::open(&dsn).await.unwrap();

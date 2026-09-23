@@ -1,12 +1,12 @@
-//! hakobackend-server: gateway HTTP universal (Axum).
-//! Wire-protocol kompatibel dengan rethink-firestore/backend agar SDK lama tetap jalan.
+//! hakobackend-server: universal HTTP gateway (Axum).
+//! Wire protocol compatible with rethink-firestore/backend so legacy SDKs keep working.
 //!
-//! Plug-and-play database: driver dipilih di `hakobackend.toml` (`database.driver`).
-//! Ganti/pasang-lepas DB = edit config + `POST /api/admin/reload` (tanpa rebuild).
-//! Tambah driver baru = crate `hakobackend-db-*` yang impl `hakobackend_core::Database` + 1 arm di `open_driver`.
+//! Plug-and-play database: driver selected in `hakobackend.toml` (`database.driver`).
+//! Swap/plug-unplug DB = edit config + `POST /api/admin/reload` (no rebuild).
+//! Add a new driver = a `hakobackend-db-*` crate impl'ing `hakobackend_core::Database` + 1 arm in `open_driver`.
 //!
-//! Fleksibilitas endpoint: wildcard otomatis (nol-config) + `policy.toml` yang
-//! **hot-reload** (mtime dipantau tiap request; edit file langsung berlaku, tanpa restart).
+//! Endpoint flexibility: automatic wildcard (zero-config) + `policy.toml` that
+//! **hot-reloads** (mtime checked on each request; file edits take effect immediately, no restart).
 
 mod config;
 mod realtime;
@@ -38,27 +38,27 @@ use hakobackend_ratelimit::{Limiter, Quota};
 
 #[derive(Clone)]
 struct AppState {
-    /// Router DB: koleksi -> driver. Hari ini 1 driver untuk semua koleksi;
-    /// peta ini yang memungkinkan override per-koleksi (`routes` di hakobackend.toml, fase 3).
+    /// DB router: collection -> driver. Today 1 driver for all collections;
+    /// this map is what enables per-collection overrides (`routes` in hakobackend.toml, phase 3).
     db: Arc<tokio::sync::RwLock<Arc<dyn Database>>>,
     policy: Arc<PolicyHot>,
-    /// Rantai verifier (kosong = mode dev tanpa auth; resolve selalu None).
+    /// Verifier chain (empty = dev mode without auth; resolve always None).
     auth: Arc<tokio::sync::RwLock<Arc<AuthChain>>>,
-    /// Konkret lokal untuk endpoint /api/auth/* (None bila `local` tak dipakai).
+    /// Concrete local provider for /api/auth/* endpoints (None when `local` is unused).
     local: Arc<tokio::sync::RwLock<Option<Arc<LocalAuth>>>>,
-    /// Alur OAuth GitHub (None bila tanpa client id). Endpoint 400 bila mati.
+    /// GitHub OAuth flow (None without client id). Endpoints return 400 when disabled.
     github: Arc<tokio::sync::RwLock<Option<Arc<GithubOAuth>>>>,
-    /// Flood protection 2 lapis (hot-reload via /api/admin/reload).
+    /// Two-layer flood protection (hot-reload via /api/admin/reload).
     limits: Arc<LimitLayers>,
-    /// TLS aktif (skema https untuk htu DPoP + HSTS).
+    /// TLS enabled (https scheme for DPoP htu + HSTS).
     tls: bool,
-    /// Nama peran bebas milik user yang boleh memanggil /api/admin/*.
+    /// Free-form user role name allowed to call /api/admin/*.
     admin_role: String,
-    /// Flag CLI untuk reload (file dibaca ulang, flag tetap menang).
+    /// CLI flags for reload (file re-read, flags still win).
     cli: Args,
 }
 
-/// Dua bucket token: global longgar + auth ketat. Clone murah (Arc di dalam).
+/// Two token buckets: loose global + strict auth. Cheap clone (Arc inside).
 #[derive(Clone)]
 struct LimitLayers {
     global: Arc<Limiter>,
@@ -66,7 +66,7 @@ struct LimitLayers {
     trust_proxy: bool,
 }
 
-/// Policy yang reload sendiri saat file berubah (cek mtime tiap request — 1 stat call).
+/// Self-reloading policy when the file changes (checks mtime each request — 1 stat call).
 struct PolicyHot {
     path: Option<String>,
     cached: tokio::sync::RwLock<(Option<SystemTime>, Arc<PolicyFile>)>,
@@ -76,10 +76,10 @@ impl PolicyHot {
     fn new(path: Option<String>) -> Self {
         match path {
             None => {
-                // ponytail: tanpa policy file = mode dev terbuka + WARN keras.
-                // Tanpa token = anonim; aturan policy yang menentukan (fail-closed
-                // bila policy file ada). SessionIssuer penuh menyusul (fase C).
-                eprintln!("[ub] WARN: tanpa policy file — semua endpoint TERBUKA (mode dev). Isi `policy_file` di hakobackend.toml untuk produksi.");
+                // ponytail: no policy file = open dev mode + loud WARN.
+                // No token = anonymous; policy rules decide (fail-closed
+                // when a policy file exists). Full SessionIssuer follows (phase C).
+                eprintln!("[ub] WARN: without policy file — all endpoints OPEN (dev mode). Set `policy_file` in hakobackend.toml for production.");
                 Self {
                     path: None,
                     cached: tokio::sync::RwLock::new((None, Arc::new(PolicyFile::open()))),
@@ -87,7 +87,7 @@ impl PolicyHot {
             }
             Some(p) => {
                 let file = PolicyFile::load(&p).unwrap_or_else(|e| {
-                    eprintln!("[ub] WARN: {e}; pakai policy terbuka sementara");
+                    eprintln!("[ub] WARN: {e}; using open policy temporarily");
                     PolicyFile::open()
                 });
                 let m = mtime(&p);
@@ -103,7 +103,7 @@ impl PolicyHot {
             return self.cached.read().await.1.clone();
         };
         let current = mtime(path);
-        // Reload hanya bila mtime berubah (edit user langsung berlaku).
+        // Reload only when mtime changes (user edits take effect immediately).
         if self.cached.read().await.0 != current {
             let mut w = self.cached.write().await;
             if w.0 != current {
@@ -112,7 +112,7 @@ impl PolicyHot {
                         eprintln!("[ub] policy reload: {path}");
                         *w = (current, Arc::new(f));
                     }
-                    Err(e) => eprintln!("[ub] policy reload GAGAL ({e}); policy lama tetap dipakai"),
+                    Err(e) => eprintln!("[ub] policy reload FAILED ({e}); keeping old policy"),
                 }
             }
             return w.1.clone();
@@ -120,8 +120,8 @@ impl PolicyHot {
         self.cached.read().await.1.clone()
     }
 
-    /// Snapshot `[identity]` untuk konstruksi provider (reload-safe: policy
-    /// hot-reload independen, provider dibangun ulang saat /api/admin/reload).
+    /// `[identity]` snapshot for provider construction (reload-safe: policy
+    /// hot-reloads independently, providers rebuilt on /api/admin/reload).
     fn identity_snapshot(&self) -> Identity {
         self.cached.try_read().map(|g| g.1.identity.clone()).unwrap_or_default()
     }
@@ -131,8 +131,8 @@ fn mtime(path: &str) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Satu-satunya tempat yang tahu daftar driver. Driver baru = 1 arm baru.
-/// Driver yang belum diimplementasi mengembalikan pesan jelas, bukan panic.
+/// The only place that knows the driver list. New driver = 1 new arm.
+/// Unimplemented drivers return a clear message, not a panic.
 async fn open_driver(driver: &str, path: &str) -> Result<Arc<dyn Database>, String> {
     match driver {
         "hako" => HakoDb::open(path).map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
@@ -140,7 +140,7 @@ async fn open_driver(driver: &str, path: &str) -> Result<Arc<dyn Database>, Stri
         "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
         "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
         other => Err(format!(
-            "driver `{other}` belum tersedia (duckdb menyusul bila diminta). Pilihan hari ini: {}.",
+            "driver `{other}` not available yet (duckdb follows if requested). Available choices: {}.",
             crate::config::KNOWN_DRIVERS.join(", ")
         )),
     }
@@ -166,8 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data).await.expect("open database");
     println!("[ub] driver={} data={} config={}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source });
 
-    // Env menang atas flag/file untuk URL publik (konsisten dengan secret lain);
-    // diisi dari config hanya bila env kosong. Sekali saat startup/reload.
+    // Env wins over flag/file for the public URL (consistent with other secrets);
+    // filled from config only when env is empty. Once at startup/reload.
     if let Some(p) = &cfg.public_url {
         if std::env::var("UB_PUBLIC_URL").is_err() {
             std::env::set_var("UB_PUBLIC_URL", p);
@@ -186,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let tls = config::tls_pair(&cfg).map_err(|e| format!("[ub] {e}"))?.is_some();
     if tls {
-        println!("[ub] TLS aktif (HSTS + skema https)");
+        println!("[ub] TLS active (HSTS + https scheme)");
     }
 
     let state = AppState {
@@ -201,8 +201,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli,
     };
 
-    // Flood protection berlapis (sebelum kerja mahal apa pun):
-    // /health terbuka (probe LB), /api/auth/* ketat, sisanya global longgar.
+    // Layered flood protection (before any expensive work):
+    // /health open (LB probes), /api/auth/* strict, rest loose global.
     let global = LimitScope { limiter: limits.global.clone(), trust_proxy: limits.trust_proxy };
     let strict = LimitScope { limiter: limits.auth.clone(), trust_proxy: limits.trust_proxy };
     let api = Router::new()
@@ -233,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state);
     if tls {
-        // HSTS hanya bermakna via TLS (tanpa efek di http biasa).
+        // HSTS only meaningful via TLS (no effect on plain http).
         app = app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
             header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
@@ -241,18 +241,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = cfg.listen();
-    // ConnectInfo wajib agar kunci rate-limit = IP peer asli.
+    // ConnectInfo required so the rate-limit key = real peer IP.
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     if tls {
-        // rustls 0.23 + dua provider di tree (aws-lc + ring) = ambigu;
-        // tetapkan aws-lc eksplisit sekali saat startup (idempoten).
+        // rustls 0.23 + two providers in the tree (aws-lc + ring) = ambiguous;
+        // pin aws-lc explicitly once at startup (idempotent).
         let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
         let (cert, key) = config::tls_pair(&cfg).map_err(|e| format!("[ub] {e}"))?.unwrap();
         let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
-            .map_err(|e| format!("[ub] TLS gagal dimuat: {e}"))?;
+            .map_err(|e| format!("[ub] TLS failed to load: {e}"))?;
         println!("[ub] listening (TLS) on https://{addr}");
-        axum_server::bind_rustls(addr.parse().map_err(|e| format!("[ub] listen salah: {e}"))?, rustls)
+        axum_server::bind_rustls(addr.parse().map_err(|e| format!("[ub] invalid listen address: {e}"))?, rustls)
             .serve(svc)
             .await?;
     } else {
@@ -263,15 +263,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Scope satu lapis rate-limit (limiter + kepercayaan proxy).
+/// Single rate-limit layer scope (limiter + proxy trust).
 #[derive(Clone)]
 struct LimitScope {
     limiter: Arc<Limiter>,
     trust_proxy: bool,
 }
 
-/// Kunci = IP peer, atau X-Forwarded-For pertama bila trust_proxy.
-/// XFF hanya dipercaya di belakang proxy yang membersihkannya (spoofable bila langsung).
+/// Key = peer IP, or first X-Forwarded-For when trust_proxy.
+/// XFF trusted only behind a sanitizing proxy (spoofable when direct).
 fn client_key(headers: &HeaderMap, peer: std::net::SocketAddr, trust_proxy: bool) -> String {
     if trust_proxy {
         if let Some(first) = headers
@@ -303,37 +303,37 @@ async fn limit_mw(
     }
 }
 
-/// Auto-create siap pakai (pola autoCreateTablesFromRules backend lama,
-/// diperluas ke index): koleksi dari kunci policy + `[[indexes]]` config.
-/// Gagal per item = WARN, bukan fatal (endpoint manual tetap tersedia).
+/// Ready-to-use auto-create (legacy autoCreateTablesFromRules pattern,
+/// extended to indexes): collections from policy keys + `[[indexes]]` config.
+/// Per-item failure = WARN, not fatal (manual endpoints stay available).
 async fn auto_provision(db: &Arc<dyn Database>, policy: &Arc<PolicyFile>, indexes: &[config::IndexDecl]) {
     for collection in policy.collections.keys() {
         if let Err(e) = db.ensure_collection(collection).await {
-            eprintln!("[ub] auto-create koleksi {collection} gagal: {e}");
+            eprintln!("[ub] auto-create collection {collection} failed: {e}");
         }
     }
     for decl in indexes {
         let spec = match decl.validate() {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("[ub] [[indexes]] dilewati: {e}");
+                eprintln!("[ub] [[indexes]] skipped: {e}");
                 continue;
             }
         };
         if let Err(e) = db.ensure_collection(&decl.collection).await {
-            eprintln!("[ub] auto-create koleksi {} gagal: {e}", decl.collection);
+            eprintln!("[ub] auto-create collection {} failed: {e}", decl.collection);
             continue;
         }
         match db.create_index(&decl.collection, &spec).await {
-            Ok(info) => println!("[ub] index siap: {} → {}", decl.collection, info.name),
-            Err(e) => eprintln!("[ub] index {} gagal: {e}", decl.collection),
+            Ok(info) => println!("[ub] index ready: {} → {}", decl.collection, info.name),
+            Err(e) => eprintln!("[ub] index {} failed: {e}", decl.collection),
         }
     }
 }
 
-/// Bangun rantai auth + konkret lokal. `local` butuh db handle + `[identity]`,
-/// jadi dibangun di sini (server), bukan di `open_builtin`. Gagal cepat bila
-/// nama/file/secret tak valid (fail-closed).
+/// Build the auth chain + local concrete provider. `local` needs a db handle + `[identity]`,
+/// so it is built here (server), not in `open_builtin`. Fail fast on
+/// invalid name/file/secret (fail-closed).
 fn open_auth(
     value: Option<&str>,
     db: Arc<dyn Database>,
@@ -347,7 +347,7 @@ fn open_auth_result(
     db: Arc<dyn Database>,
     identity: Identity,
 ) -> Result<(AuthChain, Option<Arc<LocalAuth>>, Option<Arc<GithubOAuth>>), String> {
-    // Versi tanpa panic untuk /api/admin/reload (error → 400, konfigurasi lama bertahan).
+    // Panic-free version for /api/admin/reload (error → 400, old config retained).
     let spec = AuthSpec::parse(value.unwrap_or("off"));
     let custom = match &spec {
         AuthSpec::File(path) => Some(CustomAuth::load(path)?),
@@ -364,7 +364,7 @@ fn open_auth_result(
         .then(|| LocalAuth::build(db.clone(), identity))
         .transpose()?;
     if let (Some(d), Some(l)) = (custom.as_ref().and_then(|c| c.dpop.as_deref()), &local) {
-        // custom.toml `dpop` menang atas env; typo = error (fail-closed).
+        // custom.toml `dpop` wins over env; typo = error (fail-closed).
         l.set_dpop_mode(hakobackend_auth_local::DpopMode::parse(d)?);
     }
     let chain = open_chain(
@@ -372,14 +372,14 @@ fn open_auth_result(
         custom.as_ref(),
         local.clone().map(|l| l as Arc<dyn AuthProvider>),
     )?;
-    // OAuth independen dari rantai: aktif bila kredensial env-nya lengkap.
+    // OAuth independent of the chain: active when its env credentials are complete.
     let github = GithubOAuth::from_env(db)?;
     Ok((chain, local, github))
 }
 
-/// Keputusan DPoP murni (diuji unit): Off / token non-lokal = lolos;
-/// Require tanpa proof = strip (anonim → policy bicara); proof ada = wajib verifikasi;
-/// Accept tanpa proof = bearer fallback.
+/// Pure DPoP decision (unit-tested): Off / non-local token = pass;
+/// Require without proof = strip (anonymous → policy decides); proof present = must verify;
+/// Accept without proof = bearer fallback.
 #[derive(Debug, PartialEq, Eq)]
 enum DpopAction {
     Keep,
@@ -396,7 +396,7 @@ fn dpop_action(mode: DpopMode, is_local_token: bool, has_proof: bool) -> DpopAct
     }
 }
 
-/// Resolve satu token → AuthContext (dipakai middleware, WS, SSE).
+/// Resolve one token → AuthContext (used by middleware, WS, SSE).
 async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
     let policy = s.policy.get().await;
     let db = s.db.read().await.clone();
@@ -405,9 +405,9 @@ async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
     chain.resolve(&policy.identity, Some(db_ref), token).await
 }
 
-/// Middleware auth: Bearer (klien API) else cookie access (browser BFF) →
-/// resolve rantai → enforcement DPoP (token lokal) → `Extension<Option<AuthContext>>`.
-/// Tanpa token / gagal DPoP = anonim (aturan policy yang menentukan, bukan middleware).
+/// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
+/// chain resolve → DPoP enforcement (local tokens) → `Extension<Option<AuthContext>>`.
+/// No token / DPoP failure = anonymous (policy rules decide, not middleware).
 async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
     let token = bearer(req.headers()).or_else(|| read_cookie(req.headers(), ACCESS_COOKIE));
     let dpop_proof = req.headers().get("DPoP").and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -454,7 +454,7 @@ fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     })
 }
 
-/// Skema asal absolut: https bila TLS aktif (DPoP htu wajib cocok skema persis).
+/// Absolute origin scheme: https when TLS is on (DPoP htu must match the scheme exactly).
 fn base_uri(tls: bool, headers: &HeaderMap, path: &str) -> String {
     let scheme = if tls { "https" } else { "http" };
     format!(
@@ -476,9 +476,9 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "db": "hakodb" }))
 }
 
-/// Baca ulang config + driver + rantai auth. "Pasang-lepas saat jalan":
-/// edit file, POST ke sini (peran admin), selesai — flag CLI tetap menang.
-/// Gagal di langkah mana pun = 400 dan konfigurasi lama bertahan seluruhnya.
+/// Re-read config + driver + auth chain. "Hot-swap while running":
+/// edit the file, POST here (admin role), done — CLI flags still win.
+/// Failure at any step = 400 and the old config is fully retained.
 async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>) -> impl IntoResponse {
     if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
         return forbidden();
@@ -502,7 +502,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     *s.auth.write().await = Arc::new(chain);
     *s.local.write().await = local;
     *s.github.write().await = github;
-    // Angka rate-limit + auto-provision ikut hot-reload (tanpa restart).
+    // Rate-limit numbers + auto-provision hot-reload too (no restart).
     s.limits.global.set_quota(Quota::per_minute(cfg.limit_global.0, cfg.limit_global.1));
     s.limits.auth.set_quota(Quota::per_minute(cfg.limit_auth.0, cfg.limit_auth.1));
     auto_provision(&s.db.read().await.clone(), &s.policy.get().await, &cfg.indexes).await;
@@ -547,9 +547,9 @@ async fn get_or_list(
         PathKind::Collection { collection } => match parse_options(&q) {
             Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
             Ok(opts) => match db.list(&collection, &opts).await {
-                // Filter per-doc (pengganti loop server.ts:233): dokumen yang
-                // tidak lolos rule tidak ikut dalam respons, tanpa N+1 query
-                // tambahan bila driver mendorong rule ke query (fase 3).
+                // Per-doc filter (replacement for the server.ts:233 loop): documents
+                // failing the rule are excluded from the response, with no extra N+1
+                // queries when drivers push rules into queries (phase 3).
                 Ok(docs) => {
                     let visible: Vec<_> = docs
                         .into_iter()
@@ -571,20 +571,20 @@ fn incoming_doc(id: &str, body: serde_json::Value) -> Doc {
     Doc { id: id.to_string(), data }
 }
 
-// --- Index (HTTP_CONTRACT.md §index): kelola simple/composite/FTS ---
+// --- Index (HTTP_CONTRACT.md §index): manage simple/composite/FTS ---
 //
-// Bentuk baru: POST/GET/DELETE /api/indexes (+collection sebagai field/query).
-// Bentuk legacy (POST /api/collections/<coll>/index) ditangani shim di create().
-// Gate policy: Update (operasi skema = write), kecuali list = List.
+// New shape: POST/GET/DELETE /api/indexes (+collection as field/query).
+// Legacy shape (POST /api/collections/<coll>/index) handled by the shim in create().
+// Policy gate: Update (schema ops = write), except list = List.
 
-/// Deteksi shim legacy: ".../<coll>/index" → Some(coll). "index" polos (koleksi
-/// sungguhan bernama index) → None agar tetap menjadi operasi dokumen.
+/// Detect the legacy shim: ".../<coll>/index" → Some(coll). Plain "index" (a real
+/// collection named index) → None so it stays a document operation.
 fn legacy_index_collection(path: &str) -> Option<String> {
     path.trim_matches('/').strip_suffix("/index").map(|s| s.to_string())
 }
 
 fn parse_index_spec(body: &serde_json::Value) -> Result<hakobackend_core::IndexSpec, String> {
-    serde_json::from_value(body.clone()).map_err(|_| "body butuh {collection, fields[], name?, unique?, kind?}".to_string())
+    serde_json::from_value(body.clone()).map_err(|_| "body requires {collection, fields[], name?, unique?, kind?}".to_string())
 }
 
 async fn index_create(
@@ -594,12 +594,12 @@ async fn index_create(
 ) -> impl IntoResponse {
     let collection = match body.get("collection").and_then(|v| v.as_str()) {
         Some(c) if !c.is_empty() => c.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "collection wajib").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "collection required").into_response(),
     };
     index_create_inner(s, auth, collection, body).await
 }
 
-/// Shim legacy: body {name, fields} (+kind/unique opsional), respons {success:true}.
+/// Legacy shim: body {name, fields} (+optional kind/unique), response {success:true}.
 async fn index_create_legacy(
     s: AppState,
     auth: Option<AuthContext>,
@@ -638,7 +638,7 @@ async fn index_list(
 ) -> impl IntoResponse {
     let collection = match q.get("collection").map(|s| s.as_str()) {
         Some(c) if !c.is_empty() => c.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "query ?collection= wajib").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "query ?collection= required").into_response(),
     };
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
@@ -657,7 +657,7 @@ async fn index_drop(
 ) -> impl IntoResponse {
     let (collection, name) = match (q.get("collection"), q.get("name")) {
         (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => (c.clone(), n.clone()),
-        _ => return (StatusCode::BAD_REQUEST, "query ?collection= & ?name= wajib").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "query ?collection= & ?name= required").into_response(),
     };
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
@@ -675,9 +675,9 @@ async fn create(
     Path(path): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Shim kompatibilitas legacy: POST /api/collections/<coll>/index {name, fields}
-    // (backend lama, server.ts:193). Bentuk baru: POST /api/indexes.
-    // Koleksi yang benar-benar bernama "index" diakses via bentuk baru.
+    // Legacy compat shim: POST /api/collections/<coll>/index {name, fields}
+    // (legacy backend, server.ts:193). New shape: POST /api/indexes.
+    // Collections actually named "index" are accessed via the new shape.
     if let Some(collection) = legacy_index_collection(&path) {
         return index_create_legacy(s, auth, collection, body).await;
     }
@@ -718,7 +718,7 @@ async fn patch(
     Path(path): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // ponytail: merge=true memakai path yang sama dengan PUT; tanpa baca-tulis manual.
+    // ponytail: merge=true uses the same path as PUT; no manual read-modify-write.
     write_doc(s, auth, path, body, true).await
 }
 
@@ -733,7 +733,7 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             let policy = s.policy.get().await;
             let db = s.db.read().await.clone();
             let existing = db.get(&collection, &id).await.ok().flatten();
-            // Rule owner dinilai terhadap dokumen existing (milik siapa data ini?).
+            // Owner rule evaluated against the existing document (who owns this data?).
             if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
                 return forbidden();
             }
@@ -773,7 +773,7 @@ async fn remove(
     }
 }
 
-// --- Auth lokal (BFF): dua cookie HttpOnly, browser tak pegang token ---
+// --- Local auth (BFF): two HttpOnly cookies, browser never holds tokens ---
 
 fn session_cookies(local: &LocalAuth, tokens: &hakobackend_auth_local::SessionTokens) -> HeaderMap {
     let mut h = HeaderMap::new();
@@ -782,7 +782,7 @@ fn session_cookies(local: &LocalAuth, tokens: &hakobackend_auth_local::SessionTo
         (REFRESH_COOKIE, &tokens.refresh_opaque, local.refresh_ttl()),
     ];
     for (name, value, age) in pair {
-        // __Host-: Secure + Path=/ + tanpa Domain (wajib; localhost dihitung secure context).
+        // __Host-: Secure + Path=/ + no Domain (required; localhost counts as secure context).
         let v = format!("{name}={value}; Path=/; Max-Age={age}; Secure; HttpOnly; SameSite=Strict");
         h.append(header::SET_COOKIE, v.parse().unwrap());
     }
@@ -800,7 +800,7 @@ fn clear_cookies() -> HeaderMap {
 
 async fn local_or_400(s: &AppState) -> Result<Arc<LocalAuth>, Response> {
     s.local.read().await.clone().ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, "auth local tidak aktif (lihat --auth)").into_response()
+        (StatusCode::BAD_REQUEST, "local auth is not active (see --auth)").into_response()
     })
 }
 
@@ -815,13 +815,13 @@ async fn auth_register(State(s): State<AppState>, Json(body): Json<serde_json::V
     };
     let mut body = match body.as_object() {
         Some(m) => m.clone().into_iter().collect::<HashMap<_, _>>(),
-        None => return (StatusCode::BAD_REQUEST, "body JSON object wajib").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "JSON object body required").into_response(),
     };
     let id = body.remove("id").and_then(|v| v.as_str().map(str::to_string));
     let email = body.remove("email").and_then(|v| v.as_str().map(str::to_string));
     let password = match body.remove("password").and_then(|v| v.as_str().map(str::to_string)) {
         Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, "password wajib").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "password required").into_response(),
     };
     match local.register(id, email, &password, body).await {
         Ok(doc) => (StatusCode::CREATED, Json(serde_json::json!({ "id": doc.id }))).into_response(),
@@ -829,8 +829,8 @@ async fn auth_register(State(s): State<AppState>, Json(body): Json<serde_json::V
     }
 }
 
-/// Komponen proof DPoP untuk penerbitan (login/refresh): htu = URI absolut endpoint ini.
-/// Host hilang / proof rusak → gagal di bind_dpop (fail-closed).
+/// DPoP proof components for issuance (login/refresh): htu = absolute URI of this endpoint.
+/// Missing Host / broken proof → fails in bind_dpop (fail-closed).
 fn issuance_parts(s: &AppState, headers: &HeaderMap, path: &str) -> (Option<String>, String) {
     let uri = base_uri(s.tls, headers, path);
     let proof = headers.get("DPoP").and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -848,7 +848,7 @@ async fn auth_login(
     };
     let map = match body.as_object() {
         Some(m) => m,
-        None => return (StatusCode::BAD_REQUEST, "body JSON object wajib").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "JSON object body required").into_response(),
     };
     let owned: HashMap<String, serde_json::Value> = map.clone().into_iter().collect();
     let login = str_field(&owned, &["login", "id", "email", "username"]);
@@ -862,11 +862,11 @@ async fn auth_login(
                     let headers = session_cookies(&local, &tokens);
                     (StatusCode::OK, headers, Json(serde_json::json!({ "uid": ctx.uid, "roles": ctx.roles }))).into_response()
                 }
-                // Samarkan: login vs password vs dpop salah tak dibedakan (anti enumerasi).
-                Err(_) => (StatusCode::UNAUTHORIZED, "kredensial salah").into_response(),
+                // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
+                Err(_) => (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
             }
         }
-        _ => (StatusCode::BAD_REQUEST, "login + password wajib").into_response(),
+        _ => (StatusCode::BAD_REQUEST, "login + password required").into_response(),
     }
 }
 
@@ -886,8 +886,8 @@ async fn auth_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl Int
             let h = session_cookies(&local, &tokens);
             (StatusCode::OK, h, Json(serde_json::json!({ "uid": ctx.uid, "roles": ctx.roles }))).into_response()
         }
-        // Reuse/expired/asing: cabut cookie + tolak (fail-closed).
-        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(), "sesi tidak valid").into_response(),
+        // Reuse/expired/foreign: clear cookies + reject (fail-closed).
+        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(), "invalid session").into_response(),
     }
 }
 
@@ -907,17 +907,17 @@ async fn auth_me(Extension(auth): Extension<Option<AuthContext>>) -> impl IntoRe
     }
 }
 
-// --- Realtime: WS dua-arah + SSE satu-arah (HTTP_CONTRACT.md §realtime) ---
+// --- Realtime: two-way WS + one-way SSE (HTTP_CONTRACT.md §realtime) ---
 //
 // WS:  -> {"type":"subscribe","key","collection","options"?, "group"?, "token"?}
 //      -> {"type":"unsubscribe","key"} | {"type":"ping"} | {"type":"auth","token"}
 //      <- {"type":"ready","key"} | {"type":"change","key","kind","doc"}
 //      <- {"type":"error","key"?,"message"} | {"type":"pong"}
 // SSE: GET /api/stream/<coll>?options=&token= → event: change, data: {kind,doc}.
-// Token via Bearer/cookie diutamakan; ?token= fallback (tercatat di URL —
-// disarankan hanya via TLS; lihat fase TLS). Batas 100 subs/koneksi WS.
+// Token via Bearer/cookie preferred; ?token= fallback (logged in URL —
+// recommended only via TLS; see TLS phase). 100 subs/WS connection limit.
 
-/// Batas ukuran pesan WS masuk (anti banjir frame).
+/// Inbound WS message size limit (anti frame-flood).
 const WS_MAX_MSG: usize = 1024 * 1024;
 
 async fn ws_handler(
@@ -950,7 +950,7 @@ fn ws_err(key: Option<&str>, message: &str) -> serde_json::Value {
 async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthContext>) {
     let mut subs: HashMap<String, realtime::Subscription> = HashMap::new();
     loop {
-        // Satu tugas: pesan soket + drain semua subscription (tanpa select! dinamis).
+        // Single task: socket messages + drain all subscriptions (no dynamic select!).
         let msg = tokio::select! {
             m = socket.recv() => m,
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => None,
@@ -969,7 +969,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
             let v: serde_json::Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(_) => {
-                    if !ws_send(&mut socket, ws_err(None, "pesan bukan JSON")).await {
+                    if !ws_send(&mut socket, ws_err(None, "message is not JSON")).await {
                         break;
                     }
                     continue;
@@ -993,13 +993,13 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                     let key = v.get("key").and_then(|k| k.as_str()).unwrap_or("").to_string();
                     let collection = v.get("collection").and_then(|c| c.as_str()).unwrap_or("").to_string();
                     if key.is_empty() || collection.is_empty() {
-                        if !ws_send(&mut socket, ws_err(None, "key + collection wajib")).await {
+                        if !ws_send(&mut socket, ws_err(None, "key + collection required")).await {
                             break;
                         }
                         continue;
                     }
                     if subs.len() >= realtime::MAX_SUBS_PER_SOCKET && !subs.contains_key(&key) {
-                        if !ws_send(&mut socket, ws_err(Some(&key), "batas subscription")).await {
+                        if !ws_send(&mut socket, ws_err(Some(&key), "subscription limit exceeded")).await {
                             break;
                         }
                         continue;
@@ -1012,7 +1012,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                             .unwrap_or_default(),
                         group: v.get("group").and_then(|g| g.as_bool()).unwrap_or(false),
                     };
-                    // Token per-subscribe (pola legacy authData) mengalahkan auth koneksi.
+                    // Per-subscribe token (legacy authData pattern) overrides connection auth.
                     let sub_auth = match v.get("token").and_then(|t| t.as_str()) {
                         Some(t) => resolve_token(&s, t).await,
                         None => auth.clone(),
@@ -1030,7 +1030,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                             let msg = if matches!(e, hakobackend_core::AppError::PermissionDenied) {
                                 "Permission denied by policy"
                             } else {
-                                "subscribe gagal"
+                                "subscribe failed"
                             };
                             if !ws_send(&mut socket, ws_err(Some(&key), msg)).await {
                                 break;
@@ -1044,13 +1044,13 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                     }
                 }
                 _ => {
-                    if !ws_send(&mut socket, ws_err(None, "type tak dikenal")).await {
+                    if !ws_send(&mut socket, ws_err(None, "unknown type")).await {
                         break;
                     }
                 }
             }
         }
-        // Drain semua subscription ke soket.
+        // Drain all subscriptions to the socket.
         let mut dead = false;
         for (key, sub) in subs.iter_mut() {
             while let Ok(ev) = sub.rx.try_recv() {
@@ -1079,7 +1079,7 @@ async fn sse_handler(
 ) -> Response {
     let collection = match parse_collection_path(&path) {
         PathKind::Collection { collection } if !collection.is_empty() => collection,
-        _ => return (StatusCode::BAD_REQUEST, "SSE hanya untuk endpoint koleksi").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "SSE only supports collection endpoints").into_response(),
     };
     let auth = match bearer(&headers)
         .or_else(|| read_cookie(&headers, ACCESS_COOKIE))
@@ -1100,8 +1100,8 @@ async fn sse_handler(
         Err(e) if matches!(e, hakobackend_core::AppError::PermissionDenied) => return forbidden(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    // Bridge: Subscription (pemilik task sumber) hidup di tugas penerus; bila
-    // klien putus, send gagal → tugas berhenti → sumber di-abort (rantai rapi).
+    // Bridge: Subscription (source-task owner) lives in the forwarder task; when
+    // the client disconnects, send fails → task stops → source aborted (clean chain).
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<sse::Event, std::convert::Infallible>>();
     tokio::spawn(async move {
         let mut sub = sub;
@@ -1122,11 +1122,11 @@ async fn sse_handler(
         .into_response()
 }
 
-// --- OAuth GitHub, pola BFF: browser redirect, token tak pernah ke browser ---
+// --- GitHub OAuth, BFF pattern: browser redirect, tokens never reach the browser ---
 
 async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
     match s.github.read().await.clone() {
-        None => (StatusCode::BAD_REQUEST, "oauth github tidak dikonfigurasi").into_response(),
+        None => (StatusCode::BAD_REQUEST, "github oauth is not configured").into_response(),
         Some(g) => match g.login_url().await {
             Ok(url) => Redirect::to(&url).into_response(),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1140,16 +1140,16 @@ async fn github_callback(
 ) -> impl IntoResponse {
     let (g, local) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
         (Some(g), Some(l)) => (g, l),
-        _ => return (StatusCode::BAD_REQUEST, "oauth github butuh kredensial env + `local` dalam rantai").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain").into_response(),
     };
     let (code, state) = match (q.get("code").cloned(), q.get("state").cloned()) {
         (Some(c), Some(st)) => (c, st),
-        _ => return (StatusCode::BAD_REQUEST, "code + state wajib").into_response(),
+        _ => return (StatusCode::BAD_REQUEST, "code + state required").into_response(),
     };
-    // Samarkan semua kegagalan (code jelek, state basi, github down).
+    // Obfuscate all failures (bad code, stale state, github down).
     let (uid, email, login) = match g.callback(&code, &state).await {
         Ok(v) => v,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "verifikasi github gagal").into_response(),
+        Err(_) => return (StatusCode::UNAUTHORIZED, "github verification failed").into_response(),
     };
     let mut profile = HashMap::new();
     if let Some(l) = login {
@@ -1158,7 +1158,7 @@ async fn github_callback(
     match local.login_external(&uid, email, profile).await {
         Ok((_ctx, tokens)) => {
             let mut h = session_cookies(&local, &tokens);
-            // BFF: browser kembali ke app dengan cookie sesi; tanpa token di URL.
+            // BFF: browser returns to the app with a session cookie; no tokens in URL.
             h.insert(header::LOCATION, g.after_login().parse().unwrap());
             (StatusCode::FOUND, h).into_response()
         }
@@ -1171,15 +1171,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dpop_tabel_keputusan() {
+    fn dpop_decision_table() {
         use DpopAction::*;
-        // Off / non-lokal selalu lolos.
+        // Off / non-local always passes.
         assert_eq!(dpop_action(DpopMode::Off, true, true), Keep);
         assert_eq!(dpop_action(DpopMode::Require, false, false), Keep);
-        // Require tanpa proof = strip; dengan proof = verifikasi.
+        // Require without proof = strip; with proof = verify.
         assert_eq!(dpop_action(DpopMode::Require, true, false), Strip);
         assert_eq!(dpop_action(DpopMode::Require, true, true), MustVerify);
-        // Accept: bearer fallback tanpa proof, verifikasi bila ada proof.
+        // Accept: bearer fallback without proof, verify when proof is present.
         assert_eq!(dpop_action(DpopMode::Accept, true, false), Keep);
         assert_eq!(dpop_action(DpopMode::Accept, true, true), MustVerify);
     }
@@ -1190,24 +1190,24 @@ mod tests {
             legacy_index_collection("/posts/p1/revisions/index/").as_deref(),
             Some("posts/p1/revisions")
         );
-        // Koleksi sungguhan bernama "index" tidak dibajak.
+        // A real collection named "index" is not hijacked.
         assert_eq!(legacy_index_collection("index"), None);
         assert_eq!(legacy_index_collection("posts"), None);
     }
 
     #[test]
-    fn kunci_rate_limit() {
+    fn rate_limit_key() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let peer: SocketAddr = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1234).into();
         let plain = HeaderMap::new();
-        // Tanpa trust_proxy: selalu IP peer (XFF spoof diabaikan).
+        // Without trust_proxy: always peer IP (spoofed XFF ignored).
         let mut spoof = HeaderMap::new();
         spoof.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
         assert_eq!(client_key(&spoof, peer, false), "10.0.0.1");
         assert_eq!(client_key(&plain, peer, false), "10.0.0.1");
-        // Dengan trust_proxy: entri pertama XFF.
+        // With trust_proxy: first XFF entry.
         assert_eq!(client_key(&spoof, peer, true), "1.2.3.4");
-        // XFF kosong/rusak → fallback peer.
+        // Empty/broken XFF → peer fallback.
         assert_eq!(client_key(&plain, peer, true), "10.0.0.1");
     }
 
@@ -1217,7 +1217,7 @@ mod tests {
         h.insert(header::HOST, "api.x.id:8080".parse().unwrap());
         assert_eq!(base_uri(false, &h, "/api/auth/login"), "http://api.x.id:8080/api/auth/login");
         assert_eq!(base_uri(true, &h, "/api/auth/login"), "https://api.x.id:8080/api/auth/login");
-        // Host hilang → "unknown" (fail-closed di verifikasi htu).
+        // Missing Host → "unknown" (fail-closed in htu verification).
         assert_eq!(base_uri(true, &HeaderMap::new(), "/x"), "https://unknown/x");
     }
 }

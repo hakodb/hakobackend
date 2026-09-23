@@ -1,12 +1,12 @@
-//! hakobackend-auth-local: satu-satunya issuer (fase C). Verifier + manager akun lokal.
+//! hakobackend-auth-local: the sole issuer (phase C). Verifier + local account manager.
 //!
-//! Dual-token pola BFF: access JWT pendek + refresh opaque rotasi-tiap-pakai,
-//! keduanya HttpOnly (`__Host-`, Secure, SameSite=Strict). Browser JS tidak
-//! pernah melihat token. Refresh reuse → cabut semua sesi user (fail-closed).
-//! Password Argon2id; sesi di koleksi internal `__sessions` (lihat SECURITY_RULES §4).
-//! Env: `UB_LOCAL_JWT_SECRET` (wajib), `UB_LOCAL_USERS` (default `users`),
-//! `UB_LOCAL_DEFAULT_ROLE` (opsional), `UB_LOCAL_ACCESS_TTL` (dtk, default 600),
-//! `UB_LOCAL_REFRESH_TTL` (dtk, default 30 hari).
+//! Dual-token BFF pattern: short-lived access JWT + per-use rotating opaque refresh,
+//! both HttpOnly (`__Host-`, Secure, SameSite=Strict). Browser JS never
+//! sees tokens. Refresh reuse → revoke all user sessions (fail-closed).
+//! Argon2id passwords; sessions in the internal `__sessions` collection (see SECURITY_RULES §4).
+//! Env: `UB_LOCAL_JWT_SECRET` (required), `UB_LOCAL_USERS` (default `users`),
+//! `UB_LOCAL_DEFAULT_ROLE` (optional), `UB_LOCAL_ACCESS_TTL` (secs, default 600),
+//! `UB_LOCAL_REFRESH_TTL` (secs, default 30 days).
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use argon2::password_hash::rand_core::OsRng;
@@ -21,12 +21,12 @@ pub mod dpop;
 pub use dpop::{DpopMode, DpopRequest};
 
 pub const NAME: &str = "local";
-/// Cookie access JWT: Path=/ agar terkirim ke semua API.
+/// Access JWT cookie: Path=/ so it is sent to all APIs.
 pub const ACCESS_COOKIE: &str = "__Host-ub_at";
-/// Cookie refresh opaque: Path=/ (syarat prefix `__Host-`; hanya dibaca di
-/// endpoint refresh). Keduanya HttpOnly + Secure + SameSite=Strict.
+/// Opaque refresh cookie: Path=/ (`__Host-` prefix requirement; only read at
+/// the refresh endpoint). Both HttpOnly + Secure + SameSite=Strict.
 pub const REFRESH_COOKIE: &str = "__Host-ub_rt";
-/// Koleksi sesi internal — prefix `__`, tidak diekspos HTTP (SECURITY_RULES §4).
+/// Internal session collection — `__` prefix, never exposed over HTTP (SECURITY_RULES §4).
 pub const SESSIONS_COLLECTION: &str = "__sessions";
 const PASSWORD_FIELD: &str = "password_hash";
 const ISSUER: &str = "universalbackend";
@@ -42,9 +42,9 @@ pub struct LocalConfig {
 impl LocalConfig {
     pub fn from_env() -> Result<Self, String> {
         let jwt_secret = std::env::var("UB_LOCAL_JWT_SECRET")
-            .map_err(|_| "auth local butuh env UB_LOCAL_JWT_SECRET (min 32 karakter acak)".to_string())?;
+            .map_err(|_| "auth local requires env UB_LOCAL_JWT_SECRET (min 32 random characters)".to_string())?;
         if jwt_secret.len() < 32 {
-            return Err("UB_LOCAL_JWT_SECRET terlalu pendek (min 32 karakter)".into());
+            return Err("UB_LOCAL_JWT_SECRET too short (min 32 characters)".into());
         }
         let num = |k: &str, d: u64| {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
@@ -72,9 +72,9 @@ pub struct LocalAuth {
 }
 
 impl LocalAuth {
-    /// `users_collection` diambil dari `[identity]` policy (pilihan user).
-    /// Mengembalikan konkret (server butuh method register/login/refresh);
-    /// koersi ke `Arc<dyn AuthProvider>` untuk rantai ada di server.
+    /// `users_collection` comes from the `[identity]` policy (user's choice).
+    /// Returns the concrete type (server needs the register/login/refresh methods);
+    /// coercion to `Arc<dyn AuthProvider>` for the chain lives in the server.
     pub fn build(db: Arc<dyn Database>, identity: Identity) -> Result<Arc<Self>, String> {
         Ok(Arc::new(Self {
             cfg: LocalConfig::from_env()?,
@@ -85,7 +85,7 @@ impl LocalAuth {
         }))
     }
 
-    /// Mode DPoP efektif (env `UB_LOCAL_DPOP`, bisa dioverride `dpop` custom.toml).
+    /// Effective DPoP mode (env `UB_LOCAL_DPOP`, overridable via `dpop` in custom.toml).
     pub fn dpop_mode(&self) -> DpopMode {
         *self.dpop_mode.lock().unwrap()
     }
@@ -98,7 +98,7 @@ impl LocalAuth {
         &self.identity.users_collection
     }
 
-    /// Umur cookie (dtk) — dipakai HTTP layer saat menanam Set-Cookie.
+    /// Cookie lifetime (secs) — used by the HTTP layer when setting Set-Cookie.
     pub fn access_ttl(&self) -> u64 {
         self.cfg.access_ttl_secs
     }
@@ -118,7 +118,7 @@ impl LocalAuth {
         });
         q.limit = Some(2);
         let rows = self.db.list(self.users(), &q).await.map_err(internal)?;
-        // Tepat 1 hasil; 0/2+ = samarkan sebagai kredensial salah (anti enumerasi).
+        // Exactly 1 hit; 0/2+ = disguised as wrong credentials (anti-enumeration).
         if rows.len() == 1 {
             Ok(rows.into_iter().next().unwrap())
         } else {
@@ -165,8 +165,8 @@ impl LocalAuth {
         }
     }
 
-    /// Registrasi self-service: `role`/`password_hash` dari body SELALU dibuang
-    /// (anti self-eskalasi); peran hanya dari `UB_LOCAL_DEFAULT_ROLE` bila diisi.
+    /// Self-service registration: `role`/`password_hash` from the body are ALWAYS discarded
+    /// (anti self-escalation); roles only come from `UB_LOCAL_DEFAULT_ROLE` when set.
     pub async fn register(
         &self,
         id: Option<String>,
@@ -174,9 +174,9 @@ impl LocalAuth {
         password: &str,
         profile: HashMap<String, serde_json::Value>,
     ) -> Result<Doc, AppError> {
-        let id = id.or(email.clone()).filter(|s| !s.is_empty()).ok_or_else(|| AppError::BadRequest("id/email wajib".into()))?;
+        let id = id.or(email.clone()).filter(|s| !s.is_empty()).ok_or_else(|| AppError::BadRequest("id/email required".into()))?;
         if password.len() < 8 {
-            return Err(AppError::BadRequest("password min 8 karakter".into()));
+            return Err(AppError::BadRequest("password must be at least 8 characters".into()));
         }
         if self.db.get(self.users(), &id).await.map_err(internal)?.is_some() {
             return Err(AppError::AlreadyExists);
@@ -213,7 +213,7 @@ impl LocalAuth {
         Ok((self.ctx_of(&ctx_uid, &doc), tokens))
     }
 
-    /// Rotasi refresh. Token lama yang muncul lagi = reuse → cabut SEMUA sesi user.
+    /// Refresh rotation. An old token showing up again = reuse → revoke ALL user sessions.
     pub async fn refresh(
         &self,
         presented: &str,
@@ -226,7 +226,7 @@ impl LocalAuth {
                 self.db.delete(SESSIONS_COLLECTION, &sess.id).await.map_err(internal)?;
                 return Err(AppError::PermissionDenied);
             }
-            // Rotasi: simpan hash lama sebagai jebakan reuse.
+            // Rotation: keep the old hash as a reuse trap.
             let new_refresh = rand_hex(32);
             let mut data = sess.data.clone();
             data.insert("prev_hash".into(), serde_json::Value::String(h));
@@ -253,10 +253,10 @@ impl LocalAuth {
         Ok(())
     }
 
-    /// Login via provider eksternal (hasil OAuth): cari-atau-buat dokumen user
-    /// ber-id namespaced (`github:7`), lalu terbitkan sesi lokal (BFF).
-    /// Provisi TANPA peran (fail-closed; admin menetapkan via CRUD).
-    /// Tidak ada auto-merge by email (anti pengambilalihan via email tak terverifikasi).
+    /// Login via an external provider (OAuth result): find-or-create the user document
+    /// with a namespaced id (`github:7`), then issue a local session (BFF).
+    /// Provisioned WITHOUT roles (fail-closed; admin assigns via CRUD).
+    /// No auto-merge by email (prevents takeover via unverified email).
     pub async fn login_external(
         &self,
         provider_uid: &str,
@@ -327,7 +327,7 @@ impl LocalAuth {
         .map_err(internal)
     }
 
-    /// cnf.jkt token ini (None = bearer polos). Decode SEKALI dengan verifikasi penuh.
+    /// cnf.jkt of this token (None = plain bearer). Decode ONCE with full verification.
     pub fn bound_jkt(&self, access_token: &str) -> Result<Option<String>, AppError> {
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.set_audience(&[AUDIENCE]);
@@ -341,7 +341,7 @@ impl LocalAuth {
         Ok(data.claims.cnf.map(|c| c.jkt))
     }
 
-    /// Tegakkan proof DPoP untuk satu request resource. Mode Off = lolos langsung.
+    /// Enforce the DPoP proof for one resource request. Off mode = pass through directly.
     pub fn check_dpop(
         &self,
         proof: &str,
@@ -363,7 +363,7 @@ impl LocalAuth {
         self.dpop_replay.lock().unwrap().check(&v.jti).map_err(|_| AppError::PermissionDenied)
     }
 
-    /// Validasi proof saat penerbitan (login/refresh) → jkt untuk diikat ke cnf.
+    /// Validate the proof at issuance (login/refresh) → jkt to bind into cnf.
     fn bind_dpop(&self, dpop: Option<DpopRequest<'_>>) -> Result<Option<String>, AppError> {
         match dpop {
             None => Ok(None),
@@ -430,15 +430,15 @@ impl SessionIssuer for LocalAuth {
     }
 
     async fn logout(&self, ctx: &AuthContext) -> Result<(), AppError> {
-        // Logout butuh refresh token (dipegang HTTP layer); ctx saja tak cukup.
-        // revoke_user dipakai internal saat reuse terdeteksi.
+        // Logout needs the refresh token (held by the HTTP layer); ctx alone is not enough.
+        // revoke_user is used internally when reuse is detected.
         let _ = ctx;
-        Err(AppError::BadRequest("logout lewat POST /api/auth/logout".into()))
+        Err(AppError::BadRequest("logout via POST /api/auth/logout".into()))
     }
 }
 
 fn internal(_: impl std::fmt::Display) -> AppError {
-    // ponytail: samarkan detail internal DB/kripto — selalu 500 generik.
+    // ponytail: hide internal DB/crypto details — always a generic 500.
     AppError::Internal("auth store error".into())
 }
 
@@ -469,10 +469,10 @@ async fn hash_password(password: String) -> Result<String, AppError> {
         Argon2::default()
             .hash_password(password.as_bytes(), &salt)
             .map(|h| h.to_string())
-            .map_err(|_| AppError::Internal("hash gagal".into()))
+            .map_err(|_| AppError::Internal("hash failed".into()))
     })
     .await
-    .map_err(|_| AppError::Internal("hash gagal".into()))?
+    .map_err(|_| AppError::Internal("hash failed".into()))?
 }
 
 async fn verify_password(password: String, hash: String) -> bool {
@@ -492,7 +492,7 @@ mod tests {
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Fake DB minimal khusus test auth (CRUD + filter Eq + limit).
+    /// Minimal fake DB for auth tests (CRUD + Eq filter + limit).
     struct FakeDb {
         store: std::sync::Mutex<HashMap<String, HashMap<String, Doc>>>,
     }
@@ -568,18 +568,18 @@ mod tests {
             Ok(tokio::sync::broadcast::channel(1).0.subscribe())
         }
         async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
-            Err(AppError::BadRequest("fake tanpa index".into()))
+            Err(AppError::BadRequest("fake without index".into()))
         }
         async fn list_indexes(&self, _c: &str) -> Result<Vec<hakobackend_core::IndexInfo>, AppError> {
             Ok(vec![])
         }
         async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
-            Err(AppError::BadRequest("fake tanpa index".into()))
+            Err(AppError::BadRequest("fake without index".into()))
         }
     }
 
     fn local(db: Arc<dyn Database>) -> Arc<LocalAuth> {
-        // Env global proses — kunci + tanpa await di dalam (pola yang sama di verifier lain).
+        // Process-global env — hold the lock + no await inside (same pattern as other verifiers).
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
         let cfg = LocalConfig::from_env().unwrap();
@@ -597,7 +597,7 @@ mod tests {
     async fn register_login_verify() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
-        // role dari body dibuang; default_role kosong → tanpa peran.
+        // role from the body is discarded; empty default_role → no roles.
         let mut profile = HashMap::new();
         profile.insert("role".into(), serde_json::Value::String("admin".into()));
         profile.insert("nick".into(), serde_json::Value::String("budi".into()));
@@ -605,41 +605,41 @@ mod tests {
         assert!(doc.data.get("role").is_none());
         assert_eq!(doc.data.get("nick").unwrap(), "budi");
         assert!(doc.data.get(PASSWORD_FIELD).unwrap().as_str().unwrap().starts_with("$argon2"));
-        // Duplikat ditolak; password pendek ditolak.
+        // Duplicates rejected; short passwords rejected.
         assert!(a.register(Some("budi".into()), None, "rahasia123", HashMap::new()).await.is_err());
         assert!(a.register(Some("x".into()), None, "pendek", HashMap::new()).await.is_err());
 
         let (ctx, tokens) = a.login("budi", "rahasia123", None).await.unwrap();
         assert_eq!(ctx.uid, "local:budi");
-        // Login via email juga bisa; password salah disamarkan.
+        // Email login also works; wrong passwords are disguised.
         assert!(a.login("b@x.id", "rahasia123", None).await.is_ok());
         assert!(a.login("budi", "salah", None).await.is_err());
         assert!(a.login("tak-ada", "rahasia123", None).await.is_err());
-        // Access JWT terverifikasi provider sendiri.
+        // Access JWT verified by its own provider.
         let claims = a.verify(&tokens.access_jwt).await.unwrap();
         assert_eq!(claims.uid, "budi");
     }
 
     #[tokio::test]
-    async fn refresh_rotasi_dan_reuse_dicabut() {
+    async fn refresh_rotation_and_reuse_revoked() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
         a.register(Some("siti".into()), None, "rahasia123", HashMap::new()).await.unwrap();
         let (_, t1) = a.login("siti", "rahasia123", None).await.unwrap();
 
-        // Rotasi: refresh baru valid, yang lama jadi jebakan.
+        // Rotation: the new refresh is valid, the old one becomes a trap.
         let (_, t2) = a.refresh(&t1.refresh_opaque, None).await.unwrap();
         assert_ne!(t1.refresh_opaque, t2.refresh_opaque);
         assert!(a.verify(&t2.access_jwt).await.is_ok());
 
-        // Pakai token lama lagi = reuse → semua sesi dicabut + tolak.
+        // Reusing the old token = reuse → all sessions revoked + rejected.
         assert!(a.refresh(&t1.refresh_opaque, None).await.is_err());
-        // Token hasil rotasi pun ikut mati (sesi sudah dicabut).
+        // The rotated token dies too (sessions already revoked).
         assert!(a.refresh(&t2.refresh_opaque, None).await.is_err());
     }
 
     #[tokio::test]
-    async fn logout_mencabut_sesi() {
+    async fn logout_revokes_session() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
         a.register(Some("agus".into()), None, "rahasia123", HashMap::new()).await.unwrap();
@@ -649,23 +649,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_provision_tanpa_peran_dan_idempoten() {
+    async fn oauth_provision_without_roles_idempotent() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
         let mut profile = HashMap::new();
         profile.insert("login".into(), serde_json::Value::String("octocat".into()));
         profile.insert("role".into(), serde_json::Value::String("admin".into()));
         let (ctx1, _) = a.login_external("github:7", None, profile).await.unwrap();
-        // Peran dari profil dibuang; uid namespaced.
+        // Roles from the profile are discarded; namespaced uid.
         assert_eq!(ctx1.uid, "github:7");
         assert!(ctx1.roles.is_empty());
-        // Login kedua: dokumen dipakai ulang (bukan duplikat/timpa).
+        // Second login: the document is reused (not duplicated/overwritten).
         let (ctx2, _) = a.login_external("github:7", None, HashMap::new()).await.unwrap();
         assert_eq!(ctx2.uid, "github:7");
     }
 
     #[test]
-    fn secret_pendek_ditolak() {
+    fn short_secret_rejected() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("UB_LOCAL_JWT_SECRET", "pendek");
         assert!(LocalConfig::from_env().is_err());
@@ -673,12 +673,12 @@ mod tests {
         assert!(LocalConfig::from_env().is_err());
     }
 
-    /// Kunci RSA test statis (pasangan yang sama di firebase/oidc).
+    /// Static test RSA key (same pair as in firebase/oidc).
     const TEST_PRIV_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDrSl/9ysN280jm\naQgcJNcPJSvJHk+dW7BNOj2fPjYBIfbfjTfnXE7i1WeEBgL/5UfhoC2MP9UeqOe7\nDoJ3DRGgMNZVrJ8P/kUGKKCrwMk1P1S0zG3xhWmSfX9u0z/Gli1eGTX9RRN7fX/+\nutyhhbtZZq4kdzg0FXA46Xnk8k9RD6qkiv+WnyR7TmuSDdJIYHeZvSDgU2OieIVj\nSGhZ5WBvjTfNw9yG7KbsOh1CNs1jLQONHNhgnZs+EDaQK1nhF7Y9nYUCu4+TWdOn\npWgt+z16EwBu1jXbwoPvEesg2/5Mrk4Km3b+sHDmOs5feQmj6veOQ3FLfTweSHVX\nyQCj4EoxAgMBAAECggEAff9zDf5B0/YN6Mz/+cpEnCiknOutaK/L5l801ozC8LJW\neHowIKYO3Gu5Jjrt6kjGyG01VvBr2SJMDaCEfuoxsR3V+UUaXL8mCVlCSRdQ6EHE\nw5jhmz99PGQWFKvtcBPFsalAfyM5fpzDKQ65zYlGvWY+BOsO3t1IHkHw84hKrzX0\nfNZS4Ppxug2PylXP9cDsUUcjMmZpTAYeWKcOprMIRMutjnJmf0e+n1ldL+643fHV\nZHuQ0NX9k7Bmm4jcy2eonWStj00Hw5M99u9XdhSjLjO2PDBrwUmbDXeQYJJ9QjfX\naneV3krMJ1+BFXKfN+MsSQMaDEn4QAf6w5oV3j12bQKBgQD+hKdpHluCN9curPw4\n1401n8W8NkrQ6eQmSHYBtW4CcTMHDdtM/xPPFRmELRe3u4l5rVygVfD0PNMW169c\nn/RXqrw6qH7L1qax+WW3f6UZat/KF8soaI55Dn3u6cJdLgdXlCadtREGcX15z2Pm\nRfeWw2iJ64eqOX42zuUXm2Zd2wKBgQDsqRAuWJiybomg37A1Yqrf+xf9Iw1HwJ11\nLfeK0Uztljdzlo5qcqPkphYrlTLchQG8sx+dMQBF+dXEI4rF1haYvVbP78NChoQo\njt2c5w7FCuWncvRSxYpzU5QUyDXWoH5KlnjQhUAS2vPRGhitrI2gRIY4v9DjqFii\nV0gVAHyD4wKBgQCWDcNdeCZfOWjF/fqd0IdSLCY59pBZZuu5nlLkYwC+s9pvuD2o\nwWH+XuQyRxuKmShN8mV/qetrM0kIWJTsuOknnmNm+dv3dU/F8dGEQ98kgxv5W9nM\nswf8WwzoBC0xHmf5vECgDhZBhDuDyz+MjYeQ/Rfu6EuNkmPVEFmEd3v8rQKBgQDH\nxA28kVyTgWr7ONZsudSzLCibrLLRFm3TM/H4Y6QkCODV2QhuIkbmAqxELbS5ICzP\nNARDk9E/QByJa9cAGC8KzwgwjZqs1Q9JjQ7UGtYEzaX9KrPCCq1LnAkrYbTQbrks\nDMf+e/wR7nBQ2U5ri3QhDLafwIp7IOdwYWyfDcINMQKBgB8ZkBiNiMngr59o2Y7/\nTF2sD5CSZmWd0SGhJivzcxlWWUVtZGpXgO0h6cAyTIAQJCNxox5IMNCnbtnVmQzV\nZeS8kwffcMXV7LBYEHgYlJo5gtBzPadXkXtKAQqT9jxZGjAziI7iKjr4U2vIcblm\n8mM8f3Z5FfbC828Q4rYaROLf\n-----END PRIVATE KEY-----\n";
     const TEST_JWK: &str = "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"60pf_crDdvNI5mkIHCTXDyUryR5PnVuwTTo9nz42ASH2340351xO4tVnhAYC_-VH4aAtjD_VHqjnuw6Cdw0RoDDWVayfD_5FBiigq8DJNT9UtMxt8YVpkn1_btM_xpYtXhk1_UUTe31__rrcoYW7WWauJHc4NBVwOOl55PJPUQ-qpIr_lp8ke05rkg3SSGB3mb0g4FNjoniFY0hoWeVgb403zcPchuym7DodQjbNYy0DjRzYYJ2bPhA2kCtZ4Re2PZ2FAruPk1nTp6VoLfs9ehMAbtY128KD7xHrINv-TK5OCpt2_rBw5jrOX3kJo-r3jkNxS308Hkh1V8kAo-BKMQ\"}";
 
-    /// Buat proof DPoP RS256 manual (header memuat jwk — di luar jangkauan
-    /// jsonwebtoken::encode, jadi tanda tangan RSA langsung).
+    /// Build a manual RS256 DPoP proof (header embeds jwk — beyond the reach of
+    /// jsonwebtoken::encode, so sign the RSA directly).
     fn dpop_sign(jwk_json: &str, htm: &str, htu: &str, ath: Option<&str>, jti: &str) -> String {
         use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
         use rsa::pkcs1v15::SigningKey;
@@ -692,7 +692,7 @@ mod tests {
             "ath": ath,
         })
         .to_string();
-        // ath: None → null; proof issuance tak memakai ath — buang kuncinya.
+        // ath: None → null; proof issuance does not use ath — drop the key.
         let payload = if ath.is_none() {
             let mut v: serde_json::Value = serde_json::from_str(&payload).unwrap();
             v.as_object_mut().unwrap().remove("ath");
@@ -707,13 +707,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dpop_bind_dan_teegakkan() {
+    async fn dpop_bind_and_enforce() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
         a.set_dpop_mode(DpopMode::Require);
         a.register(Some("dpop".into()), None, "rahasia123", HashMap::new()).await.unwrap();
 
-        // Login menyertakan proof penerbitan → access terikat (cnf.jkt).
+        // Login includes an issuance proof → bound access (cnf.jkt).
         let issue = dpop_sign(TEST_JWK, "POST", "http://t/api/auth/login", None, "jti-issue-1");
         let (_, t) = a
             .login("dpop", "rahasia123", Some(DpopRequest { proof: &issue, method: "POST", uri: "http://t/api/auth/login" }))
@@ -722,24 +722,24 @@ mod tests {
         let jkt = a.bound_jkt(&t.access_jwt).unwrap();
         assert!(jkt.is_some());
 
-        // Akses valid: proof segar + ath cocok + jkt cocok.
+        // Valid access: fresh proof + matching ath + matching jkt.
         let p1 = dpop_sign(TEST_JWK, "GET", "http://t/api/collections/posts", Some(&dpop::ath(&t.access_jwt)), "jti-use-1");
         assert!(a.check_dpop(&p1, "GET", "http://t/api/collections/posts", &t.access_jwt, jkt.as_deref()).is_ok());
 
-        // Replay proof sama → tolak. htm salah → tolak. ath salah → tolak.
+        // Same-proof replay → rejected. Wrong htm → rejected. Wrong ath → rejected.
         assert!(a.check_dpop(&p1, "GET", "http://t/api/collections/posts", &t.access_jwt, jkt.as_deref()).is_err());
         let p2 = dpop_sign(TEST_JWK, "POST", "http://t/api/collections/posts", Some(&dpop::ath(&t.access_jwt)), "jti-use-2");
         assert!(a.check_dpop(&p2, "GET", "http://t/api/collections/posts", &t.access_jwt, jkt.as_deref()).is_err());
         let p3 = dpop_sign(TEST_JWK, "GET", "http://t/api/collections/posts", Some("salah"), "jti-use-3");
         assert!(a.check_dpop(&p3, "GET", "http://t/api/collections/posts", &t.access_jwt, jkt.as_deref()).is_err());
 
-        // Token curian dipakai kunci lain → jkt tak cocok → tolak.
+        // Stolen token used with another key → jkt mismatch → rejected.
         let other_jwk = "{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"AAAA\"}";
         let p4 = dpop_sign(other_jwk, "GET", "http://t/api/collections/posts", Some(&dpop::ath(&t.access_jwt)), "jti-use-4");
-        // n palsu → kunci tak valid → gagal verifikasi signature.
+        // Fake n → invalid key → signature verification fails.
         assert!(a.check_dpop(&p4, "GET", "http://t/api/collections/posts", &t.access_jwt, jkt.as_deref()).is_err());
 
-        // Token polos (tanpa cnf) tetap lolos check bila expected None (mode accept).
+        // Plain token (no cnf) still passes the check when expected is None (accept mode).
         a.set_dpop_mode(DpopMode::Accept);
         let (_, tp) = a.login("dpop", "rahasia123", None).await.unwrap();
         assert!(a.bound_jkt(&tp.access_jwt).unwrap().is_none());

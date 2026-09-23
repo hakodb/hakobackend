@@ -1,92 +1,92 @@
-# Security Rules Standar
+# Standard Security Rules
 
-Aturan ini **mengikuti fleksibilitas endpoint** (berlaku untuk wildcard otomatis
-maupun resource yang dideklarasikan) dan menjadi acuan semua deployment.
-Implementasi: `crates/hakobackend-policy` + `policy.toml` (hot-reload). Contoh siap pakai:
+These rules **follow endpoint flexibility** (they apply to auto-wildcard
+and declared resources alike) and are the reference for all deployments.
+Implementation: `crates/hakobackend-policy` + `policy.toml` (hot-reload). Ready-made example:
 `policy.standard.toml`.
 
-## 1. Prinsip baku
+## 1. Standard principles
 
-1. **Default-deny.** Tanpa aturan yang mengizinkan → tolak. Tanpa `policy_file`
-   (mode dev) server TERBUKA + wajib log WARN — tidak untuk produksi.
-2. **Fail-closed.** Typo rule, gagal parse, auth tak dikenal, dokumen tak ada
-   untuk rule `owner` → tolak. Tidak pernah fail-open.
-3. **Auth seragam.** Provider apa pun (internal/firebase/oidc) hanya mengisi
-   `AuthContext{uid, roles, tenant}`; rule tidak tahu provider apa.
-4. **Tidak membocorkan alasan.** Respons selalu `403 Permission denied by policy`
-   — tanpa menjelaskan rule mana yang gagal (membedakan user-ada/tidak-ada
-   adalah celah enumerasi).
+1. **Default-deny.** No allowing rule → reject. Without `policy_file`
+   (dev mode) the server is OPEN + must log WARN — never for production.
+2. **Fail-closed.** Rule typo, parse failure, unknown auth, missing document
+   for an `owner` rule → reject. Never fail open.
+3. **Uniform auth.** Any provider (internal/firebase/oidc) only fills
+   `AuthContext{uid, roles, tenant}`; rules never know which provider.
+4. **No reason leakage.** Responses are always `403 Permission denied by policy`
+   — never saying which rule failed (distinguishing user-exists/not-exists
+   is an enumeration hole).
 
-## 2. Urutan resolusi (paling spesifik menang)
+## 2. Resolution order (most specific wins)
 
 ```
-slot metode (get/list/create/update/delete)
+method slot (get/list/create/update/delete)
   → alias read (get/list) / write (create/update/delete)
-    → koleksi exact → segmen terakhir → root → [defaults] → deny
+    → exact collection → last segment → root → [defaults] → deny
 ```
 
-Contoh: `posts/p1/revisions` memakai aturan `posts/p1/revisions`, bila tak ada
-memakai `revisions`, bila tak ada memakai `posts`, bila tak ada memakai defaults.
-(Semantik yang sama dengan engine lama `rules.ts:evaluateRule`.)
+Example: `posts/p1/revisions` uses the `posts/p1/revisions` rules; when absent
+falls back to `revisions`, then `posts`, then defaults.
+(Same semantics as the legacy engine's `rules.ts:evaluateRule`.)
 
-## 3. Peran & koleksi user: milik user, bukan core
+## 3. Roles & user collections: user-owned, not core
 
-Core **tidak mengikat** nama peran maupun koleksi user. Semua didefinisikan user
-di `[identity]` pada `policy.toml`:
+Core binds **neither** role names **nor** the user collection. Users define everything
+in `[identity]` in `policy.toml`:
 
 ```toml
 [identity]
-users_collection = "members"  # default "users"; bebas: sc_users, anggota, …
-role_field = "posisi"         # default "role"; string tunggal atau array
-owner_field = "pemilikId"     # default "ownerId"; override per koleksi bisa
+users_collection = "members"  # default "users"; free choice: sc_users, members, …
+role_field = "posisi"         # default "role"; single string or array
+owner_field = "pemilikId"     # default "ownerId"; per-collection override allowed
 ```
 
-- `role:<apapun>` bebas — core hanya membandingkan string peran dokumen user
-  (dimuat dari `users_collection` via `role_field`, string atau array) dengan
-  nama di rule. Tidak ada nama peran cadangan.
-- Contoh peran di dokumen ini (`admin`, `maintainer`, `pengurus`) hanyalah
-  **template siap pakai**, bukan ketentuan. Ganti sesukanya.
-- `owner_field` global bisa dioverride per koleksi (`collections.X.owner_field`).
-  Evaluasi `owner` memakai field terkonfigurasi, fallback kompatibilitas
-  `ownerId`/`uid` untuk data lama.
+- `role:<anything>` is free-form — core only compares the user document's role string
+  (loaded from `users_collection` via `role_field`, string or array) against
+  the name in the rule. No reserved role names.
+- Role examples in this document (`admin`, `maintainer`, `pengurus`) are just
+  **ready-made templates**, not requirements. Rename freely.
+- The global `owner_field` can be overridden per collection (`collections.X.owner_field`).
+  `owner` evaluation uses the configured field, with `ownerId`/`uid`
+  compatibility fallback for legacy data.
 
-## 4. Kelas akses endpoint standar
+## 4. Standard endpoint access classes
 
-| Kelas | Pola policy | Contoh |
+| Class | Policy pattern | Example |
 |---|---|---|
-| Publik-baca | `read = "public"`, `write = "deny"` | `posts`, `pages`, `sc_configs` |
-| Terautentikasi-tulis | `create/update = "auth"` | `media`, `tags` |
-| Milik-pemilik | `read/write = "owner"` (+ `owner_field`) | `profiles`, notifikasi user |
-| Admin-saja | `read/write = "role:admin"` | `ai_configs`, kredensial |
-| Koleksi internal | prefix `__` **tidak diekspos** HTTP (kecuali eksplisit) | `__users` (refresh token), audit |
+| Public-read | `read = "public"`, `write = "deny"` | `posts`, `pages`, `sc_configs` |
+| Authenticated-write | `create/update = "auth"` | `media`, `tags` |
+| Owner-only | `read/write = "owner"` (+ `owner_field`) | `profiles`, user notifications |
+| Admin-only | `read/write = "role:admin"` | `ai_configs`, credentials |
+| Internal collections | `__` prefix **not exposed** over HTTP (unless explicit) | `__users` (refresh tokens), audit |
 
-## 5. Konvensi dokumen (default siap pakai, semua bisa diganti)
+## 5. Document conventions (working defaults, all replaceable)
 
-- Field pemilik default `ownerId` (fallback `uid`); ganti via `[identity].owner_field`
-  atau per koleksi. Rule `owner` pada dokumen tanpa field yang cocok → tolak.
-- Field terlarang naik-level (`role`, `status`, dsb.) **tidak boleh** diubah
-  self-service — proteksi eskalasi seperti `isModifyingRestrictedFields` di backend
-  lama menjadi bagian policy fase 2 (`immutable_fields`, `owner_only_fields`).
+- Default owner field `ownerId` (fallback `uid`); change via `[identity].owner_field`
+  or per collection. An `owner` rule on a document lacking the matched field → reject.
+- Privilege-escalation fields (`role`, `status`, …) must **not** be
+  self-service writable — escalation guards like the legacy backend's
+  `isModifyingRestrictedFields` land in phase-2 policy (`immutable_fields`, `owner_only_fields`).
 
-## 6. Kode error standar (paritas backend lama)
+## 6. Standard error codes (legacy backend parity)
 
-| Situasi | Status | Body |
+| Situation | Status | Body |
 |---|---|---|
-| Tolak policy | 403 | `Permission denied by policy` |
-| Dokumen tak ada | 404 | `Document not found` |
-| Route salah jenis | 400 | `POST/PUT/PATCH/DELETE … must target …` |
-| Duplikat | 400 | `already-exists` |
-| Rate-limit / antre penuh | 429 | tanpa detail internal |
+| Policy reject | 403 | `Permission denied by policy` |
+| Document missing | 404 | `Document not found` |
+| Wrong route kind | 400 | `POST/PUT/PATCH/DELETE … must target …` |
+| Duplicate | 400 | `already-exists` |
+| Rate-limit / full queue | 429 | no internal details |
 
-## 7. Standar auth (local: terimplementasi fase C; eksternal: verifier-only)
+## 7. Auth standards (local: implemented phase C; external: verifier-only)
 
-- Dual token pola BFF: access JWT 5–15 mnt + refresh opaque rotasi-tiap-pakai
-  (hash di DB `__sessions`, cookie `__Host-` HttpOnly+Secure+SameSite=Strict Path=/).
-- Reuse refresh (token lama muncul lagi) → cabut SEMUA sesi user + tolak.
-- Register membuang `role`/`password_hash` dari body (anti self-eskalasi);
-  login/email salah disamarkan (anti enumerasi).
-- Tradeoff: access JWT stateless — logout mencabut refresh, access hidup sampai
-  kedaluwarsa (alasan TTL pendek). Tanpa `mock-user` bypass.
-- DPoP (RFC 9449, token lokal): `off|accept|require` via `UB_LOCAL_DPOP`/`dpop`
-  custom.toml; token curian tanpa private key tak bisa dipakai; replay ditolak.
-- `/api/admin/reload` terkunci peran `--admin-role` (default `admin`, nama bebas).
+- Dual-token BFF pattern: 5–15 min access JWT + rotating opaque refresh on every use
+  (hash in `__sessions` DB, `__Host-` cookies HttpOnly+Secure+SameSite=Strict Path=/).
+- Refresh reuse (an old token showing up again) → revoke ALL user sessions + reject.
+- Register drops `role`/`password_hash` from the body (anti self-escalation);
+  wrong login/email is disguised (anti enumeration).
+- Tradeoff: stateless access JWT — logout revokes refresh, access lives until
+  expiry (hence short TTL). No `mock-user` bypass.
+- DPoP (RFC 9449, local tokens): `off|accept|require` via `UB_LOCAL_DPOP`/`dpop`
+  in custom.toml; a stolen token without the private key is unusable; replays rejected.
+- `/api/admin/reload` locked behind `--admin-role` (default `admin`, name is free choice).

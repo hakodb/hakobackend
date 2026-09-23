@@ -1,9 +1,9 @@
-//! hakobackend-auth-core: resolusi `--auth` + rantai verifier + mapping deklaratif.
+//! hakobackend-auth-core: `--auth` resolution + verifier chain + declarative mapping.
 //!
-//! Core tidak mengikat provider apa pun kecuali kontrak (`hakobackend_core::AuthProvider`).
-//! Provider eksternal = verifier-only; hanya `local` yang menjadi issuer (fase C).
-//! Peran & koleksi user milik user via `hakobackend_policy::Identity`; peran final =
-//! **union** peran klaim + peran dokumen user.
+//! Core binds no provider except the contract (`hakobackend_core::AuthProvider`).
+//! External providers are verifier-only; only `local` acts as issuer (phase C).
+//! User roles & collections belong to the user via `hakobackend_policy::Identity`; final roles =
+//! **union** of claim roles + user-doc roles.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -11,16 +11,16 @@ use std::sync::Arc;
 use hakobackend_core::{AuthContext, AuthProvider, Claims, Database};
 use hakobackend_policy::Identity;
 
-// --- Spesifikasi `--auth` ---
+// --- `--auth` spec ---
 
-/// Hasil parse nilai `--auth`.
+/// Parse result of an `--auth` value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthSpec {
-    /// Tanpa auth (perilaku dev hari ini).
+    /// No auth (today's dev behavior).
     Off,
-    /// Satu provider / rantai (`local`, `chain:github,local`).
+    /// One provider / chain (`local`, `chain:github,local`).
     Named(Vec<String>),
-    /// File mapping deklaratif (`./custom.toml`).
+    /// Declarative mapping file (`./custom.toml`).
     File(String),
 }
 
@@ -39,9 +39,9 @@ impl AuthSpec {
     }
 }
 
-// --- File mapping deklaratif (`--auth ./custom.toml`) ---
+// --- Declarative mapping file (`--auth ./custom.toml`) ---
 
-/// Satu aturan klaim → peran bebas milik user.
+/// One claim → user-owned free-form role rule.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RoleRule {
     pub claim: String,
@@ -51,32 +51,32 @@ pub struct RoleRule {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ClaimMapping {
-    /// Klaim di `extra` yang dipakai sebagai uid/email (default: bawaan provider).
+    /// Claim in `extra` used as uid/email (default: provider default).
     pub uid_field: Option<String>,
     pub email_field: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CustomAuth {
-    /// Provider yang dirantai (builtin yang sudah tersedia).
+    /// Chained providers (available builtins).
     #[serde(default)]
     pub providers: Vec<String>,
     #[serde(default)]
     pub mapping: ClaimMapping,
     #[serde(default)]
     pub rules: Vec<RoleRule>,
-    /// Mode DPoP untuk anggota `local` rantai (off|accept|require).
-    /// Typo = error load (fail-closed). Tanpa ini: env UB_LOCAL_DPOP.
+    /// DPoP mode for the `local` chain member (off|accept|require).
+    /// Typo = load error (fail-closed). Without it: env UB_LOCAL_DPOP.
     pub dpop: Option<String>,
 }
 
 impl CustomAuth {
     pub fn load(path: &str) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path).map_err(|e| format!("baca {path}: {e}"))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
     }
 
-    /// Peran dari klaim: cocok bila klaim string == equals atau array memuatnya.
+    /// Roles from claims: match when a string claim == equals or an array contains it.
     pub fn roles_from_claims(&self, claims: &Claims) -> Vec<String> {
         self.rules
             .iter()
@@ -90,9 +90,9 @@ impl CustomAuth {
     }
 }
 
-// --- Resolver: verify → mapping → union peran user-doc ---
+// --- Resolver: verify → mapping → user-doc role union ---
 
-/// Rantai verifier yang sudah dibuka (urutan = prioritas).
+/// Opened verifier chain (order = priority).
 pub struct AuthChain {
     pub providers: Vec<Arc<dyn AuthProvider>>,
     pub mapping: ClaimMapping,
@@ -100,9 +100,9 @@ pub struct AuthChain {
 }
 
 impl AuthChain {
-    /// Klaim pertama yang valid menang; semua gagal → None (anonim).
-    /// Bila `db` ada, peran dokumen user (`identity`) di-union (dedup).
-    /// Kunci lookup user-doc = uid ber-namespace (`github:123`).
+    /// First valid claim wins; all fail → None (anonymous).
+    /// When `db` is present, user-doc roles (`identity`) are unioned (deduped).
+    /// User-doc lookup key = namespaced uid (`github:123`).
     pub async fn resolve(
         &self,
         identity: &Identity,
@@ -137,7 +137,7 @@ impl AuthChain {
         roles.dedup();
         let email = field(&claims.extra, self.mapping.email_field.as_deref()).or_else(|| claims.email.clone());
         let mut extra = HashMap::new();
-        // Penanda provider untuk enforcement DPoP di middleware (bukan untuk rule).
+        // Provider marker for DPoP enforcement in middleware (not for rules).
         extra.insert("provider".to_string(), serde_json::Value::String(claims.provider.into()));
         if let Some(e) = email {
             extra.insert("email".to_string(), serde_json::Value::String(e));
@@ -150,21 +150,21 @@ fn field(extra: &HashMap<String, serde_json::Value>, name: Option<&str>) -> Opti
     name.and_then(|n| extra.get(n)).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
-/// Buka provider builtin. Satu arm per provider (simetri `open_driver`).
-/// `local` menyusul fase C; nama asing ditolak dengan pesan jelas (fail-closed).
+/// Open a builtin provider. One arm per provider (mirrors `open_driver`).
+/// `local` follows in phase C; unknown names are rejected with a clear message (fail-closed).
 pub fn open_builtin(name: &str) -> Result<Arc<dyn AuthProvider>, String> {
     match name {
         "firebase" => hakobackend_auth_firebase::FirebaseVerifier::from_env(),
         "github" => Ok(hakobackend_auth_github::GithubVerifier::from_env()),
         "oidc" => hakobackend_auth_oidc::OidcVerifier::from_env(),
-        "local" => Err("provider `local` belum tersedia (fase C: BFF session manager)".into()),
-        other => Err(format!("provider `{other}` tak dikenal (lihat AUTH_CONTRACT.md §6)")),
+        "local" => Err("provider `local` not available (phase C: BFF session manager)".into()),
+        other => Err(format!("provider `{other}` unknown (see AUTH_CONTRACT.md §6)")),
     }
 }
 
-/// Bangun rantai dari `AuthSpec`. `local` tidak bisa dibuka tanpa db handle,
-/// jadi server menyuntikkannya (dibangun dari driver aktif + `[identity]`);
-/// pemanggil lain (test/CLI validate) mengisi `None` → nama `local` ditolak jelas.
+/// Build a chain from `AuthSpec`. `local` cannot be opened without a db handle,
+/// so the server injects it (built from the active driver + `[identity]`);
+/// other callers (test/CLI validate) pass `None` → the `local` name is clearly rejected.
 pub fn open_chain(
     spec: &AuthSpec,
     custom: Option<&CustomAuth>,
@@ -178,18 +178,18 @@ pub fn open_chain(
         }),
         AuthSpec::Named(names) => (names.clone(), ClaimMapping::default(), vec![]),
         AuthSpec::File(_) => {
-            let c = custom.ok_or("spec File butuh CustomAuth yang sudah di-load")?;
+            let c = custom.ok_or("File spec requires loaded CustomAuth")?;
             (c.providers.clone(), c.mapping.clone(), c.rules.clone())
         }
     };
     if names.iter().any(|n| n == "off" || n == "none") || names.is_empty() {
-        return Err("rantai kosong — pakai `off` eksplisit bila tanpa auth".into());
+        return Err("empty chain — use explicit `off` for no auth".into());
     }
     let mut providers = Vec::with_capacity(names.len());
     for n in &names {
         if n == "local" {
             providers.push(local.clone().ok_or(
-                "provider `local` butuh db handle — hanya server yang bisa membukanya".to_string(),
+                "provider `local` requires db handle — only the server can open it".to_string(),
             )?);
         } else {
             providers.push(open_builtin(n)?);
@@ -246,21 +246,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chain_fallback_dan_namespace() {
+    async fn chain_fallback_and_namespace() {
         let c = chain();
-        // Provider pertama yang tokennya cocok menang.
+        // First provider with a matching token wins.
         let a = c.resolve(&identity(), None, "loc-tok").await.unwrap();
         assert_eq!(a.uid, "local:abc");
         let b = c.resolve(&identity(), None, "gh-tok").await.unwrap();
         assert_eq!(b.uid, "github:123");
         assert_eq!(b.roles, vec!["pengurus"]);
-        // Token asing bagi semua → anonim.
+        // Token unknown to all → anonymous.
         assert!(c.resolve(&identity(), None, "bukan-token").await.is_none());
     }
 
     #[tokio::test]
     async fn union_peran_user_doc() {
-        // Fake DB minimal: hanya get() yang dipakai enrichment.
+        // Minimal fake DB: only get() is used for enrichment.
         struct FakeDb {
             doc: hakobackend_core::Doc,
         }
@@ -297,25 +297,25 @@ mod tests {
                 Ok(tokio::sync::broadcast::channel(1).0.subscribe())
             }
             async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
-                Err(AppError::BadRequest("fake tanpa index".into()))
+                Err(AppError::BadRequest("fake without index".into()))
             }
             async fn list_indexes(&self, _c: &str) -> Result<Vec<hakobackend_core::IndexInfo>, AppError> {
                 Ok(vec![])
             }
             async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
-                Err(AppError::BadRequest("fake tanpa index".into()))
+                Err(AppError::BadRequest("fake without index".into()))
             }
         }
         let db = FakeDb {
             doc: Doc {
-                // Kunci lookup = uid ber-namespace.
+                // Lookup key = namespaced uid.
                 id: "github:123".into(),
                 data: [("role".to_string(), json!(["penulis"]))].into_iter().collect(),
             },
         };
         let c = chain();
         let ctx = c.resolve(&identity(), Some(&db), "gh-tok").await.unwrap();
-        // Union + dedup: pengurus (klaim) + penulis (dokumen).
+        // Union + dedup: pengurus (claims) + penulis (document).
         assert_eq!(ctx.roles, vec!["pengurus", "penulis"]);
     }
 
@@ -333,13 +333,13 @@ mod tests {
 
     #[test]
     fn builtin_registry() {
-        // github tanpa secret → selalu bisa dibuka; firebase/oidc butuh env.
+        // github without a secret → always openable; firebase/oidc need env.
         assert_eq!(open_builtin("github").unwrap().name(), "github");
         assert!(open_builtin("local").is_err());
         assert!(open_builtin("entah").is_err());
         assert!(open_chain(&AuthSpec::Off, None, None).unwrap().providers.is_empty());
         assert!(open_chain(&AuthSpec::Named(vec!["github".into()]), None, None).unwrap().providers.len() == 1);
-        // local tanpa injeksi ditolak jelas (bukan bypass).
+        // local without injection is clearly rejected (not bypassed).
         assert!(open_chain(&AuthSpec::Named(vec!["local".into()]), None, None).is_err());
     }
 

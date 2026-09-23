@@ -1,17 +1,17 @@
-//! hakobackend-ratelimit: token-bucket per kunci, in-process, nol dependensi.
+//! hakobackend-ratelimit: per-key token bucket, in-process, zero dependencies.
 //!
-//! Sengaja hand-rolled (bukan tower-governor): angka hot-reload, semantik 429
-//! eksak, exempt per-route di level server, dan deterministik diuji via jam palsu.
-//! Batasan jujur: tiap instans menghitung sendiri (single-instance).
-//! Multi-instance butuh agregator eksternal (Redis) — di luar scope.
+//! Deliberately hand-rolled (not tower-governor): hot-reloadable numbers, exact 429
+//! semantics, per-route exemptions at the server level, and deterministically tested via a fake clock.
+//! Honest limitation: each instance counts on its own (single-instance).
+//! Multi-instance needs an external aggregator (Redis) — out of scope.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Batas satu lapis: N request per menit + burst.
+/// One limit layer: N requests per minute + burst.
 #[derive(Debug, Clone, Copy)]
 pub struct Quota {
-    /// Token per detik (dari per-menit / 60).
+    /// Tokens per second (from per-minute / 60).
     pub rate_per_sec: f64,
     pub burst: f64,
 }
@@ -27,7 +27,7 @@ struct Bucket {
     last: Instant,
 }
 
-/// Jam yang bisa dipalsukan di test (produksi: `Instant::now`).
+/// Clock that can be faked in tests (production: `Instant::now`).
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ pub struct Limiter {
     quota: std::sync::RwLock<Quota>,
     buckets: std::sync::Mutex<HashMap<String, Bucket>>,
     clock: Clock,
-    /// Batas memori: jumlah kunci berbeda maksimum.
+    /// Memory bound: maximum number of distinct keys.
     cap: usize,
 }
 
@@ -48,17 +48,17 @@ impl Limiter {
         Self { quota: std::sync::RwLock::new(quota), buckets: std::sync::Mutex::new(HashMap::new()), clock, cap: 50_000 }
     }
 
-    /// Hot-reload angka tanpa restart (dipakai /api/admin/reload).
+    /// Hot-reload the numbers without restart (used by /api/admin/reload).
     pub fn set_quota(&self, quota: Quota) {
         *self.quota.write().unwrap() = quota;
     }
 
-    /// `Ok(())` = lolos; `Err(detik)` = tolak + Retry-After jujur.
+    /// `Ok(())` = pass; `Err(seconds)` = reject + honest Retry-After.
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let quota = *self.quota.read().unwrap();
         let now = (self.clock)();
         let mut g = self.buckets.lock().unwrap();
-        // Eviksi malas: kunci idle > 10 mnt dibuang saat ada pendatang baru.
+        // Lazy eviction: keys idle > 10 min are dropped when a newcomer arrives.
         if !g.contains_key(key) && g.len() >= self.cap {
             g.retain(|_, b| now.duration_since(b.last) < Duration::from_secs(600));
         }
@@ -70,7 +70,7 @@ impl Limiter {
             b.tokens -= 1.0;
             Ok(())
         } else {
-            // Detik sampai 1 token penuh (ceil agar tak under-report).
+            // Seconds until 1 full token (ceil so we never under-report).
             Err(((1.0 - b.tokens) / quota.rate_per_sec).ceil().max(1.0) as u64)
         }
     }
@@ -81,7 +81,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Jam manual deterministik (tanpa sleep/flaky).
+    /// Deterministic manual clock (no sleep/flaky).
     #[derive(Clone)]
     struct Manual {
         t: Arc<Mutex<Instant>>,
@@ -106,11 +106,11 @@ mod tests {
         let l = Limiter::with_clock(Quota::per_minute(60, 2), m.clock());
         assert!(l.check("ip").is_ok());
         assert!(l.check("ip").is_ok());
-        // Burst habis → tolak dengan Retry-After jujur (60/mnt = 1 token/dtk).
+        // Burst spent → reject with an honest Retry-After (60/min = 1 token/sec).
         assert_eq!(l.check("ip"), Err(1));
-        // IP lain tak terdampak.
+        // Other IPs are unaffected.
         assert!(l.check("lain").is_ok());
-        // 1 detik → 1 token lagi.
+        // 1 second → 1 token again.
         m.advance(Duration::from_secs(1));
         assert!(l.check("ip").is_ok());
         assert_eq!(l.check("ip"), Err(1));
@@ -121,7 +121,7 @@ mod tests {
         let m = Manual::new();
         let l = Limiter::with_clock(Quota::per_minute(60, 2), m.clock());
         m.advance(Duration::from_secs(3600));
-        // Tak peduli idle lama: maks burst, bukan tak terbatas.
+        // No matter how long idle: capped at burst, not unlimited.
         assert!(l.check("ip").is_ok());
         assert!(l.check("ip").is_ok());
         assert!(l.check("ip").is_err());
@@ -134,7 +134,7 @@ mod tests {
         assert!(l.check("ip").is_ok());
         assert!(l.check("ip").is_err());
         l.set_quota(Quota::per_minute(6000, 10));
-        // Token lama habis; refill 100/dtk mengisi lagi setelah 1 dtk.
+        // Old tokens spent; a 100/sec refill tops up again after 1 sec.
         m.advance(Duration::from_secs(1));
         assert!(l.check("ip").is_ok());
     }
@@ -147,7 +147,7 @@ mod tests {
         assert!(l.check("a").is_ok());
         assert!(l.check("b").is_ok());
         m.advance(Duration::from_secs(601));
-        // a,b idle → dieviksi, c masuk.
+        // a,b idle → evicted, c admitted.
         assert!(l.check("c").is_ok());
     }
 }

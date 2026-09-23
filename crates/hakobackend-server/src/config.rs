@@ -1,9 +1,9 @@
-//! Konfigurasi: flag CLI > file config > default.
+//! Config: CLI flags > config file > defaults.
 //! `./universalbackend --driver sqlite --data ./app.db --rules ./rules.toml
 //! --auth local --host 127.0.0.1 --port 8080`
-//! atau `./universalbackend --config ./config.toml`.
-//! Bentuk lama (`[server] listen`, `[database]`, `policy_file`) tetap dibaca
-//! sebagai alias deprecated agar config lama tidak rusak.
+//! or `./universalbackend --config ./config.toml`.
+//! The legacy shape (`[server] listen`, `[database]`, `policy_file`) is still read
+//! as deprecated aliases so old configs don't break.
 
 use clap::Parser;
 
@@ -12,16 +12,16 @@ pub const KNOWN_DRIVERS: &[&str] = &["hako", "postgres", "sqlite", "mysql"];
 #[derive(Parser, Debug, Clone)]
 #[command(name = "universalbackend", version, about = "1 backend, multi database")]
 pub struct Args {
-    /// File config (TOML). Default: ./hakobackend.toml (legacy ./ub.toml) bila ada.
+    /// Config file (TOML). Default: ./hakobackend.toml (legacy ./ub.toml) if present.
     #[arg(long)]
     pub config: Option<String>,
-    /// Driver database (lihat KNOWN_DRIVERS).
+    /// Database driver (see KNOWN_DRIVERS).
     #[arg(long)]
     pub driver: Option<String>,
-    /// Path file (hako/sqlite) atau DSN (postgres/mysql/rethink).
+    /// File path (hako/sqlite) or DSN (postgres/mysql/rethink).
     #[arg(long)]
     pub data: Option<String>,
-    /// File aturan endpoint (TOML, hot-reload).
+    /// Endpoint rules file (TOML, hot-reload).
     #[arg(long)]
     pub rules: Option<String>,
     /// off | local | chain:a,b | ./custom.toml
@@ -31,39 +31,39 @@ pub struct Args {
     pub host: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
-    /// Peran yang boleh memanggil /api/admin/reload (nama bebas milik user, default "admin").
+    /// Role allowed to call /api/admin/reload (free-form user role name, default "admin").
     #[arg(long)]
     pub admin_role: Option<String>,
-    /// URL publik asal (untuk callback OAuth). Env UB_PUBLIC_URL menang bila diisi.
+    /// Public origin URL (for OAuth callbacks). UB_PUBLIC_URL env wins when set.
     #[arg(long)]
     pub public_url: Option<String>,
-    /// Rate-limit global req/mnt/IP (default 600) + burst (default 100).
+    /// Global rate limit req/min/IP (default 600) + burst (default 100).
     #[arg(long)]
     pub limit_global: Option<u32>,
     #[arg(long)]
     pub limit_global_burst: Option<u32>,
-    /// Rate-limit ketat /api/auth/* req/mnt/IP (default 20) + burst (default 5).
+    /// Strict rate limit for /api/auth/* req/min/IP (default 20) + burst (default 5).
     #[arg(long)]
     pub limit_auth: Option<u32>,
     #[arg(long)]
     pub limit_auth_burst: Option<u32>,
-    /// Percayai X-Forwarded-For (HANYA di belakang proxy yang membersihkannya).
+    /// Trust X-Forwarded-For (ONLY behind a sanitizing proxy).
     #[arg(long, default_value_t = false)]
     pub trust_proxy: bool,
-    /// TLS: path sertifikat + kunci PEM (keduanya wajib untuk mengaktifkan).
+    /// TLS: certificate + PEM key paths (both required to enable).
     #[arg(long)]
     pub tls_cert: Option<String>,
     #[arg(long)]
     pub tls_key: Option<String>,
-    /// Cek config + rules + auth tanpa menjalankan server.
+    /// Check config + rules + auth without starting the server.
     #[arg(long)]
     pub validate: bool,
-    /// Cetak template config lalu keluar.
+    /// Print the default config template and exit.
     #[arg(long)]
     pub print_default_config: bool,
 }
 
-/// Hasil akhir setelah merge (satu-satunya yang dipakai server).
+/// Final result after merge (the only one the server uses).
 #[derive(Debug, Clone)]
 pub struct UbConfig {
     pub host: String,
@@ -79,14 +79,14 @@ pub struct UbConfig {
     pub trust_proxy: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
-    /// Deklarasi index siap pakai (dibuat saat startup + reload — pola
-    /// autoCreateTablesFromRules backend lama, diperluas ke index).
+    /// Ready-to-use index declarations (created at startup + reload — legacy
+    /// autoCreateTablesFromRules pattern, extended to indexes).
     pub indexes: Vec<IndexDecl>,
-    /// Dari file mana (untuk /api/admin/reload); "" bila murni default+flag.
+    /// Which file it came from (for /api/admin/reload); "" when pure default+flags.
     pub source: String,
 }
 
-/// Satu deklarasi `[[indexes]]`: `collection` + `fields[]` (+opsi).
+/// One `[[indexes]]` declaration: `collection` + `fields[]` (+options).
 /// `kind`: simple (default) | composite | fts.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct IndexDecl {
@@ -106,16 +106,16 @@ fn simple_kind() -> String {
 impl IndexDecl {
     pub fn validate(&self) -> Result<hakobackend_core::IndexSpec, String> {
         if self.collection.is_empty() {
-            return Err("[[indexes]] butuh collection".into());
+            return Err("[[indexes]] requires collection".into());
         }
         if self.fields.is_empty() {
-            return Err(format!("[[indexes]] {} butuh >= 1 field", self.collection));
+            return Err(format!("[[indexes]] {} requires >= 1 field", self.collection));
         }
         let kind = match self.kind.as_str() {
             "simple" => hakobackend_core::IndexKind::Simple,
             "composite" => hakobackend_core::IndexKind::Composite,
             "fts" | "fulltext" => hakobackend_core::IndexKind::FullText,
-            other => return Err(format!("[[indexes]] kind `{other}` tak dikenal (simple|composite|fts)")),
+            other => return Err(format!("[[indexes]] kind `{other}` unknown (simple|composite|fts)")),
         };
         Ok(hakobackend_core::IndexSpec {
             name: self.name.clone(),
@@ -169,14 +169,14 @@ struct LegacyServer {
 struct LegacyDb {
     driver: Option<String>,
     path: Option<String>,
-    // Penempatan warisan yang longgar: kunci root yang tertulis di bawah
-    // [database]/[server] tetap dibaca (dulu terabaikan serde — bug kompat).
+    // Loose legacy placement: root keys written under
+    // [database]/[server] are still read (previously ignored by serde — compat bug).
     data: Option<String>,
     rules: Option<String>,
     policy_file: Option<String>,
 }
 
-/// Path config: --config > UB_CONFIG > ./hakobackend.toml > ./ub.toml (legacy) > tanpa file.
+/// Config path: --config > UB_CONFIG > ./hakobackend.toml > ./ub.toml (legacy) > no file.
 pub fn config_path(args: &Args) -> Option<String> {
     if let Some(p) = &args.config {
         return Some(p.clone());
@@ -198,18 +198,18 @@ fn load_file(path: &str, explicit: bool) -> FileConfig {
     match std::fs::read_to_string(path) {
         Ok(raw) => match toml::from_str(&raw) {
             Ok(cfg) => cfg,
-            Err(e) if explicit => panic!("[ub] parse {path} gagal: {e}"),
+            Err(e) if explicit => panic!("[ub] failed to parse {path}: {e}"),
             Err(e) => {
-                eprintln!("[ub] WARN: parse {path} gagal ({e}); pakai default");
+                eprintln!("[ub] WARN: failed to parse {path} ({e}); using defaults");
                 FileConfig::default()
             }
         },
-        Err(_) if explicit => panic!("[ub] config {path} tidak terbaca"),
+        Err(_) if explicit => panic!("[ub] could not read config {path}"),
         Err(_) => FileConfig::default(),
     }
 }
 
-/// Merge: flag > file > default. Alias lama memicu WARN sekali.
+/// Merge: flags > file > defaults. Legacy aliases trigger WARN once.
 pub fn resolve(args: &Args) -> UbConfig {
     let path = config_path(args);
     let explicit = args.config.is_some() || std::env::var("UB_CONFIG").map(|v| !v.is_empty()).unwrap_or(false);
@@ -220,13 +220,13 @@ pub fn resolve(args: &Args) -> UbConfig {
         || file.policy_file.is_some()
         || file.database.policy_file.is_some()
     {
-        eprintln!("[ub] WARN: kunci lama ([server] listen / [database] / policy_file) deprecated; pakai host/port/driver/data/rules (lihat --print-default-config)");
+        eprintln!("[ub] WARN: legacy keys ([server] listen / [database] / policy_file) are deprecated; use host/port/driver/data/rules (see --print-default-config)");
     }
     let (mut host, mut port) = ("0.0.0.0".to_string(), 3000u16);
     if let Some(listen) = file.server.listen {
         if let Some((h, p)) = listen.rsplit_once(':') {
             host = h.to_string();
-            port = p.parse().unwrap_or_else(|_| panic!("[ub] listen `{listen}` port tidak valid"));
+            port = p.parse().unwrap_or_else(|_| panic!("[ub] listen `{listen}` has an invalid port"));
         }
     }
 
@@ -272,19 +272,19 @@ pub fn resolve(args: &Args) -> UbConfig {
     }
 }
 
-/// TLS aktif bila KEDUA path terisi (gagal jelas bila timpang).
+/// TLS active when BOTH paths are set (clear failure when lopsided).
 pub fn tls_pair(cfg: &UbConfig) -> Result<Option<(String, String)>, String> {
     match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Ok(Some((c.clone(), k.clone()))),
         (None, None) => Ok(None),
-        _ => Err("tls butuh KEDUA tls_cert + tls_key (atau kosongkan keduanya)".into()),
+        _ => Err("tls requires both tls_cert + tls_key (or leave both empty)".into()),
     }
 }
 
-/// Validasi kering: driver dikenal + rules terparse + auth spec terbuka + index valid.
+/// Dry validation: known driver + parseable rules + openable auth spec + valid indexes.
 pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     if !KNOWN_DRIVERS.contains(&cfg.driver.as_str()) {
-        return Err(format!("driver `{}` tak dikenal (pilihan: {})", cfg.driver, KNOWN_DRIVERS.join(", ")));
+        return Err(format!("driver `{}` unknown (choices: {})", cfg.driver, KNOWN_DRIVERS.join(", ")));
     }
     if let Some(r) = &cfg.rules {
         hakobackend_policy::PolicyFile::load(r)?;
@@ -301,7 +301,7 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     match tls_pair(cfg)? {
         Some((c, k)) => {
             for (label, p) in [("tls_cert", &c), ("tls_key", &k)] {
-                std::fs::metadata(p).map_err(|_| format!("{label} tak terbaca: {p}"))?;
+                std::fs::metadata(p).map_err(|_| format!("{label} unreadable: {p}"))?;
             }
         }
         None => {}
@@ -317,29 +317,29 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     ))
 }
 
-pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# universalbackend — template config (lihat --help untuk flag CLI).
-# Flag CLI selalu menang atas file ini.
+pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# universalbackend — config template (see --help for CLI flags).
+# CLI flags always win over this file.
 host = "0.0.0.0"
 port = 3000
 
-driver = "hako"          # pilihan: hako (lainnya fase 3)
-data = "./data/hako.ub"  # path file atau DSN
+driver = "hako"          # choices: hako (others in phase 3)
+data = "./data/hako.ub"  # file path or DSN
 
-rules = "./policy.toml"  # hot-reload; kosongkan = mode dev terbuka
+rules = "./policy.toml"  # hot-reload; leave empty = open dev mode
 auth = "off"             # off | local | chain:github,local | ./custom.toml
 
-# Asal publik untuk callback OAuth (atau env UB_PUBLIC_URL yang menang bila diisi).
-# public_url = "https://api.contoh.id"
+# Public origin for OAuth callbacks (or UB_PUBLIC_URL env which wins when set).
+# public_url = "https://api.example.com"
 
-# Flood protection in-process (tanpa redis): req/mnt per IP + burst.
-# Lapisan ketat khusus /api/auth/* (anti brute-force credential).
+# In-process flood protection (without redis): req/min per IP + burst.
+# Strict layer just for /api/auth/* (anti credential brute-force).
 limit_global = 600
 limit_global_burst = 100
 limit_auth = 20
 limit_auth_burst = 5
-# trust_proxy = false  # true HANYA di belakang proxy yang membersihkan X-Forwarded-For
+# trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
 
-# TLS (keduanya wajib; kosong = http biasa). Skema DPoP + cookie Secure mengikuti otomatis.
+# TLS (both required; empty = plain http). DPoP scheme + Secure cookies follow automatically.
 # tls_cert = "./cert.pem"
 # tls_key = "./key.pem"
 "#;
@@ -391,10 +391,10 @@ mod tests {
     }
 
     #[test]
-    fn alias_lama_tetap_dibaca() {
+    fn legacy_alias_still_read() {
         let f = write_tmp(
             "hakobackend_legacy_test.toml",
-            // Layout warisan persis (policy_file di bawah [database]).
+            // Exact legacy layout (policy_file under [database]).
             "[server]\nlisten = \"127.0.0.1:4040\"\n[database]\ndriver = \"hako\"\npath = \"./x.ub\"\npolicy_file = \"./r.toml\"\n",        );
         let mut a = args();
         a.config = Some(f.clone());

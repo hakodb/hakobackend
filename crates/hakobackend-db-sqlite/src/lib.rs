@@ -1,8 +1,8 @@
-//! hakobackend-db-sqlite: addon SQLite via sqlx (file atau :memory:).
+//! hakobackend-db-sqlite: SQLite addon via sqlx (file or :memory:).
 //!
-//! Difusi pola Postgres: tabel JSON generik per koleksi (flat name),
-//! subkoleksi + `_collectionPath`, registry index `__ub_indexes`.
-//! Dialek: `json_extract`, placeholder `?`, FTS5 external-content + trigger.
+//! Postgres-pattern diffusion: generic JSON table per collection (flat name),
+//! subcollections + `_collectionPath`, index registry `__ub_indexes`.
+//! Dialect: `json_extract`, `?` placeholders, FTS5 external-content + triggers.
 
 use std::collections::{HashMap, HashSet};
 use hakobackend_core::{AppError, Capabilities, Change, Database, Direction, Doc, Filter, FilterOp, IndexInfo, IndexKind, IndexSpec, QueryOptions};
@@ -19,9 +19,9 @@ impl SqliteDb {
         use sqlx::sqlite::SqliteConnectOptions;
         use std::str::FromStr;
         let opts = SqliteConnectOptions::from_str(if path.is_empty() { ":memory:" } else { path })
-            .map_err(|_| AppError::BadRequest("DSN sqlite tak valid".into()))?
+            .map_err(|_| AppError::BadRequest("invalid sqlite DSN".into()))?
             .create_if_missing(true);
-        // :memory: = 1 koneksi (tiap koneksi pool punya DB sendiri!).
+        // :memory: = 1 connection (each pool connection owns its own DB!).
         let max = if path.is_empty() || path == ":memory:" { 1 } else { 5 };
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(max)
@@ -40,7 +40,7 @@ impl SqliteDb {
         .execute(&self.pool)
         .await
         .map_err(|_| AppError::Internal("db error".into()))?;
-        // Migrasi toleran: tabel lama tanpa kolom ddl.
+        // Tolerant migration: legacy tables without the ddl column.
         let sql: String = sqlx::query("SELECT sql FROM sqlite_master WHERE name = '__ub_indexes'")
             .fetch_one(&self.pool)
             .await
@@ -77,19 +77,19 @@ impl SqliteDb {
     }
 }
 
-// --- Helper SQL murni (diuji unit tanpa DB) ---
+// --- Pure SQL helpers (unit-tested without a DB) ---
 
 fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Path JSON: "a.b" → `json_extract(data, '$."a"."b"')`.
+/// JSON path: "a.b" → `json_extract(data, '$."a"."b"')`.
 fn jpath(field: &str) -> String {
     let segs: Vec<String> = field.split('.').map(|s| format!("\"{}\"", s.replace('"', "\"\""))).collect();
     format!("json_extract(data, '$.{}')", segs.join("."))
 }
 
-/// Param terikat: angka→REAL, string→TEXT, bool→INTEGER, null→IS NULL khusus.
+/// Bound param: number→REAL, string→TEXT, bool→INTEGER, null→special IS NULL.
 enum P {
     F(f64),
     T(String),
@@ -114,11 +114,11 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
                 sql.push_str(&format!("{col} = ?"));
                 params.push(p);
             }
-            // Eq null/objek: NULL tak pernah == ; objek/array tak didukung banding.
+            // Eq null/object: NULL is never == ; objects/arrays lack comparison support.
             None if f.value.is_null() => sql.push_str(&format!("{col} IS NULL")),
             None => sql.push_str("FALSE"),
         },
-        // Paritas kontrak: field hilang = true untuk Ne (SQL NULL perlu OR eksplisit).
+        // Contract parity: a missing field = true for Ne (SQL NULL needs an explicit OR).
         FilterOp::Ne => match to_param(&f.value) {
             Some(p) => {
                 sql.push_str(&format!("({col} <> ? OR {col} IS NULL)"));
@@ -128,34 +128,34 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
         },
         FilterOp::Gt => {
             let Some(p) = to_param(&f.value) else {
-                return Err(AppError::BadRequest("perbandingan butuh skalar".into()));
+                return Err(AppError::BadRequest("comparison needs a scalar".into()));
             };
             sql.push_str(&format!("{col} > ?"));
             params.push(p);
         }
         FilterOp::Gte => {
             let Some(p) = to_param(&f.value) else {
-                return Err(AppError::BadRequest("perbandingan butuh skalar".into()));
+                return Err(AppError::BadRequest("comparison needs a scalar".into()));
             };
             sql.push_str(&format!("{col} >= ?"));
             params.push(p);
         }
         FilterOp::Lt => {
             let Some(p) = to_param(&f.value) else {
-                return Err(AppError::BadRequest("perbandingan butuh skalar".into()));
+                return Err(AppError::BadRequest("comparison needs a scalar".into()));
             };
             sql.push_str(&format!("{col} < ?"));
             params.push(p);
         }
         FilterOp::Lte => {
             let Some(p) = to_param(&f.value) else {
-                return Err(AppError::BadRequest("perbandingan butuh skalar".into()));
+                return Err(AppError::BadRequest("comparison needs a scalar".into()));
             };
             sql.push_str(&format!("{col} <= ?"));
             params.push(p);
         }
         FilterOp::In => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("in needs an array".into()))?;
             let mut parts = Vec::new();
             for v in arr {
                 match to_param(v) {
@@ -172,16 +172,16 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
                 sql.push_str(&format!("({})", parts.join(" OR ")));
             }
         }
-        // json_each: uniform untuk semua tipe skalar (tanpa asumsi string).
+        // json_each: uniform across all scalar types (no string assumption).
         FilterOp::ArrayContains => {
             let Some(p) = to_param(&f.value) else {
-                return Err(AppError::BadRequest("array-contains butuh skalar".into()));
+                return Err(AppError::BadRequest("array-contains needs a scalar".into()));
             };
             sql.push_str(&format!("EXISTS (SELECT 1 FROM json_each(data, '$.{field}') WHERE value = ?)", field = f.field.replace('\'', "''")));
             params.push(p);
         }
         FilterOp::ArrayContainsAny => {
-            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any butuh array".into()))?;
+            let arr = f.value.as_array().ok_or_else(|| AppError::BadRequest("array-contains-any needs an array".into()))?;
             if arr.is_empty() {
                 sql.push_str("FALSE");
                 return Ok(());
@@ -189,7 +189,7 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
             let mut parts = Vec::new();
             for v in arr {
                 let Some(p) = to_param(v) else {
-                    return Err(AppError::BadRequest("array-contains-any butuh skalar".into()));
+                    return Err(AppError::BadRequest("array-contains-any needs scalars".into()));
                 };
                 parts.push(format!("EXISTS (SELECT 1 FROM json_each(data, '$.{field}') WHERE value = ?)", field = f.field.replace('\'', "''")));
                 params.push(p);
@@ -217,8 +217,8 @@ fn build_where(collection: &str, q: &QueryOptions) -> Result<(String, Vec<P>), A
     Ok((where_, params))
 }
 
-/// Fragmen cursor: bound typed seperti filter (REAL/TEXT/INTEGER).
-/// Bound null/objek → FALSE (tak-bisa-dibandingkan = gugur semua, paritas kontrak).
+/// Cursor fragment: typed bounds like filters (REAL/TEXT/INTEGER).
+/// Null/object bounds → FALSE (incomparable = drop everything, contract parity).
 fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<P>) {
     let field = hakobackend_core::conformance::cursor_field(q);
     let mut bound = |op: &str, v: &serde_json::Value| {
@@ -254,7 +254,7 @@ fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<P>)
     }
 }
 
-/// LIMIT/OFFSET SQLite: OFFSET butuh LIMIT (pakai -1 = tanpa batas).
+/// LIMIT/OFFSET for SQLite: OFFSET needs LIMIT (use -1 = unbounded).
 fn build_page(q: &QueryOptions) -> String {
     match (q.limit, q.offset) {
         (Some(n), Some(o)) => format!(" LIMIT {n} OFFSET {o}"),
@@ -311,11 +311,11 @@ fn uuid_like() -> String {
 }
 
 fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
-    // Tabel FTS memakai prefix internal `__fts_` agar tersembunyi dari list_collections.
+    // FTS tables use the internal `__fts_` prefix to stay hidden from list_collections.
     let base = spec.name.clone().unwrap_or_else(|| match spec.kind {
         IndexKind::Simple => format!("idx_{}_{}", table, spec.fields.join("_")),
         IndexKind::Composite => format!("idx_{}_{}", table, spec.fields.join("_")),
-        // Satu tabel FTS per field (nama deterministik, prefix internal agar tersembunyi).
+        // One FTS table per field (deterministic name, internal prefix to stay hidden).
         IndexKind::FullText => format!("__fts_{}_{}", table, spec.fields.join("_")),
     });
     base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
@@ -353,7 +353,7 @@ impl Database for SqliteDb {
     }
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
-        // Koleksi internal `__*` (sesi, registry, tabel FTS) tak diekspos HTTP.
+        // Internal `__*` collections (sessions, registry, FTS tables) are not exposed over HTTP.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%'",
         )
@@ -432,7 +432,7 @@ impl Database for SqliteDb {
         self.ensure_table(&table).await?;
         inject_path(&mut doc.data, collection);
         if merge {
-            // Gabung dangkal level-atas di Rust (json_patch = deep-merge, salah semantik).
+            // Shallow top-level merge in Rust (json_patch = deep-merge, wrong semantics).
             let mut base = self
                 .get(collection, id)
                 .await?
@@ -506,11 +506,11 @@ impl Database for SqliteDb {
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError> {
         hakobackend_core::conformance::validate_spec(self.capabilities(), spec)?;
         if spec.unique && spec.kind == IndexKind::FullText {
-            return Err(AppError::BadRequest("fts tak bisa unique".into()));
+            return Err(AppError::BadRequest("fts cannot be unique".into()));
         }
         let table = hakobackend_core::flat_table_name(collection);
         self.ensure_table(&table).await?;
-        // Nama logis (kontrak, deterministik lintas driver) vs fisik (DDL per tabel).
+        // Logical name (contract, deterministic across drivers) vs physical (DDL per table).
         let logical = spec.name.clone().unwrap_or_else(|| hakobackend_core::conformance::auto_index_name(spec));
         let physical = safe_index_name(&table, spec);
         let unique = if spec.unique { "UNIQUE " } else { "" };
@@ -528,13 +528,13 @@ impl Database for SqliteDb {
                 .map_err(|_| AppError::Internal("db error".into()))?;
             }
             IndexKind::FullText => {
-                // FTS5 external-content: 1 field; trigger menjaga sinkronisasi.
+                // FTS5 external-content: 1 field; triggers keep it in sync.
                 let f = &spec.fields[0];
                 let path = format!("$.\"{}\"", f.replace('"', "\"\""));
                 sqlx::query(&format!("CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(content, content={table}, content_rowid=\"rowid\")", name = qi(&physical), table = qi(&table)))
                     .execute(&self.pool)
                     .await
-                    .map_err(|_| AppError::Internal("db error (fts5 butuh build sqlite ber-fts)".into()))?;
+                    .map_err(|_| AppError::Internal("db error (fts5 needs an fts-enabled sqlite build)".into()))?;
                 for (trg, when, body) in [
                     ("ai", "AFTER INSERT", format!("INSERT INTO {name}(rowid, content) VALUES (new.rowid, json_extract(new.data, '{path}'))", name = qi(&physical))),
                     ("ad", "AFTER DELETE", format!("INSERT INTO {name}({name}, rowid, content) VALUES ('delete', old.rowid, json_extract(old.data, '{path}'))", name = qi(&physical))),
@@ -666,17 +666,17 @@ mod tests {
 
     #[test]
     fn filter_sqlite_parity() {
-        // Angka diikat REAL (30 = 30.0), string TEXT, bool INTEGER.
+        // Numbers bind REAL (30 = 30.0), strings TEXT, bools INTEGER.
         let (s, p) = frag(&filter("age", FilterOp::Eq, serde_json::json!(30)));
         assert_eq!(s, "json_extract(data, '$.\"age\"') = ?");
         assert_eq!(p, vec!["F(30)"]);
         let (s, p) = frag(&filter("aktif", FilterOp::Eq, serde_json::json!(true)));
         assert_eq!(p, vec!["I(1)"]);
         assert!(s.ends_with("= ?"));
-        // Ne atas field hilang = true via OR IS NULL (paritas kontrak).
+        // Ne over a missing field = true via OR IS NULL (contract parity).
         let (s, _) = frag(&filter("x", FilterOp::Ne, serde_json::json!(1)));
         assert!(s.contains("OR") && s.contains("IS NULL"));
-        // Eq null → IS NULL; array-contains via json_each uniform.
+        // Eq null → IS NULL; array-contains via uniform json_each.
         let (s, _) = frag(&filter("x", FilterOp::Eq, serde_json::json!(null)));
         assert!(s.contains("IS NULL"));
         let (s, p) = frag(&filter("tags", FilterOp::ArrayContains, serde_json::json!("a")));
@@ -687,12 +687,12 @@ mod tests {
     }
 
     #[test]
-    fn identifier_dikutip() {
+    fn identifier_quoted() {
         assert_eq!(qi("a\"b"), "\"a\"\"b\"");
         assert_eq!(jpath("a.b"), "json_extract(data, '$.\"a\".\"b\"')");
     }
 
-    /// Konformansi penuh butuh sqlite live (file/:memory:) — jalan tanpa server.
+    /// Full conformance needs live sqlite (file/:memory:) — runs without a server.
     #[tokio::test]
     async fn conformance_sqlite_memory() {
         let db = SqliteDb::open(":memory:").await.unwrap();

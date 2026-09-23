@@ -1,10 +1,10 @@
-//! realtime: fan-out WS + SSE di atas `Database::subscribe` (watch) atau polling.
+//! realtime: WS + SSE fan-out over `Database::subscribe` (watch) or polling.
 //!
-//! Satu-satunya sumber kebenaran klasifikasi add/change/remove adalah SNAPSHOT
-//! per-subscription + pencocokan opsi penuh (filter + cursor) — pola
-//! `changeHandler` backend lama. Watch driver hanya pemicu; polling menutup
-//! driver tanpa watch. Policy: gate `List` saat subscribe, `Get` per dokumen
-//! saat delivery (dokumen tak dikenal = rule dengan resource None).
+//! The single source of truth for add/change/remove classification is the
+//! per-subscription SNAPSHOT + full option matching (filter + cursor) — the
+//! legacy `changeHandler` pattern. Driver watch is only a trigger; polling covers
+//! drivers without watch. Policy: `List` gate at subscribe, per-document `Get`
+//! at delivery (unknown document = rule with None resource).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -13,9 +13,9 @@ use std::time::Duration;
 use hakobackend_core::{AppError, AuthContext, ChangeKind, Database, Doc, Method, QueryOptions};
 use hakobackend_policy::PolicyFile;
 
-/// Interval polling untuk driver tanpa watch (single-instance; Redis fan-out menyusul).
+/// Polling interval for drivers without watch (single-instance; Redis fan-out follows).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Batas subscription per koneksi WS (paritas backend lama).
+/// Subscription limit per WS connection (legacy backend parity).
 pub const MAX_SUBS_PER_SOCKET: usize = 100;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,7 +33,7 @@ pub struct OutEvent {
     pub doc: Option<Doc>,
 }
 
-/// Bentuk kabel ke WS/SSE (kind sebagai string).
+/// Wire shape to WS/SSE (kind as string).
 #[derive(Debug, Clone, Serialize)]
 pub struct WireEvent {
     pub kind: &'static str,
@@ -64,8 +64,8 @@ impl Drop for Subscription {
     }
 }
 
-/// `posts_revisions` / `posts/revisions` cocok untuk group `revisions`
-/// (paritas `matchesGroupTable` backend lama).
+/// `posts_revisions` / `posts/revisions` match group `revisions`
+/// (legacy `matchesGroupTable` parity).
 pub fn matches_group(table: &str, target: &str) -> bool {
     table == target || table.ends_with(&format!("/{target}")) || table.ends_with(&format!("_{target}"))
 }
@@ -74,12 +74,12 @@ fn matches_full(doc: &Doc, q: &QueryOptions) -> bool {
     hakobackend_core::conformance::doc_matches(doc, &q.filters) && hakobackend_core::conformance::matches_cursor(doc, q)
 }
 
-/// Opsi untuk snapshot: filter saja (tanpa limit/cursor/offset — diff butuh semesta).
+/// Options for snapshot: filters only (no limit/cursor/offset — diff needs the universe).
 fn snapshot_options(q: &QueryOptions) -> QueryOptions {
     QueryOptions { filters: q.filters.clone(), ..Default::default() }
 }
 
-/// Klasifikasi transisi (paritas changeHandler legacy): (cocok_lama, cocok_baru).
+/// Transition classification (legacy changeHandler parity): (old_match, new_match).
 fn transition(old_match: bool, new_match: bool) -> Option<ChangeKind> {
     match (old_match, new_match) {
         (false, true) => Some(ChangeKind::Add),
@@ -89,7 +89,7 @@ fn transition(old_match: bool, new_match: bool) -> Option<ChangeKind> {
     }
 }
 
-/// Buka subscription: gate List → snapshot → sumber watch/poll per koleksi.
+/// Open subscription: List gate → snapshot → per-collection watch/poll source.
 pub async fn subscribe(
     db: Arc<dyn Database>,
     policy: Arc<PolicyFile>,
@@ -108,7 +108,7 @@ pub async fn subscribe(
     if collections.is_empty() {
         collections.push(spec.collection.clone());
     }
-    // Snapshot awal (tanpa burst ke klien — klien GET dulu seperti legacy).
+    // Initial snapshot (no burst to client — client GETs first like legacy).
     let snap_q = snapshot_options(&spec.options);
     let mut snapshot: HashMap<String, Doc> = HashMap::new();
     for coll in &collections {
@@ -136,7 +136,7 @@ async fn run_source(
     tx: tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) {
     if watch {
-        // Satu receiver per koleksi; select bergilir (contract: watch = push engine).
+        // One receiver per collection; round-robin select (contract: watch = push engine).
         let mut rxs = Vec::new();
         for coll in &collections {
             if let Ok(rx) = db.subscribe(coll).await {
@@ -148,7 +148,7 @@ async fn run_source(
         }
         loop {
             let mut got: Option<(usize, hakobackend_core::Change)> = None;
-            // Poll bergilir non-blocking antar receiver (tanpa select! macro dinamis).
+            // Non-blocking round-robin poll across receivers (no dynamic select! macro).
             for (i, (_, rx)) in rxs.iter_mut().enumerate() {
                 match rx.try_recv() {
                     Ok(change) => {
@@ -181,7 +181,7 @@ async fn run_source(
                     }
                 }
             }
-            // Diff: tambah/ubah + hapus.
+            // Diff: adds/changes + removals.
             for (key, doc) in &fresh {
                 let coll = key.split('\0').next().unwrap_or("");
                 let old = snapshot.get(key);
@@ -207,7 +207,7 @@ async fn run_source(
     }
 }
 
-/// Terapkan satu perubahan watch ke snapshot + kirim bila cocok.
+/// Apply one watch change to the snapshot + send on match.
 async fn ingest_change(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
@@ -217,7 +217,7 @@ async fn ingest_change(
     change: hakobackend_core::Change,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) {
-    // Kunci snapshot mencakup koleksi (group multi-koleksi aman).
+    // Snapshot key includes the collection (multi-collection groups safe).
     let key = format!("{collection}\0{}", change.id);
     match change.kind {
         ChangeKind::Remove => {
@@ -239,7 +239,7 @@ async fn ingest_change(
     }
 }
 
-/// Pembungkus deliver yang tahu koleksi (untuk resolusi rule hierarkis).
+/// Collection-aware deliver wrapper (for hierarchical rule resolution).
 pub async fn deliver_in(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
@@ -286,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn transisi_add_change_remove_skip() {
+    fn transition_add_change_remove_skip() {
         assert_eq!(transition(false, true), Some(ChangeKind::Add));
         assert_eq!(transition(true, false), Some(ChangeKind::Remove));
         assert_eq!(transition(true, true), Some(ChangeKind::Change));
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn cocok_penuh_filter_dan_cursor() {
+    fn full_match_filter_and_cursor() {
         let q = opts();
         assert!(matches_full(&doc("a", 20), &q));
         assert!(!matches_full(&doc("b", 10), &q));

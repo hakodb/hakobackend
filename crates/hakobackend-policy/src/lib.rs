@@ -1,18 +1,18 @@
-//! hakobackend-policy: pengganti `userrules.ts`.
+//! hakobackend-policy: the `userrules.ts` replacement.
 //!
-//! Aturan deklaratif di TOML, **hot-reload tanpa restart** (hakobackend-server memantau
-//! mtime file). Gagal parse / typo rule = fail-closed (deny) + pesan error,
-//! tidak pernah fail-open.
+//! Declarative rules in TOML, **hot-reloaded without restart** (hakobackend-server watches
+//! the file mtime). Parse failures / rule typos = fail-closed (deny) + error message,
+//! never fail-open.
 //!
-//! Core TIDAK mengikat nama peran maupun koleksi user — semua milik user
+//! Core does NOT bind role or user-collection names — all of that is yours
 //! via `[identity]` (`users_collection`, `role_field`, `owner_field`).
-//! `role:<apapun>` bebas; core hanya membandingkan string.
+//! `role:<anything>` is free-form; core only compares strings.
 //!
 //! ```toml
 //! [identity]
-//! users_collection = "members"   # koleksi user versi Anda (default "users")
-//! role_field = "posisi"          # field peran versi Anda (default "role")
-//! owner_field = "pemilikId"      # field pemilik versi Anda (default "ownerId")
+//! users_collection = "members"   # your user collection (default "users")
+//! role_field = "posisi"          # your role field (default "role")
+//! owner_field = "pemilikId"      # your owner field (default "ownerId")
 //!
 //! [defaults]
 //! read = "public"
@@ -21,14 +21,14 @@
 //! [collections.posts]
 //! read = "public"
 //! create = "auth"
-//! delete = "role:pengurus"       # peran bebas, didefinisikan user
+//! delete = "role:pengurus"       # free-form role, defined by you
 //! ```
 
 use serde::Deserialize;
 use std::collections::HashMap;
 use hakobackend_core::{AuthContext, Doc, Method};
 
-/// Satu aturan. Dari string TOML: `public|auth|owner|deny|role:<nama>`.
+/// One rule. From a TOML string: `public|auth|owner|deny|role:<name>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rule {
     Public,
@@ -47,7 +47,7 @@ impl From<String> for Rule {
             "deny" => Rule::Deny,
             _ => match s.strip_prefix("role:") {
                 Some(name) if !name.is_empty() => Rule::Role(name.to_string()),
-                // ponytail: typo rule = deny (fail-closed), bukan error startup.
+                // ponytail: rule typo = deny (fail-closed), not a startup error.
                 _ => Rule::Deny,
             },
         }
@@ -81,21 +81,21 @@ fn default_owner_field() -> String {
     "ownerId".into()
 }
 
-/// Identitas milik USER, bukan core. Menjawab: "dokumen user ada di koleksi
-/// mana, field peran yang mana, field pemilik yang mana". Core hanya memakai
-/// nilai ini (fase 2: auth provider memuat doc user dari `users_collection`
-/// dan memetakan `role_field` menjadi `AuthContext.roles`); core tidak pernah
-/// mengasumsikan nama koleksi/peran tertentu.
+/// Identity owned by the USER, not core. Answers: "which collection holds user docs,
+/// which field holds the role, which field holds the owner". Core only consumes
+/// these values (phase 2: the auth provider loads the user doc from `users_collection`
+/// and maps `role_field` into `AuthContext.roles`); core never
+/// assumes any particular collection/role name.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Identity {
-    /// Koleksi dokumen user. Bebas: `users`, `members`, `sc_users`, …
+    /// User-document collection. Free-form: `users`, `members`, `sc_users`, …
     #[serde(default = "default_users_collection")]
     pub users_collection: String,
-    /// Field peran di dokumen user. Mendukung string tunggal (`"admin"`)
-    /// atau array (`["admin","staff"]`). Bebas diganti (`posisi`, `level`, …).
+    /// Role field on the user doc. Supports a single string (`"admin"`)
+    /// or an array (`["admin","staff"]`). Freely replaceable (`posisi`, `level`, …).
     #[serde(default = "default_role_field")]
     pub role_field: String,
-    /// Default field pemilik global; bisa dioverride per koleksi.
+    /// Global default owner field; can be overridden per collection.
     #[serde(default = "default_owner_field")]
     pub owner_field: String,
 }
@@ -111,8 +111,8 @@ impl Default for Identity {
 }
 
 impl Identity {
-    /// Ekstrak peran dari dokumen user (string atau array string).
-    /// Helper siap pakai untuk auth provider fase 2 dan untuk test.
+    /// Extract roles from a user doc (string or string array).
+    /// Ready-made helper for phase-2 auth providers and for tests.
     pub fn roles_of(&self, user_doc: &Doc) -> Vec<String> {
         match user_doc.data.get(&self.role_field) {
             Some(serde_json::Value::String(s)) => vec![s.clone()],
@@ -142,7 +142,7 @@ pub struct CollectionPolicy {
     pub delete: Option<Rule>,
     pub read: Option<Rule>,
     pub write: Option<Rule>,
-    /// Field dokumen pemilik (default `ownerId`, fallback `uid`).
+    /// Document owner field (default `ownerId`, fallback `uid`).
     pub owner_field: Option<String>,
 }
 
@@ -169,7 +169,7 @@ impl CollectionPolicy {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PolicyFile {
-    /// Konfigurasi identitas milik user (koleksi user, field peran/pemilik).
+    /// User-owned identity config (user collection, role/owner fields).
     #[serde(default)]
     pub identity: Identity,
     #[serde(default)]
@@ -179,7 +179,7 @@ pub struct PolicyFile {
 }
 
 impl PolicyFile {
-    /// Tanpa file policy (mode dev): semua public + server wajib log WARN.
+    /// Without a policy file (dev mode): everything public + the server must log WARN.
     pub fn open() -> Self {
         Self {
             identity: Identity::default(),
@@ -192,13 +192,13 @@ impl PolicyFile {
     }
 
     pub fn load(path: &str) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path).map_err(|e| format!("baca {path}: {e}"))?;
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
     }
 
-    /// Resolusi koleksi mengikuti fleksibilitas route (semantik Firestore
-    /// "most specific wins", seperti engine lama di `rules.ts:evaluateRule`):
-    /// exact (`posts/abc/revisions`) → segmen terakhir (`revisions`) →
+    /// Collection resolution follows route flexibility (Firestore-style
+    /// "most specific wins", like the old engine in `rules.ts:evaluateRule`):
+    /// exact (`posts/abc/revisions`) → last segment (`revisions`) →
     /// root (`posts`) → `[defaults]`.
     fn find(&self, collection: &str) -> Option<&CollectionPolicy> {
         if let Some(p) = self.collections.get(collection) {
@@ -220,8 +220,8 @@ impl PolicyFile {
         None
     }
 
-    /// `resource` = dokumen existing (get/update/delete), dokumen incoming (create),
-    /// atau tiap dokumen hasil list (dipanggil per-doc oleh server).
+    /// `resource` = existing doc (get/update/delete), incoming doc (create),
+    /// or each listed doc (called per-doc by the server).
     pub fn allow(
         &self,
         auth: Option<&AuthContext>,
@@ -232,7 +232,7 @@ impl PolicyFile {
         let empty = CollectionPolicy::default();
         let policy = self.find(collection).unwrap_or(&empty);
         let rule = policy.slot(method, &self.defaults);
-        // owner_field: override per koleksi menang atas default global milik user.
+        // owner_field: the per-collection override wins over the user's global default.
         let owner_field = policy.owner_field.as_deref().unwrap_or(&self.identity.owner_field);
         eval(rule, auth, Some(owner_field), resource)
     }
@@ -295,7 +295,7 @@ mod tests {
         assert!(p.allow(None, "posts", Method::List, None));
         assert!(!p.allow(None, "posts", Method::Create, None));
         assert!(p.allow(Some(&auth("u1")), "posts", Method::Create, Some(&doc("u1"))));
-        // koleksi tak dikenal -> defaults
+        // unknown collection -> defaults
         assert!(p.allow(None, "lain", Method::Get, None));
         assert!(!p.allow(Some(&auth("u1")), "lain", Method::Delete, None));
     }
@@ -351,20 +351,20 @@ mod tests {
             read = "public"
             "#,
         );
-        // exact menang atas segmen terakhir
+        // exact wins over the last segment
         assert!(p.allow(None, "posts/p1/revisions", Method::Get, None));
-        // segmen terakhir menang atas root
+        // last segment wins over root
         assert!(!p.allow(None, "posts/p9/revisions", Method::Get, None));
         assert!(p.allow(Some(&auth("u1")), "posts/p9/revisions", Method::Get, None));
-        // root untuk subcollection tanpa aturan sendiri
+        // root for subcollections without their own rule
         assert!(p.allow(None, "posts/p1/comments", Method::Get, None));
-        // tanpa kecocokan -> defaults (deny)
+        // no match -> defaults (deny)
         assert!(!p.allow(None, "lain/x/y", Method::Get, None));
     }
 
     #[test]
     fn identity_milik_user() {
-        // Peran bebas (bukan nama cadangan), users_collection & field custom.
+        // Free-form roles (not reserved names), custom users_collection & fields.
         let p: PolicyFile = toml::from_str(
             r#"
             [identity]
@@ -379,7 +379,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.identity.users_collection, "members");
 
-        // roles_of: dukung string tunggal maupun array, via field custom.
+        // roles_of: supports a single string or an array, via the custom field.
         let single = Doc {
             id: "u1".into(),
             data: [("posisi".to_string(), json!("pengurus"))].into_iter().collect(),
@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(p.identity.roles_of(&single), vec!["pengurus"]);
         assert_eq!(p.identity.roles_of(&multi), vec!["pengurus", "penulis"]);
 
-        // owner memakai pemilikId global; role bebas "pengurus" dihormati.
+        // owner uses the global pemilikId; the free-form "pengurus" role is honored.
         let owner_doc = Doc {
             id: "d".into(),
             data: [("pemilikId".to_string(), json!("u1"))].into_iter().collect(),
@@ -408,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_field_per_koleksi_menang_atas_global() {
+    fn owner_field_per_collection_beats_global() {
         let p: PolicyFile = toml::from_str(
             r#"
             [identity]
@@ -428,7 +428,7 @@ mod tests {
             id: "d".into(),
             data: [("ownerUid".to_string(), json!("u1"))].into_iter().collect(),
         };
-        // "khusus" memakai override, bukan global.
+        // "khusus" uses the override, not the global.
         assert!(!p.allow(Some(&me), "khusus", Method::Get, Some(&via_global)));
         assert!(p.allow(Some(&me), "khusus", Method::Get, Some(&via_override)));
     }

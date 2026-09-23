@@ -1,16 +1,16 @@
-//! hakobackend-db-hako: adapter HakoDB (driver default hakobackend).
+//! hakobackend-db-hako: HakoDB adapter (the default hakobackend driver).
 //!
-//! HakoDB dipakai sebagai dependensi Rust langsung (`rlib`), bukan via FFI.
-//! API-nya sinkron → setiap op dibungkus `spawn_blocking`; `watch_collection`
-//! di-bridge ke `tokio::sync::broadcast` agar bisa dipakai handler Axum async.
+//! HakoDB is used as a direct Rust dependency (`rlib`), not via FFI.
+//! Its API is synchronous → every op is wrapped in `spawn_blocking`; `watch_collection`
+//! is bridged to `tokio::sync::broadcast` so async Axum handlers can use it.
 
 use std::sync::Arc;
 use hakobackend_core::{AppError, Change, Database, Doc, QueryOptions};
 
 pub struct HakoDb {
     inner: Arc<hakodb::Hako>,
-    // ponytail: satu broadcast per koleksi dibuat malas (lazy); kebanyakan
-    // koleksi tidak pernah di-watch, jadi jangan alokasi di depan.
+    // ponytail: one broadcast per collection created lazily; most
+    // collections are never watched, so don't allocate up front.
     channels: tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Change>>>,
 }
 
@@ -25,7 +25,7 @@ impl HakoDb {
     }
 
     fn to_doc(id: String, hako: hakodb::document::hako_doc::HakoDoc) -> Doc {
-        // HakoDoc::to_json() -> serde_json::Value::Object; ambil map-nya langsung.
+        // HakoDoc::to_json() -> serde_json::Value::Object; take its map directly.
         let data = match hako.to_json() {
             serde_json::Value::Object(m) => m.into_iter().collect(),
             other => {
@@ -101,16 +101,16 @@ impl Database for HakoDb {
             supports_transactions: true,
             supports_composite: true,
             supports_fts: true,
-            // HakoDB tak punya API hapus index maupun constraint unik — tolak jelas.
+            // HakoDB has no drop-index API or unique constraints — reject clearly.
             supports_drop_index: false,
             supports_unique: false,
-            // HakoDB tak menyimpan nama custom — selalu auto (didokumentasikan).
+            // HakoDB doesn't store custom names — always auto (documented).
             supports_named_index: false,
         }
     }
 
     async fn ensure_collection(&self, _path: &str) -> Result<(), AppError> {
-        // HakoDB schemaless: koleksi terbentuk saat tulis pertama. Nul-op.
+        // HakoDB is schemaless: collections form on first write. No-op.
         Ok(())
     }
 
@@ -137,12 +137,12 @@ impl Database for HakoDb {
     }
 
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
-        // Dua jebakan semantik HakoDB native (ditemukan via suite konformansi):
-        // 1. Cursor bekerja pada sorted KEYS (id), bukan nilai field order.
-        // 2. Full-scan mendorong limit ke scan SEBELUM sort manual
-        //    (planner.rs:286-297, asumsi "unordered boleh TOP-N sembarang").
-        // Bila ada cursor ATAU order_by: ambil himpunan penuh (terurut native),
-        // lalu cursor+offset+limit via helper kontrak (paritas terjamin).
+        // Two native HakoDB semantic traps (found via the conformance suite):
+        // 1. Cursor operates on sorted KEYS (ids), not order-field values.
+        // 2. Full-scan pushes limit into the scan BEFORE manual sort
+        //    (planner.rs:286-297, assuming "unordered may take any TOP-N").
+        // With a cursor OR order_by: fetch the full set (natively sorted),
+        // then apply cursor+offset+limit via the contract helper (parity guaranteed).
         let emulate = q.start_at.is_some()
             || q.start_after.is_some()
             || q.end_at.is_some()
@@ -173,7 +173,7 @@ impl Database for HakoDb {
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
         if emulate {
-            // Native sudah filter+urut benar; terapkan cursor+offset+limit via kontrak.
+            // Native already filters+sorts correctly; apply cursor+offset+limit via the contract.
             Ok(hakobackend_core::conformance::apply_offset_limit(
                 hakobackend_core::conformance::apply_cursor(docs, q),
                 q,
@@ -191,7 +191,7 @@ impl Database for HakoDb {
     }
 
     async fn set(&self, collection: &str, id: &str, doc: Doc, merge: bool) -> Result<Doc, AppError> {
-        // Kontrak: merge=true = gabung dangkal level-atas (baca-gabung-tulis).
+        // Contract: merge=true = shallow top-level merge (read-merge-write).
         let data = if merge {
             let mut base = self
                 .get(collection, id)
@@ -244,7 +244,7 @@ impl Database for HakoDb {
             Entry::Vacant(v) => {
                 let (tx, _) = tokio::sync::broadcast::channel(256);
                 let rx = tx.subscribe();
-                // Bridge watch→broadcast hidup selama proses (satu thread per koleksi).
+                // The watch→broadcast bridge lives for the process lifetime (one thread per collection).
                 spawn_bridge(self.inner.clone(), v.key().clone(), tx.clone());
                 v.insert(tx);
                 Ok(rx)
@@ -255,8 +255,8 @@ impl Database for HakoDb {
     async fn create_index(&self, collection: &str, spec: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
         hakobackend_core::conformance::validate_spec(self.capabilities(), spec)?;
         if spec.unique {
-            // ponytail: HakoDB tak punya constraint unik — tolak jelas, bukan diam.
-            return Err(AppError::BadRequest("driver hako tanpa unique index".into()));
+            // ponytail: HakoDB has no unique constraints — reject clearly, don't stay silent.
+            return Err(AppError::BadRequest("hako driver has no unique index".into()));
         }
         let db = self.inner.clone();
         let (c, spec) = (collection.to_string(), spec.clone());
@@ -269,7 +269,7 @@ impl Database for HakoDb {
                         .next()
                         .ok_or_else(|| AppError::BadRequest("index spec needs at least one field".into()))?;
                     db.create_index(&c, &f).map_err(|e| AppError::Internal(e.to_string()))?;
-                    // Nama auto = nama field (hako tanpa penamaan; terdokumentasi).
+                    // Auto name = field name (hako has no naming; documented).
                     Ok(hakobackend_core::IndexInfo { name: f.clone(), fields: vec![f], unique: false, kind: hakobackend_core::IndexKind::Simple })
                 }
                 hakobackend_core::IndexKind::Composite => {
@@ -280,7 +280,7 @@ impl Database for HakoDb {
                         .collect();
                     let names = fields.iter().map(|(f, _)| f.clone()).collect::<Vec<_>>();
                     let _id = db.create_composite_index(&c, fields).map_err(|e| AppError::Internal(e.to_string()))?;
-                    // Nama logis kontrak (HakoDB menamai by id; adapter menyeragamkan).
+                    // Contract logical name (HakoDB names by id; the adapter normalizes).
                     let logical = spec.name.clone().unwrap_or_else(|| hakobackend_core::conformance::auto_index_name(&spec));
                     Ok(hakobackend_core::IndexInfo {
                         name: logical,
@@ -334,7 +334,7 @@ impl Database for HakoDb {
             }
             for comp in &list.composite {
                 let fields: Vec<String> = comp.fields.iter().map(|f| f.field.clone()).collect();
-                // Nama logis kontrak direkonstruksi dari fields (konsisten dengan create).
+                // Contract logical name reconstructed from fields (consistent with create).
                 let logical = hakobackend_core::conformance::auto_index_name(&hakobackend_core::IndexSpec {
                     name: None,
                     fields: fields.clone(),
@@ -355,7 +355,7 @@ impl Database for HakoDb {
     }
 
     async fn drop_index(&self, _collection: &str, _name: &str) -> Result<(), AppError> {
-        Err(AppError::BadRequest("driver hako tanpa API hapus index".into()))
+        Err(AppError::BadRequest("hako driver has no drop-index API".into()))
     }
 }
 
@@ -368,10 +368,10 @@ fn uuid_like() -> String {
     format!("{:x}{:x}", nanos, std::process::id())
 }
 
-/// Fan-out `watch_collection` HakoDB ke broadcast channel (satu thread OS per
-/// koleksi yang di-watch, hidup selama proses). Klasifikasi add/change kasar
-/// via himpunan id terlihat (seed sekali dari list); server memverifikasi ulang
-/// via snapshot-nya sendiri sehingga klasifikasi akhir SELALU konsisten.
+/// Fan-out HakoDB `watch_collection` into a broadcast channel (one OS thread per
+/// watched collection, living for the process lifetime). Coarse add/change classification
+/// via the visible id set (seeded once from list); the server re-verifies
+/// via its own snapshot so the final classification is ALWAYS consistent.
 fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broadcast::Sender<Change>) {
     std::thread::spawn(move || {
         let rx = db.watch_collection(&collection);
@@ -420,15 +420,15 @@ fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broa
 mod tests {
     use super::*;
 
-    /// Wajib lolos sebelum driver boleh diregistrasi (DRIVER_CONTRACT.md §4).
-    /// Berat (menarik HakoDB) — dijalankan saat build penuh, bukan tiap edit.
+    /// Must pass before the driver may be registered (DRIVER_CONTRACT.md §4).
+    /// Heavy (pulls in HakoDB) — run on full builds, not every edit.
     #[tokio::test]
-    #[ignore = "butuh build HakoDB penuh; jalankan saat build release"]
+    #[ignore = "requires a full HakoDB build; run on release builds"]
     async fn conformance_hako() {
         let dir = std::env::temp_dir().join(format!("hakobackend_conform_{}", std::process::id()));
         let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
         hakobackend_core::conformance::run_conformance_suite(&db).await;
-        // Drop tak didukung hako → suite index menegaskan penolakan jelasnya.
+        // Drop is unsupported by hako → the index suite asserts its clear rejection.
         hakobackend_core::conformance::run_index_suite(&db).await;
         let _ = std::fs::remove_dir_all(dir);
     }

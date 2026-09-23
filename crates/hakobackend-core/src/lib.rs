@@ -1,15 +1,15 @@
-//! hakobackend-core: kontrak bersama hakobackend.
-//! Diport dari `rethink-firestore/backend/src/lib/{query,rdb}.ts`.
-//! Semua driver DB (hako, postgres, mysql, sqlite, rethink) mengimpl trait [`Database`]
-//! dan wajib lolos contract-test yang sama.
+//! hakobackend-core: the shared hakobackend contract.
+//! Ported from `rethink-firestore/backend/src/lib/{query,rdb}.ts`.
+//! All DB drivers (hako, postgres, mysql, sqlite, rethink) implement the [`Database`] trait
+//! and must pass the same contract test.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-// --- Dokumen: id + field fleksibel (schemaless, seperti Firestore) ---
+// --- Document: id + flexible fields (schemaless, like Firestore) ---
 
-/// Satu dokumen: identik dengan bentuk JSON yang dipakai wire-protocol lama
-/// (`GET /api/collections/<path>/<id>` mengembalikan objek ini + `id`).
+/// One document: identical to the JSON shape used by the legacy wire protocol
+/// (`GET /api/collections/<path>/<id>` returns this object + `id`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Doc {
     pub id: String,
@@ -17,12 +17,12 @@ pub struct Doc {
     pub data: HashMap<String, serde_json::Value>,
 }
 
-// --- Query: diport dari FILTER_OPS (query.ts) + RethinkDBOptions (rdb.ts) ---
+// --- Query: ported from FILTER_OPS (query.ts) + RethinkDBOptions (rdb.ts) ---
 
-/// Operator filter yang didukung gateway. Superset HakoDB mencakup semuanya
-/// (lihat `hakodb/src/query/filter.rs`), driver SQL menerjemahkan ke JSON path.
-/// Wire-protocol menerima BENTUK SIMBOLIK legacy (`==`, `>`, `array-contains`, …)
-/// maupun kata (`eq`, `gt`, …) — keduanya dipetakan ke varian yang sama.
+/// Filter operators supported by the gateway. The HakoDB superset covers all of them
+/// (see `hakodb/src/query/filter.rs`); SQL drivers translate them to JSON paths.
+/// The wire protocol accepts the legacy SYMBOLIC form (`==`, `>`, `array-contains`, …)
+/// as well as words (`eq`, `gt`, …) — both map to the same variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
     Eq,
@@ -105,9 +105,9 @@ pub enum Direction {
     Desc,
 }
 
-/// Opsi list/query — diparsing dari `?options=<json>` persis seperti server lama.
-/// Kunci camelCase legacy (`orderBy`, `startAt`, …) diterima via alias.
-/// `offset` kemampuan baru (legacy tak punya; HakoDB/Firestore-style).
+/// List/query options — parsed from `?options=<json>` exactly like the legacy server.
+/// Legacy camelCase keys (`orderBy`, `startAt`, …) are accepted via alias.
+/// `offset` is a new capability (legacy lacked it; HakoDB/Firestore-style).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QueryOptions {
     #[serde(default)]
@@ -128,9 +128,9 @@ pub struct QueryOptions {
     pub end_before: Option<serde_json::Value>,
 }
 
-// --- Path: aturan genap/ganjil (server.ts:getPathInfo) ---
+// --- Path: even/odd rules (server.ts:getPathInfo) ---
 
-/// Hasil parsing `/api/collections/{*path}`: jumlah segmen genap = dokumen.
+/// Parse result of `/api/collections/{*path}`: an even segment count = document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathKind {
     Document { collection: String, id: String },
@@ -152,8 +152,8 @@ pub fn parse_collection_path(raw: &str) -> PathKind {
     }
 }
 
-/// `posts/123/revisions` -> `posts_revisions` (diport dari `getFlatTableName`).
-/// Driver SQL memakai ini; HakoDB memakai path hierarkis aslinya.
+/// `posts/123/revisions` -> `posts_revisions` (ported from `getFlatTableName`).
+/// SQL drivers use this; HakoDB uses the original hierarchical path.
 pub fn flat_table_name(collection_path: &str) -> String {
     if !collection_path.contains('/') {
         return collection_path.to_string();
@@ -167,17 +167,17 @@ pub fn flat_table_name(collection_path: &str) -> String {
         .join("_")
 }
 
-// --- Auth: konteks seragam untuk semua provider (pengganti auth Firebase-only) ---
+// --- Auth: uniform context for all providers (replacing Firebase-only auth) ---
 //
-// Dua peran provider (AUTH_CONTRACT.md):
-// - Verifier (semua provider): hanya `verify` token asing menjadi Claims. Stateless.
-// - Issuer (HANYA `local`): menerbitkan + mengelola sesi/token (SessionIssuer, fase C).
+// Two provider roles (AUTH_CONTRACT.md):
+// - Verifier (all providers): only `verify` a foreign token into Claims. Stateless.
+// - Issuer (ONLY `local`): issues + manages sessions/tokens (SessionIssuer, phase C).
 
-/// Klaim ternormalisasi hasil verifikasi. Provider hanya mengisi struct ini;
-/// policy tidak tahu provider apa yang dipakai.
+/// Normalized claims from verification. Providers only fill in this struct;
+/// policy never knows which provider was used.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AuthContext {
-    /// uid ber-namespace (`github:123`, `local:abc`) agar tak tabrakan antar-provider.
+    /// Namespaced uid (`github:123`, `local:abc`) so providers never collide.
     pub uid: String,
     #[serde(default)]
     pub roles: Vec<String>,
@@ -187,36 +187,36 @@ pub struct AuthContext {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Hasil mentah verifikasi token oleh satu provider, sebelum mapping + union peran.
+/// Raw token-verification result from one provider, before role mapping + union.
 #[derive(Debug, Clone, Default)]
 pub struct Claims {
-    /// Nama provider (`local`, `firebase`, `github`, `oidc`).
+    /// Provider name (`local`, `firebase`, `github`, `oidc`).
     pub provider: &'static str,
-    /// uid mentah dari provider (tanpa namespace; namespace ditambah resolver).
+    /// Raw uid from the provider (unnamespaced; the resolver adds the namespace).
     pub uid: String,
     pub email: Option<String>,
     pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl Claims {
-    /// `github:123` — kunci lookup user-doc + `AuthContext.uid` final.
+    /// `github:123` — user-doc lookup key + final `AuthContext.uid`.
     pub fn namespaced(&self) -> String {
         format!("{}:{}", self.provider, self.uid)
     }
 }
 
-/// Verifier: wajib diimpl semua provider auth (termasuk `local` untuk tokennya sendiri).
+/// Verifier: required impl for all auth providers (including `local` for its own tokens).
 #[async_trait::async_trait]
 pub trait AuthProvider: Send + Sync {
     fn name(&self) -> &'static str;
-    /// `Ok` = token valid milik provider ini; `Err` = bukan token kami / tidak valid.
-    /// Chain mencoba provider berikut bila Err — jadi jangan error untuk token asing
-    /// yang formatnya jelas bukan milikmu; error hanya untuk tokenmu yang gagal verifikasi.
+    /// `Ok` = valid token owned by this provider; `Err` = not our token / invalid.
+    /// The chain tries the next provider on Err — so don't error for a foreign token
+    /// that is clearly not yours; only error for your own token failing verification.
     async fn verify(&self, token: &str) -> Result<Claims, AppError>;
 }
 
-/// Issuer: HANYA `local` (fase C). Provider eksternal tidak pernah mengimpl ini —
-/// backend tidak menerbitkan token atas nama Firebase/GitHub/OIDC.
+/// Issuer: ONLY `local` (phase C). External providers never implement this —
+/// the backend never issues tokens on behalf of Firebase/GitHub/OIDC.
 #[async_trait::async_trait]
 pub trait SessionIssuer: AuthProvider {
     async fn login(&self, user: &str, secret: &str) -> Result<AuthContext, AppError>;
@@ -234,7 +234,7 @@ pub enum Method {
     Delete,
 }
 
-// --- Error gateway ---
+// --- Gateway error ---
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -251,7 +251,7 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// Status HTTP — peta dari `mapError` server lama.
+    /// HTTP status — mapped from the legacy server's `mapError`.
     pub fn status_code(&self) -> u16 {
         match self {
             AppError::PermissionDenied => 403,
@@ -263,10 +263,10 @@ impl AppError {
     }
 }
 
-// --- Trait Database: kontrak plug-and-play (pengganti RethinkDBService) ---
+// --- Database trait: the plug-and-play contract (replacing RethinkDBService) ---
 
-/// Perubahan dokumen untuk realtime fan-out. HakoDB: `ChangeEvent{path, Put|Delete}`;
-/// driver lain: changefeed RethinkDB / pg LISTEN / polling.
+/// Document change for realtime fan-out. HakoDB: `ChangeEvent{path, Put|Delete}`;
+/// other drivers: RethinkDB changefeed / pg LISTEN / polling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
     Add,
@@ -277,7 +277,7 @@ pub enum ChangeKind {
 #[derive(Debug, Clone)]
 pub struct Change {
     pub collection: String,
-    /// Id dokumen (selalu ada; Delete tak membawa body).
+    /// Document id (always present; Delete carries no body).
     pub id: String,
     pub kind: ChangeKind,
     pub old: Option<Doc>,
@@ -286,50 +286,50 @@ pub struct Change {
 
 #[async_trait::async_trait]
 pub trait Database: Send + Sync {
-    /// Identitas + kapabilitas driver (lihat DRIVER_CONTRACT.md).
-    /// Core memakai ini untuk memutuskan apa yang di-push-down vs diemulasi.
+    /// Driver identity + capabilities (see DRIVER_CONTRACT.md).
+    /// Core uses this to decide what to push down vs emulate.
     fn capabilities(&self) -> Capabilities;
     async fn ensure_collection(&self, path: &str) -> Result<(), AppError>;
     async fn list_collections(&self) -> Result<Vec<String>, AppError>;
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError>;
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError>;
-    /// `merge=false` = ganti seluruh isi; `merge=true` = gabung dangkal level-atas.
+    /// `merge=false` = replace the whole body; `merge=true` = shallow top-level merge.
     async fn insert(&self, collection: &str, doc: Doc) -> Result<Doc, AppError>;
     async fn set(&self, collection: &str, id: &str, doc: Doc, merge: bool) -> Result<Doc, AppError>;
-    /// Mengembalikan dokumen sebelum dihapus (None bila tidak ada).
+    /// Returns the document before deletion (None when absent).
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError>;
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError>;
-    /// Stream perubahan; di-bridge ke broadcast di hakobackend-server (fan-out WS/SSE + Redis).
+    /// Change stream; bridged to broadcast in hakobackend-server (WS/SSE + Redis fan-out).
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError>;
-    /// Buat index (simple/composite/FTS). Kapabilitas tak didukung → tolak jelas.
+    /// Create an index (simple/composite/FTS). Unsupported capability → reject clearly.
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError>;
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError>;
-    /// Hapus index by name. Driver tanpa API drop → tolak jelas.
+    /// Drop an index by name. Drivers without a drop API → reject clearly.
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError>;
 }
 
-/// Kapabilitas yang dideklarasikan tiap driver addon.
+/// Capabilities declared by each addon driver.
 #[derive(Debug, Clone)]
 pub struct Capabilities {
-    /// Nama driver, sama dengan `name` di driver.toml (`hako`, `postgres`, …).
+    /// Driver name, matching `name` in driver.toml (`hako`, `postgres`, …).
     pub driver: &'static str,
-    /// Watch/push perubahan real-time (bila false, core memakai polling).
+    /// Realtime change watch/push (when false, core uses polling).
     pub supports_watch: bool,
-    /// Transaksi multi-operasi atomik (batch/transaction endpoint).
+    /// Atomic multi-op transactions (batch/transaction endpoint).
     pub supports_transactions: bool,
-    /// Index komposit multi-field (bila false → tolak jelas, bukan diam).
+    /// Multi-field composite index (when false → reject clearly, don't stay silent).
     pub supports_composite: bool,
-    /// Full-text search (bila false → tolak jelas).
+    /// Full-text search (when false → reject clearly).
     pub supports_fts: bool,
-    /// Hapus index (bila false → tolak jelas; mis. HakoDB tak punya API drop).
+    /// Drop index (when false → reject clearly; e.g. HakoDB has no drop API).
     pub supports_drop_index: bool,
-    /// Constraint unik (bila false → tolak jelas; mis. HakoDB).
+    /// Unique constraint (when false → reject clearly; e.g. HakoDB).
     pub supports_unique: bool,
-    /// Nama index custom dihormati (bila false → selalu auto, mis. HakoDB).
+    /// Custom index names honored (when false → always auto, e.g. HakoDB).
     pub supports_named_index: bool,
 }
 
-// --- Index: kontrak manajemen simple/composite/FTS (HTTP_CONTRACT.md §index) ---
+// --- Index: simple/composite/FTS management contract (HTTP_CONTRACT.md §index) ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -346,9 +346,9 @@ fn simple_kind() -> IndexKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSpec {
-    /// Nama bebas; driver tanpa penamaan (HakoDB) mengabaikan + auto-generate.
+    /// Free-form name; drivers without naming (HakoDB) ignore it + auto-generate.
     pub name: Option<String>,
-    /// 1 field = simple/FTS; >1 = composite (butuh supports_composite).
+    /// 1 field = simple/FTS; >1 = composite (requires supports_composite).
     pub fields: Vec<String>,
     #[serde(default)]
     pub unique: bool,
@@ -364,9 +364,9 @@ pub struct IndexInfo {
     pub kind: IndexKind,
 }
 
-// --- Trait Policy: pengganti userrules.ts ---
+// --- Policy trait: replacing userrules.ts ---
 
-/// `resource` = dokumen existing (None untuk create/list), `incoming` = body tulis.
+/// `resource` = existing document (None for create/list), `incoming` = write body.
 pub struct PolicyInput<'a> {
     pub auth: Option<&'a AuthContext>,
     pub collection: &'a str,
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn filter_op_wire_legacy() {
-        // Simbolik legacy (dipakai SDK lama) + kata (bentuk baru) → varian sama.
+        // Legacy symbolic (used by the old SDK) + word (new form) → same variant.
         for (wire, word, op) in [
             ("==", "eq", FilterOp::Eq),
             ("!=", "ne", FilterOp::Ne),
@@ -441,14 +441,14 @@ mod tests {
         }
         assert_eq!(FilterOp::parse("!="), Some(FilterOp::Ne));
         assert!(FilterOp::parse("contains").is_none());
-        // Full options JSON seperti dikirim SDK lama.
+        // Full options JSON as sent by the old SDK.
         let q: QueryOptions = serde_json::from_str(
             r#"{"filters":[{"field":"age","op":">","value":20}],"order_by":[{"field":"age","direction":"desc"}],"limit":1}"#,
         )
         .unwrap();
         assert_eq!(q.filters[0].op, FilterOp::Gt);
         assert_eq!(q.limit, Some(1));
-        // Kunci camelCase legacy juga diterima.
+        // Legacy camelCase keys are also accepted.
         let qc: QueryOptions = serde_json::from_str(
             r#"{"filters":[],"orderBy":[{"field":"age","direction":"desc"}],"startAt":10,"endBefore":99}"#,
         )
@@ -459,13 +459,13 @@ mod tests {
     }
 }
 
-/// Kontrak driver: conformance suite + helper emulasi.
+/// Driver contract: conformance suite + emulation helpers.
 ///
-/// Setiap addon database (`hakobackend-db-*`) **wajib** memanggil
-/// [`conformance::run_conformance_suite`] dari test-nya sendiri.
-/// Helper [`conformance::doc_matches`] / [`conformance::sort_and_limit`]
-/// dipakai driver yang tidak punya operasi JSON native agar semantik
-/// filter/urutan/limit **identik** di semua driver (lihat DRIVER_CONTRACT.md).
+/// Every database addon (`hakobackend-db-*`) **must** call
+/// [`conformance::run_conformance_suite`] from its own test.
+/// Helpers [`conformance::doc_matches`] / [`conformance::sort_and_limit`]
+/// are used by drivers without native JSON ops so filter/sort/limit
+/// semantics stay **identical** across drivers (see DRIVER_CONTRACT.md).
 pub mod conformance {
     use super::*;
     use std::cmp::Ordering;
@@ -520,23 +520,23 @@ pub mod conformance {
         }
     }
 
-    /// Predikat filter standar. Driver tanpa JSON-filter native
-    /// (atau untuk verifikasi) memakai fungsi ini agar hasil SELALU sama.
+    /// Standard filter predicate. Drivers without a native JSON filter
+    /// (or for verification) use this function so results are ALWAYS identical.
     pub fn doc_matches(doc: &Doc, filters: &[Filter]) -> bool {
         filters.iter().all(|f| filter_matches(doc, f))
     }
 
-    /// Field acuan cursor: `order_by[0]` atau `"id"` (paritas `rdb.ts` legacy).
+    /// Cursor reference field: `order_by[0]` or `"id"` (legacy `rdb.ts` parity).
     pub fn cursor_field(q: &QueryOptions) -> &str {
         q.order_by.first().map(|o| o.field.as_str()).unwrap_or("id")
     }
 
-    /// Predikat cursor standar (paritas `rdb.ts:cursorFilter` + ReQL legacy):
-    /// startAt `>=`, startAfter `>`, endAt `<=`, endBefore `<` pada field acuan.
-    /// Bound ada + nilai hilang/null/tak-bisa-dibandingkan = false.
-    /// Arah sort DIABAIKAN (paritas legacy).
+    /// Standard cursor predicate (`rdb.ts:cursorFilter` + legacy ReQL parity):
+    /// startAt `>=`, startAfter `>`, endAt `<=`, endBefore `<` on the reference field.
+    /// Bound present + missing/null/incomparable value = false.
+    /// Sort direction is IGNORED (legacy parity).
     pub fn matches_cursor(doc: &Doc, q: &QueryOptions) -> bool {
-        // "id" bukan bagian data — dukung sebagai field acuan fallback.
+        // "id" is not part of data — support it as the fallback reference field.
         let owned;
         let v = match nested(&doc.data, cursor_field(q)) {
             Some(v) => Some(v),
@@ -563,12 +563,12 @@ pub mod conformance {
         true
     }
 
-    /// Saring cursor (dipakai setelah urut, sebelum limit — paritas legacy).
+    /// Filter by cursor (applied after sorting, before limit — legacy parity).
     pub fn apply_cursor(docs: Vec<Doc>, q: &QueryOptions) -> Vec<Doc> {
         docs.into_iter().filter(|d| matches_cursor(d, q)).collect()
     }
 
-    /// Potong offset + limit (offset dulu, lalu limit — konvensi SQL).
+    /// Slice offset + limit (offset first, then limit — SQL convention).
     pub fn apply_offset_limit(docs: Vec<Doc>, q: &QueryOptions) -> Vec<Doc> {
         let off = q.offset.unwrap_or(0).min(docs.len());
         let mut docs = docs.into_iter().skip(off).collect::<Vec<_>>();
@@ -578,8 +578,8 @@ pub mod conformance {
         docs
     }
 
-    /// Pipeline list standar: urut → cursor → offset → limit (paritas legacy).
-    /// Driver emulasi / MemDb memakai ini agar hasil SELALU sama.
+    /// Standard list pipeline: sort → cursor → offset → limit (legacy parity).
+    /// Emulating drivers / MemDb use this so results are ALWAYS identical.
     pub fn sort_and_limit(mut docs: Vec<Doc>, q: &QueryOptions) -> Vec<Doc> {
         if !q.order_by.is_empty() {
             docs.sort_by(|a, b| {
@@ -611,26 +611,26 @@ pub mod conformance {
         }
     }
 
-    /// Suite konformitas. Koleksi unik per run agar acak aman dijalankan paralel.
-    /// Gagal di sini = driver belum boleh diregistrasi.
+    /// Conformance suite. Unique collection per run so parallel runs stay isolated.
+    /// Failing here = the driver must not be registered yet.
     pub async fn run_conformance_suite(db: &impl Database) {
-        assert!(!db.capabilities().driver.is_empty(), "capabilities().driver wajib diisi");
+        assert!(!db.capabilities().driver.is_empty(), "capabilities().driver is required");
         let coll = format!("conf_{}_{}", std::process::id(), nanos());
         let q0 = QueryOptions::default();
 
-        // 1. Koleksi baru = list kosong.
+        // 1. A fresh collection = empty list.
         assert!(db.list(&coll, &q0).await.unwrap().is_empty());
 
-        // 2. Insert tanpa id -> id terisi; get roundtrip.
+        // 2. Insert without id -> id filled; get roundtrip.
         let d = db
             .insert(&coll, mk(serde_json::json!({"name": "a", "age": 30, "tags": ["x", "y"]})))
             .await
             .unwrap();
-        assert!(!d.id.is_empty(), "insert wajib mengisi id kosong");
+        assert!(!d.id.is_empty(), "insert must fill an empty id");
         let got = db.get(&coll, &d.id).await.unwrap().expect("get after insert");
         assert_eq!(got.data.get("name"), Some(&serde_json::json!("a")));
 
-        // 3. Data tambahan untuk query.
+        // 3. Extra data for queries.
         for (name, age, tags) in [("b", 25, vec!["y"]), ("c", 35, vec!["z"])] {
             db.insert(
                 &coll,
@@ -641,7 +641,7 @@ pub mod conformance {
         }
         assert_eq!(db.list(&coll, &q0).await.unwrap().len(), 3);
 
-        // 4. Semua operator filter.
+        // 4. All filter operators.
         let filtered = |op: FilterOp, value: serde_json::Value| {
             let mut q = QueryOptions::default();
             q.filters.push(Filter {
@@ -698,7 +698,7 @@ pub mod conformance {
         assert_eq!(rows[0].data.get("age"), Some(&serde_json::json!(35)));
         assert_eq!(db.count(&coll, &q0).await.unwrap(), 3);
 
-        // 5b. Cursor (acuan = order_by[0]) + offset. Paritas rdb.ts:cursorFilter.
+        // 5b. Cursor (reference = order_by[0]) + offset. rdb.ts:cursorFilter parity.
         let ordered = |cursor: QueryOptions| {
             let mut q = cursor;
             q.order_by.push(OrderBy { field: "age".into(), direction: Direction::Asc });
@@ -725,13 +725,13 @@ pub mod conformance {
         let mut qc3 = QueryOptions::default();
         qc3.end_before = Some(serde_json::json!(30));
         assert_eq!(ages(ordered(qc3)).await, vec![serde_json::json!(25)]);
-        // Offset setelah urut, sebelum limit.
+        // Offset after sorting, before limit.
         let mut qoff = QueryOptions::default();
         qoff.order_by.push(OrderBy { field: "age".into(), direction: Direction::Asc });
         qoff.offset = Some(1);
         qoff.limit = Some(1);
         assert_eq!(ages(qoff).await, vec![serde_json::json!(30)]);
-        // Dokumen tanpa field acuan + ada cursor = dikecualikan (paritas ReQL).
+        // Documents missing the reference field + an active cursor = excluded (ReQL parity).
         let ageless = db.insert(&coll, mk(serde_json::json!({"name": "d"}))).await.unwrap();
         let mut qnull = QueryOptions::default();
         qnull.order_by.push(OrderBy { field: "age".into(), direction: Direction::Asc });
@@ -740,13 +740,13 @@ pub mod conformance {
         assert!(!got.contains(&serde_json::Value::Null));
         db.delete(&coll, &ageless.id).await.unwrap();
 
-        // 6. set merge=false mengganti; merge=true menggabung dangkal.
+        // 6. set merge=false replaces; merge=true shallow-merges.
         db.set(&coll, &d.id, mk(serde_json::json!({"name": "a2"})), false)
             .await
             .unwrap();
         let r = db.get(&coll, &d.id).await.unwrap().unwrap();
         assert_eq!(r.data.get("name"), Some(&serde_json::json!("a2")));
-        assert!(!r.data.contains_key("age"), "replace wajib menghapus field lama");
+        assert!(!r.data.contains_key("age"), "replace must drop old fields");
 
         db.set(&coll, &d.id, mk(serde_json::json!({"city": "bdg"})), true)
             .await
@@ -755,13 +755,13 @@ pub mod conformance {
         assert_eq!(m.data.get("name"), Some(&serde_json::json!("a2")));
         assert_eq!(m.data.get("city"), Some(&serde_json::json!("bdg")));
 
-        // 7. delete mengembalikan prev; get -> None.
+        // 7. delete returns prev; get -> None.
         let prev = db.delete(&coll, &d.id).await.unwrap();
-        assert!(prev.is_some(), "delete wajib mengembalikan dokumen sebelumnya");
+        assert!(prev.is_some(), "delete must return the previous document");
         assert!(db.get(&coll, &d.id).await.unwrap().is_none());
         assert!(db.delete(&coll, &d.id).await.unwrap().is_none());
 
-        // 8. subscribe tidak error.
+        // 8. subscribe must not error.
         assert!(db.subscribe(&coll).await.is_ok());
     }
 
@@ -773,30 +773,30 @@ pub mod conformance {
             .unwrap_or(0)
     }
 
-    // --- Kontrak index: validasi + suite bersama ---
+    // --- Index contract: shared validation + suite ---
 
-    /// Validasi baku spec terhadap kapabilitas. Dipakai semua driver agar
-    /// penolakan identik (tak ada silent-ignore).
+    /// Standard spec validation against capabilities. Used by all drivers so
+    /// rejections are identical (no silent-ignore).
     pub fn validate_spec(caps: Capabilities, spec: &IndexSpec) -> Result<(), AppError> {
         if spec.fields.is_empty() {
-            return Err(AppError::BadRequest("index butuh >= 1 field".into()));
+            return Err(AppError::BadRequest("index needs >= 1 field".into()));
         }
         match spec.kind {
             IndexKind::Simple | IndexKind::FullText if spec.fields.len() > 1 => {
-                return Err(AppError::BadRequest("simple/fts index tepat 1 field (multi-field = composite)".into()))
+                return Err(AppError::BadRequest("simple/fts index takes exactly 1 field (multi-field = composite)".into()))
             }
             _ => {}
         }
         if spec.kind == IndexKind::Composite && !caps.supports_composite {
-            return Err(AppError::BadRequest(format!("driver {} tanpa composite index", caps.driver)));
+            return Err(AppError::BadRequest(format!("driver {} has no composite index", caps.driver)));
         }
         if spec.kind == IndexKind::FullText && !caps.supports_fts {
-            return Err(AppError::BadRequest(format!("driver {} tanpa full-text index", caps.driver)));
+            return Err(AppError::BadRequest(format!("driver {} has no full-text index", caps.driver)));
         }
         Ok(())
     }
 
-    /// Nama otomatis deterministik bila spec.name kosong / driver tanpa penamaan.
+    /// Deterministic auto name when spec.name is empty / the driver has no naming.
     pub fn auto_index_name(spec: &IndexSpec) -> String {
         let base = spec.fields.join("+");
         match spec.kind {
@@ -806,16 +806,16 @@ pub mod conformance {
         }
     }
 
-    /// Suite konformitas index. Kondisional pada kapabilitas (composite/FTS/drop).
+    /// Index conformance suite. Conditional on capabilities (composite/FTS/drop).
     pub async fn run_index_suite(db: &impl Database) {
         let caps = db.capabilities();
         let coll = format!("idx_{}_{}", std::process::id(), nanos());
         assert!(db.list_indexes(&coll).await.unwrap().is_empty());
 
-        // Spec kosong selalu ditolak.
+        // An empty spec is always rejected.
         let bad = IndexSpec { name: None, fields: vec![], unique: false, kind: IndexKind::Simple };
         assert!(db.create_index(&coll, &bad).await.is_err());
-        // Simple multi-field ditolak (harus composite).
+        // Multi-field simple is rejected (must be composite).
         let bad2 = IndexSpec {
             name: None,
             fields: vec!["a".into(), "b".into()],
@@ -833,10 +833,10 @@ pub mod conformance {
             })
             .await
             .unwrap();
-        // Driver tanpa penamaan selalu auto (fail-clear, bukan diam).
+        // Drivers without naming always go auto (fail-clear, not silent).
         let want_simple = if caps.supports_named_index { "by_age" } else { "age" };
         assert_eq!(simple.fields, vec!["age".to_string()]);
-        // Nama otomatis deterministik.
+        // Deterministic auto name.
         let auto = db
             .create_index(&coll, &IndexSpec { name: None, fields: vec!["name".into()], unique: true, kind: IndexKind::Simple })
             .await;
@@ -845,9 +845,9 @@ pub mod conformance {
             assert_eq!(auto.name, "name");
             assert!(auto.unique);
         } else {
-            // Tanpa constraint unik → tolak jelas (fail-clear, bukan diam).
+            // Without a unique constraint → reject clearly (fail-clear, not silent).
             assert!(auto.is_err());
-            // Ulangi tanpa unique agar koleksi siap untuk langkah berikut.
+            // Retry without unique so the collection is ready for the next steps.
             db.create_index(&coll, &IndexSpec { name: None, fields: vec!["name".into()], unique: false, kind: IndexKind::Simple })
                 .await
                 .unwrap();
@@ -884,14 +884,14 @@ pub mod conformance {
         if caps.supports_drop_index {
             db.drop_index(&coll, want_simple).await.unwrap();
             assert!(db.list_indexes(&coll).await.unwrap().iter().all(|i| i.name != want_simple));
-            assert!(db.drop_index(&coll, "tak-ada").await.is_err());
+            assert!(db.drop_index(&coll, "missing").await.is_err());
         }
     }
 
-    // --- Driver referensi dalam-memori: bukti suite valid + contoh addon minimal ---
+    // --- In-memory reference driver: proof the suite is valid + minimal addon example ---
 
-    /// Implementasi `Database` paling kecil yang lolos suite.
-    /// Dipakai sebagai test hakobackend-core; calon penulis driver bisa meniru polanya.
+    /// The smallest `Database` implementation that passes the suite.
+    /// Used as a hakobackend-core test; prospective driver authors can copy the pattern.
     #[cfg(test)]
     pub struct MemDb {
         store: std::sync::Mutex<HashMap<String, HashMap<String, Doc>>>,

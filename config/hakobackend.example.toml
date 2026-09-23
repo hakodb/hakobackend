@@ -1,9 +1,9 @@
-# hakobackend-server example config (fase 2+; fase 1 memakai env UB_HAKO_PATH / UB_LISTEN)
+# hakobackend-server example config (phase 2+; phase 1 uses env UB_HAKO_PATH / UB_LISTEN)
 [server]
 listen = "0.0.0.0:3000"
 
 [database]
-# default embedded; opsi: postgres | mysql | sqlite | rethink (plugin menyusul)
+# embedded default; options: postgres | mysql | sqlite
 driver = "hako"
 path = "./data/hako.ub"
 
@@ -12,7 +12,7 @@ path = "./data/hako.ub"
 mode = "internal"
 access_ttl_secs = 600
 
-# [[resources]] = deklarasi opsional per koleksi (hybrid; tanpa ini tetap jalan)
+# [[resources]] = optional per-collection declaration (hybrid; works without it)
 # [[resources]]
 # path = "posts"
 # max_limit = 100

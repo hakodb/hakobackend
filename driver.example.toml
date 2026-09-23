@@ -1,14 +1,14 @@
-# driver.example.toml — template manifest addon database baru.
-# Salin ke crates/hakobackend-db-<nama>/driver.toml lalu isi. Lihat DRIVER_CONTRACT.md.
+# driver.example.toml — new database addon manifest template.
+# Copy to crates/hakobackend-db-<name>/driver.toml then fill in. See DRIVER_CONTRACT.md.
 [driver]
-name = "ganti-nama-driver"
+name = "replace-driver-name"
 version = "0.1.0"
-description = "Deskripsi singkat backend yang dibungkus"
+description = "Short description of the wrapped backend"
 
 [capabilities]
 watch = false
 transactions = false
 
 [config]
-# Contoh nilai database.path untuk driver ini:
-path = "contoh-dsn-atau-path"
+# Example database.path value for this driver:
+path = "example-dsn-or-path"

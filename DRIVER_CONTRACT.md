@@ -1,53 +1,53 @@
-# Kontrak Driver Database (Addon/Plugin)
+# Database Driver Contract (Addon/Plugin)
 
-Motto: **1 backend, multi database.** Tidak ada database yang terikat ke
-universalbackend — termasuk HakoDB. Setiap database adalah *addon* yang mengikuti
-kontrak ini.
+Motto: **1 backend, many databases.** No database is bound to
+universalbackend — including HakoDB. Every database is an *addon* following
+this contract.
 
-## 1. Isi sebuah addon
+## 1. What an addon contains
 
 ```text
-crates/hakobackend-db-<nama>/
-  Cargo.toml        # crate biasa; dependensi driver bebas (sqlx, client rethink, …)
-  driver.toml       # manifest (lihat §2)
-  src/lib.rs        # struct yang mengimpl hakobackend_core::Database + capabilities()
+crates/hakobackend-db-<name>/
+  Cargo.toml        # plain crate; free choice of driver deps (sqlx, rethink client, …)
+  driver.toml       # manifest (see §2)
+  src/lib.rs        # struct implementing hakobackend_core::Database + capabilities()
 ```
 
-Contoh lengkap: `crates/hakobackend-db-hako/` (+ `driver.toml` di dalamnya).
+Full example: `crates/hakobackend-db-hako/` (+ the `driver.toml` inside it).
 
-## 2. Manifest `driver.toml`
+## 2. `driver.toml` manifest
 
 ```toml
 [driver]
-name = "postgres"        # = Capabilities::driver, = nilai database.driver di hakobackend.toml
+name = "postgres"        # = Capabilities::driver, = database.driver value in hakobackend.toml
 version = "0.1.0"
 description = "…"
 
 [capabilities]
-watch = false            # tanpa push → core memakai polling
+watch = false            # no push → core falls back to polling
 transactions = true
 
 [config]
-# dokumentasikan field yang dibaca dari database.path / env
+# document the fields read from database.path / env
 path = "postgres://user:pass@host/db"
 ```
 
-## 3. Kontrak perilaku (`hakobackend_core::Database`)
+## 3. Behavior contract (`hakobackend_core::Database`)
 
-| Metode | Aturan baku |
+| Method | Standard rule |
 |---|---|
-| `capabilities()` | `driver` wajib sama dengan manifest; jujur soal `watch`/`transactions` |
-| `insert` tanpa id | driver **wajib** mengisi id unik (kontrak, bukan core) |
-| `set` merge=false | **ganti seluruh isi** (field lama hilang) |
-| `set` merge=true | **gabung dangkal level-atas** (baca-gabung-tulis bila engine tidak mendukung) |
-| `delete` | kembalikan dokumen **sebelum** dihapus (`None` bila tak ada) |
-| `get` dokumen tak ada | `Ok(None)`, bukan error |
-| `list` filter/order/limit | semantik **identik** §5 di semua driver |
-| `subscribe` | kembalikan receiver; bila engine tak mendukung push, kembalikan channel kosong dan set `watch=false` agar core polling |
+| `capabilities()` | `driver` must match the manifest; be honest about `watch`/`transactions` |
+| `insert` without id | driver **must** fill in a unique id (contract, not core) |
+| `set` merge=false | **replace the whole body** (old fields disappear) |
+| `set` merge=true | **shallow top-level merge** (read-merge-write where the engine lacks it) |
+| `delete` | return the **pre-delete** document (`None` when absent) |
+| `get` missing document | `Ok(None)`, not an error |
+| `list` filter/order/limit | **identical** semantics (§5) on every driver |
+| `subscribe` | return a receiver; where the engine has no push, return an empty channel and set `watch=false` so core polls |
 
-## 4. Konformitas wajib
+## 4. Mandatory conformance
 
-Setiap addon memanggil suite bersama dari test-nya sendiri:
+Every addon runs the shared suite from its own tests:
 
 ```rust
 #[tokio::test]
@@ -57,50 +57,49 @@ async fn conformance() {
 }
 ```
 
-Suite menguji: CRUD roundtrip, semua 9 operator filter, order+limit, count,
-semantik replace/merge, delete-mengembalikan-prev, subscribe. **Gagal = belum boleh
-diregistrasi.** (`hakobackend-db-hako` menandai testnya `#[ignore]` karena butuh build
-HakoDB penuh — dijalankan saat build release, bukan tiap edit.)
+The suite covers: CRUD roundtrip, all 9 filter operators, order+limit, count,
+replace/merge semantics, delete-returns-prev, subscribe. **Fail = not yet
+registrable.** (`hakobackend-db-hako` marks its test `#[ignore]` because it needs a full
+HakoDB build — run on release builds, not on every edit.)
 
-## 5. Semantik query baku (sumber kebenaran tunggal)
+## 5. Standard query semantics (single source of truth)
 
-`hakobackend_core::conformance::doc_matches` + `sort_and_limit` adalah implementasi
-rujukan filter/urutan/limit (diport dari `query.ts:matchesFilter` backend lama).
-Driver yang **punya** filter JSON native (HakoDB, Postgres `jsonb`) menerjemahkan
-operator ke bahasa query-nya; driver yang **tidak punya** memakai helper ini
-(ambil → saring di memori). Hasilnya sama persis di semua driver.
+`hakobackend_core::conformance::doc_matches` + `sort_and_limit` are the reference
+filter/order/limit implementations (ported from the legacy backend's `query.ts:matchesFilter`).
+Drivers **with** native JSON filtering (HakoDB, Postgres `jsonb`) translate
+operators into their query language; drivers **without** it use these helpers
+(fetch → filter in memory). Results are exactly the same on every driver.
 
-Kontrak operator = 9 simbolik legacy (`== != > < >= <= array-contains
-array-contains-any in`) + alias kata + cursor (`startAt/startAfter/endAt/endBefore`)
-+ `offset`. Operator ekstra HakoDB (`match`, `contains`, `startsWith`, `notIn`)
-BELUM bagian kontrak (cadangan; driver tak boleh mengeksposnya via wire).
+Operator contract = 9 legacy symbolic ops (`== != > < >= <= array-contains
+array-contains-any in`) + word aliases + cursors (`startAt/startAfter/endAt/endBefore`)
++ `offset`. Extra HakoDB operators (`match`, `contains`, `startsWith`, `notIn`)
+are NOT yet contract (reserved; drivers must not expose them over the wire).
 
-## 6. Registrasi (satu-satunya titik sentuh core)
+## 6. Registration (the only core touchpoint)
 
-1. Tambah crate ke workspace (`crates/*` otomatis anggota).
-2. Tambah 1 arm di `open_driver()` (`crates/hakobackend-server/src/main.rs`).
-3. Tambah 1 baris di tabel Registry (§7) + contoh `database.path`.
+1. Add the crate to the workspace (`crates/*` are members automatically).
+2. Add 1 arm in `open_driver()` (`crates/hakobackend-server/src/main.rs`).
+3. Add 1 row to the Registry table (§7) + a `database.path` example.
 
-Itu saja. Handler, policy, realtime tidak tahu driver apa yang dipakai.
+That is all. Handlers, policy, and realtime never know which driver is in use.
 
-## 7. Registry driver
+## 7. Driver registry
 
-| Driver | Crate | Status | Watch | Transaksi |
+| Driver | Crate | Status | Watch | Transactions |
 |---|---|---|---|---|
-| `hako` | `hakobackend-db-hako` | ✅ default (embedded, nol-setup) | ya | ya |
-| `postgres` | `hakobackend-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | ya |
-| `sqlite` | `hakobackend-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | ya |
-| `mysql` | `hakobackend-db-mysql` | ✅ via sqlx (pool, JSON, FTS generated) | polling | ya |
-| `mongodb` | `hakobackend-db-mongo` | 🔜 fase berikutnya (crate resmi `mongodb`, async) | change stream | ya |
+| `hako` | `hakobackend-db-hako` | ✅ default (embedded, zero-setup) | yes | yes |
+| `postgres` | `hakobackend-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | yes |
+| `sqlite` | `hakobackend-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | yes |
+| `mysql` | `hakobackend-db-mysql` | ✅ via sqlx (pool, JSON, generated FTS) | polling | yes |
+| `mongodb` | `hakobackend-db-mongo` | 🔜 next phase (official `mongodb` crate, async) | change stream | yes |
 
-### Fase berikutnya: MongoDB
+### Next phase: MongoDB
 
-Berbeda dengan RethinkDB, MongoDB punya crate resmi yang matang (`mongodb`,
-async native, change streams untuk watch). Pola yang sama seperti Postgres:
-koleksi = collection native (tanpa flatten — MongoDB sudah hierarchical),
-dokumen = BSON↔JSON, `_id` string dipetakan ke `id`, filter 9 operator →
-padanan MQL (`$eq`, `$gt`, `$in`, `$elemMatch`/`$all` untuk array),
-order/limit/offset/cursor native, index via `create_index` (single/compound/
-`text`), FTS via text index (`supports_fts: true`), registry `__ub_indexes`
-di DB yang sama. Estimasi ringan karena kontrak + suite sudah ada.
-| `mysql` | `hakobackend-db-mysql` | ⬜ peta jalan fase 3 | polling | ya |
+Unlike RethinkDB, MongoDB has a mature official crate (`mongodb`,
+async-native, change streams for watch). Same pattern as Postgres:
+collection = native collection (no flattening — MongoDB is already hierarchical),
+document = BSON↔JSON, string `_id` mapped to `id`, 9-operator filters →
+MQL equivalents (`$eq`, `$gt`, `$in`, `$elemMatch`/`$all` for arrays),
+native order/limit/offset/cursor, indexes via `create_index` (single/compound/
+`text`), FTS via text index (`supports_fts: true`), `__ub_indexes` registry
+in the same DB. Light estimate since the contract + suite already exist.

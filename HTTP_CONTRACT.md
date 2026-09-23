@@ -1,80 +1,80 @@
-# Kontrak Translasi HTTP (wire-protocol)
+# HTTP Translation Contract (wire protocol)
 
-Satu-satunya permukaan yang dilihat SDK/klien. Driver apa pun di belakangnya
-wajib menghasilkan perilaku yang sama persis.
+The only surface SDKs/clients ever see. Whatever driver sits behind it
+must produce exactly the same behavior.
 
-## 1. Aturan path: genap/ganjil (paritas backend lama)
+## 1. Path rule: even/odd (legacy backend parity)
 
-`/api/collections/{*path}` — jumlah segmen genap = dokumen, ganjil = koleksi
-(`hakobackend_core::parse_collection_path`, diuji paritas dengan `getPathInfo` lama).
+`/api/collections/{*path}` — even segment count = document, odd = collection
+(`hakobackend_core::parse_collection_path`, parity-tested against the legacy `getPathInfo`).
 
-## 2. Tabel endpoint → policy → driver
+## 2. Endpoint → policy → driver table
 
-| HTTP | Method policy | Trait call | Status |
+| HTTP | Policy slot | Trait call | Status |
 |---|---|---|---|
-| `GET` dokumen / koleksi+`?options=` | Get / List | `get` / `list` + filter per-doc | 200 / 404 / 400 (options malformat) |
-| `GET /api/collections` | — (tanpa gate) | `list_collections` | 200 |
-| `POST` koleksi | Create | `insert` (id kosong diisi driver) | 200 / 400 (salah route) |
-| `PUT` dokumen | Update | `set(merge=false)` = ganti total | 200 / 400 |
-| `PATCH` dokumen | Update | `set(merge=true)` = gabung dangkal | 200 / 400 |
-| `DELETE` dokumen | Delete | `delete` (kembalikan prev) | 200 / 400 |
+| `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
+| `GET /api/collections` | — (ungated) | `list_collections` | 200 |
+| `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
+| `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
+| `PATCH` document | Update | `set(merge=true)` = shallow merge | 200 / 400 |
+| `DELETE` document | Delete | `delete` (returns prev) | 200 / 400 |
 | Error | — | `AppError::status_code` (403/404/400/500) | — |
 
-## 3. Index (§index)
+## 3. Indexes (§index)
 
-| HTTP | Method policy | Trait call | Status |
+| HTTP | Policy slot | Trait call | Status |
 |---|---|---|---|
 | `POST /api/indexes {collection, fields[], name?, unique?, kind?}` | Update | `create_index` | 200 `{success, index}` / 400 |
 | `GET /api/indexes?collection=` | List | `list_indexes` | 200 / 400 |
 | `DELETE /api/indexes?collection=&name=` | Update | `drop_index` | 200 `{success}` / 400 / 404 |
 | `POST /api/collections/<coll>/index {name, fields}` (legacy) | Update | `create_index` | 200 `{success: true}` |
 
-- `kind`: `simple` (default, tepat 1 field), `composite` (>1 field, butuh
-  `supports_composite`), `fts` (1 field, butuh `supports_fts`).
-- `unique`: didukung bila driver mendukung; bila tidak → 400 jelas (tanpa diam).
-- `name` opsional; driver tanpa penamaan (HakoDB) auto-generate deterministik
+- `kind`: `simple` (default, exactly 1 field), `composite` (>1 field, requires
+  `supports_composite`), `fts` (1 field, requires `supports_fts`).
+- `unique`: honored where the driver supports it; otherwise a clear 400 (never silent).
+- `name` optional; drivers without naming (HakoDB) auto-generate deterministically
   (`field`, `composite(a+b)`, `fts(body)`).
-- Driver tanpa API drop (HakoDB) → 400 jelas.
-- Pengecualian shim legacy: koleksi yang benar-benar bernama `index` sebagai
-  segmen terakhir TIDAK dibajak — gunakan bentuk baru `/api/indexes`.
+- Drivers without a drop API (HakoDB) → clear 400.
+- Legacy-shim exception: a collection genuinely named `index` as the
+  last segment is NOT hijacked — use the new `/api/indexes` form.
 
-## 4. Query universal (`?options=` JSON)
+## 4. Universal query (`?options=` JSON)
 
-`filters[]` (`field`, `op`, `value`), `fields[]`, `orderBy[]`, `limit`, `offset` (baru, kemampuan HakoDB-style),
-`startAt/startAfter/endAt/endBefore`. Operator wire = simbolik legacy
-(`== != > < >= <= array-contains array-contains-any in`) — kata
-(`eq gt …`) juga diterima. Cursor = nilai batas pada `orderBy[0]` (atau `id`);
-arah sort diabaikan (paritas legacy); field hilang + cursor = gugur.
-Operator ekstra HakoDB (`match`, `contains`, `startsWith`, `notIn`) BELUM
-bagian kontrak (cadangan masa depan). Semantik rujukan:
+`filters[]` (`field`, `op`, `value`), `fields[]`, `orderBy[]`, `limit`, `offset` (new, HakoDB-style),
+`startAt/startAfter/endAt/endBefore`. Wire operators = legacy symbolic
+(`== != > < >= <= array-contains array-contains-any in`) — word forms
+(`eq gt …`) also accepted. Cursors = bound values on `orderBy[0]` (or `id`);
+sort direction ignored (legacy parity); missing field + cursor = dropped.
+Extra HakoDB operators (`match`, `contains`, `startsWith`, `notIn`) are NOT
+yet contract (future reserve). Reference semantics:
 `hakobackend_core::conformance::{doc_matches, sort_and_limit, matches_cursor}` —
-driver native menerjemahkan, sisanya mengemulasi dengan helper yang sama
-(hasil identik).
+native drivers translate, the rest emulate with the same helpers
+(identical results).
 
 ## 5. Auth & admin
 
-`Authorization: Bearer …` else cookie `__Host-ub_at` → `Extension<Option<AuthContext>>`.
-Tanpa token / gagal verifikasi = anonim (policy bicara; 401 vs 403 lihat AUTH_CONTRACT).
-`/api/admin/reload` terkunci peran `--admin-role`.
-`/api/auth/*` lihat AUTH_CONTRACT (local BFF, OAuth GitHub, DPoP).
+`Authorization: Bearer …` else `__Host-ub_at` cookie → `Extension<Option<AuthContext>>`.
+No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_CONTRACT).
+`/api/admin/reload` is locked behind `--admin-role`.
+`/api/auth/*` see AUTH_CONTRACT (local BFF, GitHub OAuth, DPoP).
 
 ## 6. Realtime (WS + SSE)
 
-- `GET /ws` (upgrade): pesan `subscribe{key, collection, options?, group?, token?}`,
-  `unsubscribe{key}`, `ping`, `auth{token}`; balasan `ready{key}`,
-  `change{key, kind: add|change|remove, doc}`, `error{key?, message}`, `pong`.
-  Batas 100 subs/koneksi; pesan >1 MB menutup koneksi.
-- `GET /api/stream/<koleksi>?options=&group=&token=` → `text/event-stream`
-  (`event: change`, keep-alive 15 dtk). Token via Bearer/cookie diutamakan;
-  `?token=` fallback (tercatat di URL — pakai hanya via TLS).
-- Semantik delivery = snapshot + filter/cursor penuh (paritas changeHandler legacy);
-  gate `List` saat subscribe, `Get` per dokumen. Tanpa burst awal (klien GET dulu).
-- Driver watch (HakoDB) = push; lainnya = polling 2 dtk (single-instance;
-  fan-out Redis multi-instance menyusul). Grup: akhiran `/nama` atau `_nama`.
+- `GET /ws` (upgrade): `subscribe{key, collection, options?, group?, token?}`,
+  `unsubscribe{key}`, `ping`, `auth{token}` messages; `ready{key}`,
+  `change{key, kind: add|change|remove, doc}`, `error{key?, message}`, `pong` replies.
+  100 subs/connection cap; messages >1 MB close the connection.
+- `GET /api/stream/<collection>?options=&group=&token=` → `text/event-stream`
+  (`event: change`, 15 s keep-alive). Bearer/cookie token preferred;
+  `?token=` fallback (lands in the URL — TLS only).
+- Delivery semantics = snapshot + full filter/cursor (legacy changeHandler parity);
+  `List` gate at subscribe, `Get` per document. No initial burst (clients GET first).
+- Watch drivers (HakoDB) = push; others = 2 s polling (single-instance;
+  Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
 
 ## 7. TLS
 
-`--tls-cert/--tls-key` (PEM, keduanya wajib) → rustls + HSTS
-(`max-age=31536000; includeSubDomains`). Skema `htu` DPoP + cookie `Secure`
-mengikuti otomatis. Tanpa keduanya = http biasa. Port/listen berubah = restart
-(reload mencakup DB/auth/policy/limit/index, bukan socket).
+`--tls-cert/--tls-key` (PEM, both required) → rustls + HSTS
+(`max-age=31536000; includeSubDomains`). DPoP `htu` scheme + `Secure` cookies
+follow automatically. Neither = plain http. Port/listen changes need a restart
+(reload covers DB/auth/policy/limits/indexes, not sockets).
