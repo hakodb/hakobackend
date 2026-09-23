@@ -2,7 +2,7 @@
 
 Aturan ini **mengikuti fleksibilitas endpoint** (berlaku untuk wildcard otomatis
 maupun resource yang dideklarasikan) dan menjadi acuan semua deployment.
-Implementasi: `crates/ub-policy` + `policy.toml` (hot-reload). Contoh siap pakai:
+Implementasi: `crates/hakobackend-policy` + `policy.toml` (hot-reload). Contoh siap pakai:
 `policy.standard.toml`.
 
 ## 1. Prinsip baku

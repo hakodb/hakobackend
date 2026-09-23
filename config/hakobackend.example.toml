@@ -1,0 +1,18 @@
+# hakobackend-server example config (fase 2+; fase 1 memakai env UB_HAKO_PATH / UB_LISTEN)
+[server]
+listen = "0.0.0.0:3000"
+
+[database]
+# default embedded; opsi: postgres | mysql | sqlite | rethink (plugin menyusul)
+driver = "hako"
+path = "./data/hako.ub"
+
+[auth]
+# mode = "internal" | "firebase" | "oidc" | "chain:firebase,internal"
+mode = "internal"
+access_ttl_secs = 600
+
+# [[resources]] = deklarasi opsional per koleksi (hybrid; tanpa ini tetap jalan)
+# [[resources]]
+# path = "posts"
+# max_limit = 100

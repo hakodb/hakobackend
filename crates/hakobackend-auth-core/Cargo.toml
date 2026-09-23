@@ -1,0 +1,16 @@
+[package]
+name = "hakobackend-auth-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hakobackend-core = { path = "../hakobackend-core" }
+hakobackend-policy = { path = "../hakobackend-policy" }
+hakobackend-auth-firebase = { path = "../hakobackend-auth-firebase" }
+hakobackend-auth-github = { path = "../hakobackend-auth-github" }
+hakobackend-auth-oidc = { path = "../hakobackend-auth-oidc" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }

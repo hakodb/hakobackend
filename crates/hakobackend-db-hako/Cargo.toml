@@ -1,0 +1,11 @@
+[package]
+name = "hakobackend-db-hako"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hakobackend-core = { path = "../hakobackend-core" }
+hakodb = { version = "0.8.23" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

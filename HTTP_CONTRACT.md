@@ -6,7 +6,7 @@ wajib menghasilkan perilaku yang sama persis.
 ## 1. Aturan path: genap/ganjil (paritas backend lama)
 
 `/api/collections/{*path}` — jumlah segmen genap = dokumen, ganjil = koleksi
-(`ub_core::parse_collection_path`, diuji paritas dengan `getPathInfo` lama).
+(`hakobackend_core::parse_collection_path`, diuji paritas dengan `getPathInfo` lama).
 
 ## 2. Tabel endpoint → policy → driver
 
@@ -47,7 +47,7 @@ wajib menghasilkan perilaku yang sama persis.
 arah sort diabaikan (paritas legacy); field hilang + cursor = gugur.
 Operator ekstra HakoDB (`match`, `contains`, `startsWith`, `notIn`) BELUM
 bagian kontrak (cadangan masa depan). Semantik rujukan:
-`ub_core::conformance::{doc_matches, sort_and_limit, matches_cursor}` —
+`hakobackend_core::conformance::{doc_matches, sort_and_limit, matches_cursor}` —
 driver native menerjemahkan, sisanya mengemulasi dengan helper yang sama
 (hasil identik).
 

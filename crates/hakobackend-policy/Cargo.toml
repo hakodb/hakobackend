@@ -1,0 +1,13 @@
+[package]
+name = "hakobackend-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hakobackend-core = { path = "../hakobackend-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# (kosong — serde_json sudah dependensi utama karena dipakai roles_of)

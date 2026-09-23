@@ -74,16 +74,16 @@ FastAPI tetap menang untuk prototipe cepat + ekosistem Python/ML.
 
 ```text
 crates/
-  ub-core/          trait Database, AuthProvider, Policy; Doc; QueryOptions; AppError
-  ub-db-hako/       adapter HakoDB (default; spawn_blocking + watch bridge)
-  ub-db-postgres/ ub-db-mysql/ ub-db-sqlite/   plugin (menyusul)
-  ub-auth-core/     AuthContext{uid, roles, tenant}, Claims, Session
-  ub-auth-internal/ default: argon2id + JWT akses pendek + refresh opaque rotasi
-  ub-auth-firebase/ opsional: verifikasi JWT via JWKS Google (tanpa Admin SDK)
-  ub-auth-oidc/     generik OIDC (menyusul)
-  ub-policy/        policy.toml declarative + escape-hatch (menyusul: Rhai/WASM)
-  ub-server/        Axum router, WS/SSE, main.rs
-config/ub.example.toml
+  hakobackend-core/          trait Database, AuthProvider, Policy; Doc; QueryOptions; AppError
+  hakobackend-db-hako/       adapter HakoDB (default; spawn_blocking + watch bridge)
+  hakobackend-db-postgres/ hakobackend-db-mysql/ hakobackend-db-sqlite/   plugin (menyusul)
+  hakobackend-auth-core/     AuthContext{uid, roles, tenant}, Claims, Session
+  hakobackend-auth-local/ default: argon2id + JWT akses pendek + refresh opaque rotasi
+  hakobackend-auth-firebase/ opsional: verifikasi JWT via JWKS Google (tanpa Admin SDK)
+  hakobackend-auth-oidc/     generik OIDC (menyusul)
+  hakobackend-policy/        policy.toml declarative + escape-hatch (menyusul: Rhai/WASM)
+  hakobackend-server/        Axum router, WS/SSE, main.rs
+config/hakobackend.example.toml
 ```
 
 - **Endpoint hybrid:** Lapisan 0 nol-config (wildcard persis lama) + Lapisan 1 deklarasi
@@ -103,7 +103,7 @@ config/ub.example.toml
 
 ## 7. Tahapan
 
-0. Kontrak: `ub-core` + shared contract-test (semua driver wajib lolos).
+0. Kontrak: `hakobackend-core` + shared contract-test (semua driver wajib lolos).
 1. Inti REST: wildcard + sqlite (dev instan) + postgres; bench vs Express lama.
 2. Auth internal dual-token + cookie + CSRF + `policy.toml` dasar.
 3. Driver mysql/mariadb + Redis fan-out.

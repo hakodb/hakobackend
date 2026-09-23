@@ -957,8 +957,178 @@ dependencies = [
 ]
 
 [[package]]
+name = "hakobackend-auth-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-auth-firebase",
+ "hakobackend-auth-github",
+ "hakobackend-auth-oidc",
+ "hakobackend-core",
+ "hakobackend-policy",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "hakobackend-auth-firebase"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "jsonwebtoken",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-auth-github"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "hakobackend-core",
+ "rand 0.8.8",
+ "reqwest",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-auth-local"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "base64",
+ "hakobackend-core",
+ "hakobackend-policy",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signature",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-auth-oidc"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "jsonwebtoken",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-db-hako"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "hakodb",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-db-mysql"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-db-postgres"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-db-sqlite"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
+name = "hakobackend-policy"
+version = "0.1.0"
+dependencies = [
+ "hakobackend-core",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "hakobackend-ratelimit"
+version = "0.1.0"
+
+[[package]]
+name = "hakobackend-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-server",
+ "clap",
+ "hakobackend-auth-core",
+ "hakobackend-auth-github",
+ "hakobackend-auth-local",
+ "hakobackend-core",
+ "hakobackend-db-hako",
+ "hakobackend-db-mysql",
+ "hakobackend-db-postgres",
+ "hakobackend-db-sqlite",
+ "hakobackend-policy",
+ "hakobackend-ratelimit",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "tower-http",
+]
+
+[[package]]
 name = "hakodb"
 version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5320e856c667b00786166d72eebb50145521ab25c20c3a218a32f22b09e2a5f"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -3185,174 +3355,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "ub-auth-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "ub-auth-firebase",
- "ub-auth-github",
- "ub-auth-oidc",
- "ub-core",
- "ub-policy",
-]
-
-[[package]]
-name = "ub-auth-firebase"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "jsonwebtoken",
- "reqwest",
- "serde_json",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-auth-github"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "rand 0.8.8",
- "reqwest",
- "serde_json",
- "sha2",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-auth-local"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "async-trait",
- "base64",
- "jsonwebtoken",
- "rand 0.8.8",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "signature",
- "tokio",
- "ub-core",
- "ub-policy",
-]
-
-[[package]]
-name = "ub-auth-oidc"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "jsonwebtoken",
- "reqwest",
- "serde_json",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "ub-db-hako"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hakodb",
- "serde_json",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-db-mysql"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "sqlx",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-db-postgres"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "sqlx",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-db-sqlite"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "serde_json",
- "sqlx",
- "tokio",
- "ub-core",
-]
-
-[[package]]
-name = "ub-policy"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "toml",
- "ub-core",
-]
-
-[[package]]
-name = "ub-ratelimit"
-version = "0.1.0"
-
-[[package]]
-name = "ub-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "axum-server",
- "clap",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-stream",
- "toml",
- "tower-http",
- "ub-auth-core",
- "ub-auth-github",
- "ub-auth-local",
- "ub-core",
- "ub-db-hako",
- "ub-db-mysql",
- "ub-db-postgres",
- "ub-db-sqlite",
- "ub-policy",
- "ub-ratelimit",
-]
 
 [[package]]
 name = "unicode-bidi"

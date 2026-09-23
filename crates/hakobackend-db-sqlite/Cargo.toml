@@ -1,0 +1,11 @@
+[package]
+name = "hakobackend-db-sqlite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hakobackend-core = { path = "../hakobackend-core" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }

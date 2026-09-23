@@ -1,5 +1,5 @@
 # driver.example.toml — template manifest addon database baru.
-# Salin ke crates/ub-db-<nama>/driver.toml lalu isi. Lihat DRIVER_CONTRACT.md.
+# Salin ke crates/hakobackend-db-<nama>/driver.toml lalu isi. Lihat DRIVER_CONTRACT.md.
 [driver]
 name = "ganti-nama-driver"
 version = "0.1.0"

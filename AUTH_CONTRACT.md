@@ -4,7 +4,7 @@ Simetri dengan `DRIVER_CONTRACT.md`: **tidak ada provider auth yang terikat ke
 core kecuali kontrak**. Backend untuk provider eksternal hanya *verifier*;
 hanya `local` yang menjadi *issuer* (mengelola sesi/token).
 
-## 1. Dua peran (di `ub_core`)
+## 1. Dua peran (di `hakobackend_core`)
 
 ```rust
 trait AuthProvider: Send + Sync {
@@ -24,7 +24,7 @@ trait SessionIssuer: AuthProvider {
 - Provider eksternal **tidak pernah** mengimpl `SessionIssuer`: backend tidak
   menerbitkan token atas nama Firebase/GitHub/OIDC.
 
-## 2. Resolusi `--auth` (di `ub_auth_core`)
+## 2. Resolusi `--auth` (di `hakobackend_auth_core`)
 
 `off`/`none`/kosong → tanpa auth (anonim) | `local` → satu provider |
 `chain:github,local` → coba berurutan, klaim pertama yang valid menang |
@@ -58,7 +58,7 @@ role = "pengurus"
 Cocok bila klaim string == `equals` atau array klaim memuatnya.
 Contoh siap salin: `custom.example.toml`.
 
-## 5. Middleware (`ub-server`)
+## 5. Middleware (`hakobackend-server`)
 
 `Authorization: Bearer …` (klien API) else cookie access (browser BFF) → resolve
 → enforcement DPoP (token lokal) → `Extension<Option<AuthContext>>`.
@@ -80,10 +80,10 @@ Penerbitan mengikat bila login/refresh menyertakan header `DPoP`
 
 | Provider | Crate | Status | Peran |
 |---|---|---|---|
-| `local` | `ub-auth-local` | ✅ fase C (satu-satunya issuer, pola BFF) | Issuer |
-| `firebase` | `ub-auth-firebase` | ✅ fase B (JWKS Google, `UB_FIREBASE_PROJECT`) | Verifier |
-| `github` | `ub-auth-github` | ✅ fase B (token) + E (OAuth BFF: `/api/auth/github/login|callback`) | Verifier |
-| `oidc` | `ub-auth-oidc` | ✅ fase B (`UB_OIDC_ISSUER`, `UB_OIDC_AUDIENCE` opsional) | Verifier |
+| `local` | `hakobackend-auth-local` | ✅ fase C (satu-satunya issuer, pola BFF) | Issuer |
+| `firebase` | `hakobackend-auth-firebase` | ✅ fase B (JWKS Google, `UB_FIREBASE_PROJECT`) | Verifier |
+| `github` | `hakobackend-auth-github` | ✅ fase B (token) + E (OAuth BFF: `/api/auth/github/login|callback`) | Verifier |
+| `oidc` | `hakobackend-auth-oidc` | ✅ fase B (`UB_OIDC_ISSUER`, `UB_OIDC_AUDIENCE` opsional) | Verifier |
 | custom | `custom.toml` | ✅ fase A (mapping + chain) | Mapping |
 
 Secret/param provider via env (tidak di file config): `UB_FIREBASE_PROJECT`,

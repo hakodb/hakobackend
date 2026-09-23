@@ -1,0 +1,34 @@
+# hakobackend.toml — konfigurasi hakobackend. Salin menjadi hakobackend.toml lalu sesuaikan.
+# Prioritas: flag CLI > file ini > default. (--help untuk semua flag)
+host = "0.0.0.0"
+port = 3000
+
+# GANTI DATABASE: edit 2 baris + POST /api/admin/reload. Tanpa rebuild.
+# hako (default, embedded) | postgres | sqlite | mysql (rethink pending)
+driver = "hako"
+# path file (hako/sqlite) atau DSN (postgres/mysql)
+data = "./data/hako.ub"
+
+# Auth: off (default, dev) | local | chain:github,local | ./custom.toml.
+# Nama yang belum tersedia gagal cepat saat startup (fail-closed).
+# `local` butuh env UB_LOCAL_JWT_SECRET (min 32 char acak) + endpoint
+# /api/auth/register|login|refresh|logout|me aktif otomatis.
+# auth = "off"
+
+# File aturan endpoint. EDIT SAAT SERVER JALAN — langsung berlaku (hot-reload).
+# Kosongkan (= mode dev terbuka) hanya untuk development lokal.
+rules = "./policy.toml"
+
+# Index siap pakai: dibuat saat startup + reload (gagal per item = WARN).
+# [[indexes]]
+# collection = "posts"
+# fields = ["age"]
+# kind = "simple"  # simple | composite | fts
+
+# Flood protection in-process (tanpa redis): req/mnt per IP + burst.
+# /api/health selalu terbuka (probe); /api/auth/* lapisan ketat.
+limit_global = 600
+limit_global_burst = 100
+limit_auth = 20
+limit_auth_burst = 5
+# trust_proxy = false  # true HANYA di belakang proxy yang membersihkan X-Forwarded-For

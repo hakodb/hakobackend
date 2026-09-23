@@ -7,19 +7,19 @@ kontrak ini.
 ## 1. Isi sebuah addon
 
 ```text
-crates/ub-db-<nama>/
+crates/hakobackend-db-<nama>/
   Cargo.toml        # crate biasa; dependensi driver bebas (sqlx, client rethink, …)
   driver.toml       # manifest (lihat §2)
-  src/lib.rs        # struct yang mengimpl ub_core::Database + capabilities()
+  src/lib.rs        # struct yang mengimpl hakobackend_core::Database + capabilities()
 ```
 
-Contoh lengkap: `crates/ub-db-hako/` (+ `driver.toml` di dalamnya).
+Contoh lengkap: `crates/hakobackend-db-hako/` (+ `driver.toml` di dalamnya).
 
 ## 2. Manifest `driver.toml`
 
 ```toml
 [driver]
-name = "postgres"        # = Capabilities::driver, = nilai database.driver di ub.toml
+name = "postgres"        # = Capabilities::driver, = nilai database.driver di hakobackend.toml
 version = "0.1.0"
 description = "…"
 
@@ -32,7 +32,7 @@ transactions = true
 path = "postgres://user:pass@host/db"
 ```
 
-## 3. Kontrak perilaku (`ub_core::Database`)
+## 3. Kontrak perilaku (`hakobackend_core::Database`)
 
 | Metode | Aturan baku |
 |---|---|
@@ -53,18 +53,18 @@ Setiap addon memanggil suite bersama dari test-nya sendiri:
 #[tokio::test]
 async fn conformance() {
     let db = MyDriver::open("…").unwrap();
-    ub_core::conformance::run_conformance_suite(&db).await;
+    hakobackend_core::conformance::run_conformance_suite(&db).await;
 }
 ```
 
 Suite menguji: CRUD roundtrip, semua 9 operator filter, order+limit, count,
 semantik replace/merge, delete-mengembalikan-prev, subscribe. **Gagal = belum boleh
-diregistrasi.** (`ub-db-hako` menandai testnya `#[ignore]` karena butuh build
+diregistrasi.** (`hakobackend-db-hako` menandai testnya `#[ignore]` karena butuh build
 HakoDB penuh — dijalankan saat build release, bukan tiap edit.)
 
 ## 5. Semantik query baku (sumber kebenaran tunggal)
 
-`ub_core::conformance::doc_matches` + `sort_and_limit` adalah implementasi
+`hakobackend_core::conformance::doc_matches` + `sort_and_limit` adalah implementasi
 rujukan filter/urutan/limit (diport dari `query.ts:matchesFilter` backend lama).
 Driver yang **punya** filter JSON native (HakoDB, Postgres `jsonb`) menerjemahkan
 operator ke bahasa query-nya; driver yang **tidak punya** memakai helper ini
@@ -78,7 +78,7 @@ BELUM bagian kontrak (cadangan; driver tak boleh mengeksposnya via wire).
 ## 6. Registrasi (satu-satunya titik sentuh core)
 
 1. Tambah crate ke workspace (`crates/*` otomatis anggota).
-2. Tambah 1 arm di `open_driver()` (`crates/ub-server/src/main.rs`).
+2. Tambah 1 arm di `open_driver()` (`crates/hakobackend-server/src/main.rs`).
 3. Tambah 1 baris di tabel Registry (§7) + contoh `database.path`.
 
 Itu saja. Handler, policy, realtime tidak tahu driver apa yang dipakai.
@@ -87,11 +87,11 @@ Itu saja. Handler, policy, realtime tidak tahu driver apa yang dipakai.
 
 | Driver | Crate | Status | Watch | Transaksi |
 |---|---|---|---|---|
-| `hako` | `ub-db-hako` | ✅ default (embedded, nol-setup) | ya | ya |
-| `postgres` | `ub-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | ya |
-| `sqlite` | `ub-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | ya |
-| `mysql` | `ub-db-mysql` | ✅ via sqlx (pool, JSON, FTS generated) | polling | ya |
-| `mongodb` | `ub-db-mongo` | 🔜 fase berikutnya (crate resmi `mongodb`, async) | change stream | ya |
+| `hako` | `hakobackend-db-hako` | ✅ default (embedded, nol-setup) | ya | ya |
+| `postgres` | `hakobackend-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | ya |
+| `sqlite` | `hakobackend-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | ya |
+| `mysql` | `hakobackend-db-mysql` | ✅ via sqlx (pool, JSON, FTS generated) | polling | ya |
+| `mongodb` | `hakobackend-db-mongo` | 🔜 fase berikutnya (crate resmi `mongodb`, async) | change stream | ya |
 
 ### Fase berikutnya: MongoDB
 
@@ -103,4 +103,4 @@ padanan MQL (`$eq`, `$gt`, `$in`, `$elemMatch`/`$all` untuk array),
 order/limit/offset/cursor native, index via `create_index` (single/compound/
 `text`), FTS via text index (`supports_fts: true`), registry `__ub_indexes`
 di DB yang sama. Estimasi ringan karena kontrak + suite sudah ada.
-| `mysql` | `ub-db-mysql` | ⬜ peta jalan fase 3 | polling | ya |
+| `mysql` | `hakobackend-db-mysql` | ⬜ peta jalan fase 3 | polling | ya |

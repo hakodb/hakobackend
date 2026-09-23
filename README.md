@@ -8,32 +8,32 @@ Penerus `rethink-firestore/backend` — wire-protocol kompatibel agar SDK lama t
 - Kontrak provider auth: [`AUTH_CONTRACT.md`](AUTH_CONTRACT.md) (+ `custom.example.toml`)
 - Kontrak translasi HTTP: [`HTTP_CONTRACT.md`](HTTP_CONTRACT.md)
 - Security rules standar: [`SECURITY_RULES.md`](SECURITY_RULES.md) (+ `policy.standard.toml`)
-- Contoh config: [`config/ub.example.toml`](config/ub.example.toml)
+- Contoh config: [`config/hakobackend.example.toml`](config/hakobackend.example.toml)
 
 ## Struktur
 
 ```text
 crates/
-  ub-core/       kontrak: Doc, QueryOptions, trait Database/Auth, Claims, AppError
-  ub-db-hako/    adapter HakoDB (driver default; path-dep ke ../hakodb)
-  ub-db-postgres/  addon PostgreSQL via sqlx (pool, JSONB, FTS GIN)
-  ub-db-sqlite/    addon SQLite via sqlx (file/:memory:, FTS5)
-  ub-db-mysql/     addon MySQL/MariaDB via sqlx (pool, JSON, FTS generated)
-  ub-policy/     policy.toml + [identity] milik user (hot-reload)
-  ub-auth-core/  resolusi --auth: chain + custom.toml mapping + union peran
-  ub-auth-local/ issuer BFF (dual-token, DPoP, argon2)
-  ub-auth-firebase|github|oidc/  verifier-only eksternal (+ OAuth GitHub BFF)
-  ub-ratelimit/  token-bucket in-process 2 lapis (tanpa redis)
-  ub-server/     gateway Axum + CLI + WS/SSE + TLS
+  hakobackend-core/       kontrak: Doc, QueryOptions, trait Database/Auth, Claims, AppError
+  hakobackend-db-hako/    adapter HakoDB (driver default; path-dep ke ../hakodb)
+  hakobackend-db-postgres/  addon PostgreSQL via sqlx (pool, JSONB, FTS GIN)
+  hakobackend-db-sqlite/    addon SQLite via sqlx (file/:memory:, FTS5)
+  hakobackend-db-mysql/     addon MySQL/MariaDB via sqlx (pool, JSON, FTS generated)
+  hakobackend-policy/     policy.toml + [identity] milik user (hot-reload)
+  hakobackend-auth-core/  resolusi --auth: chain + custom.toml mapping + union peran
+  hakobackend-auth-local/ issuer BFF (dual-token, DPoP, argon2)
+  hakobackend-auth-firebase|github|oidc/  verifier-only eksternal (+ OAuth GitHub BFF)
+  hakobackend-ratelimit/  token-bucket in-process 2 lapis (tanpa redis)
+  hakobackend-server/     gateway Axum + CLI + WS/SSE + TLS
 ```
 
 ## Jalan cepat
 
 ```powershell
-cargo run -p ub-server -- --driver hako --data ./data/hako.ub --rules ./policy.example.toml --port 8080
-cargo run -p ub-server -- --config ub.example.toml   # atau via file
-cargo run -p ub-server -- --config ub.example.toml --validate   # cek kering
-cargo run -p ub-server -- --print-default-config     # cetak template
+cargo run -p hakobackend-server -- --driver hako --data ./data/hako.ub --rules ./policy.example.toml --port 8080
+cargo run -p hakobackend-server -- --config hakobackend.example.toml   # atau via file
+cargo run -p hakobackend-server -- --config hakobackend.example.toml --validate   # cek kering
+cargo run -p hakobackend-server -- --print-default-config     # cetak template
 ```
 
 Prioritas: flag CLI > file config > default. Bentuk config lama
@@ -57,18 +57,18 @@ Endpoint (sama seperti backend lama):
 
 ## Catatan build
 
-`ub-db-hako` menarik seluruh HakoDB + dependensi C-nya (`zstd-sys`, `aws-lc-sys`);
+`hakobackend-db-hako` menarik seluruh HakoDB + dependensi C-nya (`zstd-sys`, `aws-lc-sys`);
 `cargo check/build` pertama lama — itu normal, bukan error. Fokus saat ini pengembangan,
 build penuh belakangan.
 
 ## Plug-and-play database & endpoint fleksibel
 
 - **Ganti DB saat server jalan:** edit `driver` / `data` di config,
-  lalu `POST /api/admin/reload`. Tanpa rebuild/restart. Driver baru = crate `ub-db-*`
-  yang mengimpl `ub_core::Database` + 1 arm di `open_driver` (`crates/ub-server/src/main.rs`).
-  Contoh: `cp ub.example.toml ub.toml`.
+  lalu `POST /api/admin/reload`. Tanpa rebuild/restart. Driver baru = crate `hakobackend-db-*`
+  yang mengimpl `hakobackend_core::Database` + 1 arm di `open_driver` (`crates/hakobackend-server/src/main.rs`).
+  Contoh: `cp hakobackend.example.toml hakobackend.toml`.
 - **Ganti auth saat server jalan:** edit `auth` (`off | local | chain:a,b | ./custom.toml`)
-  lalu reload yang sama. Rantai + mapping di `ub-auth-core`; provider yang belum
+  lalu reload yang sama. Rantai + mapping di `hakobackend-auth-core`; provider yang belum
   tersedia gagal cepat (fail-closed). Contoh: `custom.example.toml`.
 - **`local` (issuer BFF):** `POST /api/auth/register|login|refresh|logout`, `GET /api/auth/me`;
   dua cookie `__Host-` HttpOnly+Secure+SameSite=Strict; refresh rotasi + reuse-detection;
