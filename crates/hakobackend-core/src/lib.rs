@@ -261,6 +261,17 @@ impl AppError {
             AppError::Internal(_) => 500,
         }
     }
+
+    /// Legacy `mapError` code string for `{error, code}` write failures.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AppError::PermissionDenied => "permission-denied",
+            AppError::NotFound => "not-found",
+            AppError::AlreadyExists => "already-exists",
+            AppError::BadRequest(_) => "bad-request",
+            AppError::Internal(_) => "internal",
+        }
+    }
 }
 
 // --- Database trait: the plug-and-play contract (replacing RethinkDBService) ---
@@ -306,6 +317,42 @@ pub trait Database: Send + Sync {
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError>;
     /// Drop an index by name. Drivers without a drop API → reject clearly.
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError>;
+    /// Atomic multi-op batch (`/api/batch`, `/api/transaction`): all ops
+    /// apply or none do. Reads inside observe the batch's own writes.
+    /// Default: reject clearly (drivers advertising `supports_transactions`
+    /// must override).
+    async fn run_transaction(&self, _ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
+        Err(AppError::BadRequest("driver has no transaction support".into()))
+    }
+}
+
+/// One operation inside `run_transaction`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOp {
+    pub collection: String,
+    pub id: String,
+    pub kind: TxOpKind,
+    /// Body for Put (ignored for Read/Delete).
+    #[serde(default)]
+    pub doc: Option<Doc>,
+}
+
+/// Operation kind. `Put.must_exist` mirrors the legacy `update` (error when
+/// absent); plain `set`/`add` create freely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TxOpKind {
+    Read,
+    Put { merge: bool, must_exist: bool },
+    Delete,
+}
+
+/// One result, aligned with its op: the doc read/written (None for deletes
+/// of absent docs) plus whether the doc existed before this op ran.
+#[derive(Debug, Clone)]
+pub struct TxOut {
+    pub doc: Option<Doc>,
+    pub existed: bool,
 }
 
 /// Capabilities declared by each addon driver.
@@ -763,6 +810,58 @@ pub mod conformance {
 
         // 8. subscribe must not error.
         assert!(db.subscribe(&coll).await.is_ok());
+
+        // 9. run_transaction: read-your-writes, must_exist, atomic rollback.
+        let txc = format!("{coll}_tx");
+        let put = |id: &str, age: i64| TxOp {
+            collection: txc.clone(),
+            id: id.into(),
+            kind: TxOpKind::Put { merge: false, must_exist: false },
+            doc: Some(mk(serde_json::json!({"age": age}))),
+        };
+        let out = db
+            .run_transaction(vec![
+                put("t1", 1),
+                put("t2", 2),
+                TxOp {
+                    collection: txc.clone(),
+                    id: "t1".into(),
+                    kind: TxOpKind::Read,
+                    doc: None,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert!(!out[0].existed && !out[1].existed);
+        assert!(out[2].existed);
+        assert_eq!(out[2].doc.as_ref().unwrap().data.get("age"), Some(&serde_json::json!(1)));
+        // must_exist on a missing doc aborts the whole batch.
+        let bad = db
+            .run_transaction(vec![
+                put("t3", 3),
+                TxOp {
+                    collection: txc.clone(),
+                    id: "ghost".into(),
+                    kind: TxOpKind::Put { merge: true, must_exist: true },
+                    doc: Some(mk(serde_json::json!({"age": 9}))),
+                },
+            ])
+            .await;
+        assert!(matches!(bad, Err(AppError::NotFound)));
+        assert!(db.get(&txc, "t3").await.unwrap().is_none(), "abort must roll back t3");
+        // Delete reports prev + existed.
+        let del = db
+            .run_transaction(vec![TxOp {
+                collection: txc.clone(),
+                id: "t1".into(),
+                kind: TxOpKind::Delete,
+                doc: None,
+            }])
+            .await
+            .unwrap();
+        assert!(del[0].existed && del[0].doc.is_some());
+        assert!(db.get(&txc, "t1").await.unwrap().is_none());
     }
 
     fn nanos() -> u128 {
@@ -996,6 +1095,45 @@ pub mod conformance {
                 return Err(AppError::NotFound);
             }
             Ok(())
+        }
+        async fn run_transaction(&self, ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
+            // In-memory: apply to a scratch clone under one lock hold, swap
+            // on success. An error anywhere discards the scratch = rollback.
+            let mut store = self.store.lock().unwrap();
+            let mut scratch = store.clone();
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                let table = scratch.entry(op.collection.clone()).or_default();
+                match op.kind {
+                    TxOpKind::Read => {
+                        let doc = table.get(&op.id).cloned();
+                        out.push(TxOut { existed: doc.is_some(), doc });
+                    }
+                    TxOpKind::Put { merge, must_exist } => {
+                        let old = table.get(&op.id).cloned();
+                        if must_exist && old.is_none() {
+                            return Err(AppError::NotFound);
+                        }
+                        let existed = old.is_some();
+                        let mut data = if merge {
+                            old.map(|d| d.data).unwrap_or_default()
+                        } else {
+                            HashMap::new()
+                        };
+                        let mut body = op.doc.map(|d| d.data).unwrap_or_default();
+                        data.extend(body.drain());
+                        let doc = Doc { id: op.id.clone(), data };
+                        table.insert(op.id.clone(), doc.clone());
+                        out.push(TxOut { existed, doc: Some(doc) });
+                    }
+                    TxOpKind::Delete => {
+                        let old = table.remove(&op.id);
+                        out.push(TxOut { existed: old.is_some(), doc: old });
+                    }
+                }
+            }
+            *store = scratch;
+            Ok(out)
         }
     }
 

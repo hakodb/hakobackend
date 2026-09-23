@@ -18,7 +18,24 @@ must produce exactly the same behavior.
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | `set(merge=true)` = shallow merge | 200 / 400 |
 | `DELETE` document | Delete | `delete` (returns prev) | 200 / 400 |
-| Error | — | `AppError::status_code` (403/404/400/500) | — |
+| `POST /api/batch {operations[]}` | per-op (see §8) | one `run_transaction` (atomic) | 200 / 400 / 500 `{error}` |
+| `POST /api/transaction {operations[]}` | per-op (see §8) | one `run_transaction` (atomic) | 200 / 400 / mapped `{error, code}` |
+| `GET /api/collectionGroup/:name?options=` | List + per-doc Get | fan-out over matching collections | 200 / 400 |
+| `POST /api/aggregate/{collection} {options?, aggregations[]}` | List | gateway reduce (count/sum/avg) | 200 / 400 |
+| Error | — | `AppError::status_code` (403/404/400/500) + `code()` | body `{error}` (`{error, code}` on writes) |
+
+## 8. Batch + transaction (legacy server.ts:392-603 parity)
+
+One op = `{type, collection, id, data?, options?}` (`id` required).
+Type mapping: `get`→Get, `delete`→Delete, `update`→Update (errors when
+absent), `set`→Create/Update by existence (honors `options.merge`),
+`add`→forced merge-create; transaction maps unknown types by existence,
+batch treats them as creates. Gates run per op against the existing doc
+(or the incoming one for creates); collections are created only after
+their gate passes. Then the whole write set applies in ONE driver
+`run_transaction`: all or none, reads inside observe the batch's own
+writes. Result shapes: batch → every op `{id, success}`; transaction →
+`get` returns the doc (or null), writes return `{success: true}`.
 
 ## 3. Indexes (§index)
 
@@ -69,8 +86,9 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
   `?token=` fallback (lands in the URL — TLS only).
 - Delivery semantics = snapshot + full filter/cursor (legacy changeHandler parity);
   `List` gate at subscribe, `Get` per document. No initial burst (clients GET first).
-- Watch drivers (HakoDB) = push; others = 2 s polling (single-instance;
-  Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
+- Watch drivers (HakoDB) = push with lagged resync; others = shared poller
+  (one list per collection per 2 s tick no matter the watcher count;
+  single-instance; Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
 
 ## 7. TLS
 

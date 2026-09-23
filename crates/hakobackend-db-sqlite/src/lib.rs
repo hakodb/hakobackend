@@ -333,6 +333,128 @@ macro_rules! bind_params {
     };
 }
 
+impl SqliteDb {
+    /// Transactional variants: same SQL as the pool methods, but every
+    /// statement runs on `&mut Transaction` (reborrowed per statement).
+    /// Tables are ensured by the caller, never here.
+    async fn get_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Doc>, AppError> {
+        let table = hakobackend_core::flat_table_name(collection);
+        let mut sql = format!("SELECT id, data FROM {} WHERE id = ?1", qi(&table));
+        if collection.contains('/') {
+            sql.push_str(&format!(" AND json_extract(data, '$.\"{PATH_FIELD}\"') = ?2"));
+        }
+        let mut q = sqlx::query(&sql).bind(id);
+        if collection.contains('/') {
+            q = q.bind(collection);
+        }
+        let row: Option<(String, String)> = q
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?
+            .map(|r| {
+                use sqlx::Row;
+                (r.get::<String, _>("id"), r.get::<String, _>("data"))
+            });
+        Ok(row.map(|(id, text)| to_doc(id, parse_data(&text))))
+    }
+
+    async fn insert_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        collection: &str,
+        mut doc: Doc,
+    ) -> Result<Doc, AppError> {
+        if doc.id.is_empty() {
+            doc.id = uuid_like();
+        }
+        let table = hakobackend_core::flat_table_name(collection);
+        inject_path(&mut doc.data, collection);
+        let text = serde_json::Value::Object(doc.data.clone().into_iter().collect()).to_string();
+        let r = sqlx::query(&format!("INSERT INTO {} (id, data) VALUES (?1, ?2) ON CONFLICT (id) DO NOTHING", qi(&table)))
+            .bind(&doc.id)
+            .bind(&text)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?;
+        if r.rows_affected() == 0 {
+            return Err(AppError::AlreadyExists);
+        }
+        doc.data.remove(PATH_FIELD);
+        Ok(doc)
+    }
+
+    /// Returns the written doc plus whether it existed before this op.
+    async fn set_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        collection: &str,
+        id: &str,
+        body: std::collections::HashMap<String, serde_json::Value>,
+        merge: bool,
+        must_exist: bool,
+    ) -> Result<(Doc, bool), AppError> {
+        let table = hakobackend_core::flat_table_name(collection);
+        let old = Self::get_tx(&mut *tx, collection, id).await?;
+        if must_exist && old.is_none() {
+            return Err(AppError::NotFound);
+        }
+        let existed = old.is_some();
+        let mut data = if merge { old.map(|d| d.data).unwrap_or_default() } else { Default::default() };
+        data.extend(body);
+        inject_path(&mut data, collection);
+        let text = serde_json::Value::Object(data.clone().into_iter().collect()).to_string();
+        if merge {
+            let mut sql = format!("UPDATE {} SET data = ?1 WHERE id = ?2", qi(&table));
+            let mut q = sqlx::query(&sql).bind(&text).bind(id);
+            if collection.contains('/') {
+                sql.push_str(&format!(" AND json_extract(data, '$.\"{PATH_FIELD}\"') = ?3"));
+                q = sqlx::query(&sql).bind(&text).bind(id).bind(collection);
+            }
+            let r = q.execute(&mut **tx).await.map_err(|_| AppError::Internal("db error".into()))?;
+            if r.rows_affected() == 0 {
+                let doc = Self::insert_tx(&mut *tx, collection, Doc { id: id.into(), data }).await?;
+                return Ok((doc, existed));
+            }
+        } else {
+            sqlx::query(&format!(
+                "INSERT INTO {} (id, data) VALUES (?1, ?2) ON CONFLICT (id) DO UPDATE SET data = excluded.data",
+                qi(&table)
+            ))
+            .bind(id)
+            .bind(&text)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?;
+        }
+        data.remove(PATH_FIELD);
+        Ok((Doc { id: id.into(), data }, existed))
+    }
+
+    async fn delete_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<Doc>, AppError> {
+        let prev = Self::get_tx(&mut *tx, collection, id).await?;
+        if prev.is_none() {
+            return Ok(None);
+        }
+        let table = hakobackend_core::flat_table_name(collection);
+        let mut sql = format!("DELETE FROM {} WHERE id = ?1", qi(&table));
+        if collection.contains('/') {
+            sql.push_str(&format!(" AND json_extract(data, '$.\"{PATH_FIELD}\"') = ?2"));
+        }
+        let mut q = sqlx::query(&sql).bind(id);
+        if collection.contains('/') {
+            q = q.bind(collection);
+        }
+        q.execute(&mut **tx).await.map_err(|_| AppError::Internal("db error".into()))?;
+        Ok(prev)
+    }
+}
+
 #[async_trait::async_trait]
 impl Database for SqliteDb {
     fn capabilities(&self) -> Capabilities {
@@ -486,6 +608,38 @@ impl Database for SqliteDb {
         q.execute(&self.pool).await.map_err(|_| AppError::Internal("db error".into()))?;
         Ok(prev)
     }
+
+    async fn run_transaction(&self, ops: Vec<hakobackend_core::TxOp>) -> Result<Vec<hakobackend_core::TxOut>, AppError> {
+        use hakobackend_core::{TxOpKind, TxOut};
+        // Tables first (DDL outside the tx; sqlite allows it inside, but one
+        // code path for all three SQL drivers beats per-driver cleverness).
+        for op in &ops {
+            self.ensure_table(&hakobackend_core::flat_table_name(&op.collection)).await?;
+        }
+        let mut tx = self.pool.begin().await.map_err(|_| AppError::Internal("db error".into()))?;
+        let mut out = Vec::with_capacity(ops.len());
+        for op in ops {
+            match op.kind {
+                TxOpKind::Read => {
+                    let doc = Self::get_tx(&mut tx, &op.collection, &op.id).await?;
+                    out.push(TxOut { existed: doc.is_some(), doc });
+                }
+                TxOpKind::Put { merge, must_exist } => {
+                    let body = op.doc.map(|d| d.data).unwrap_or_default();
+                    let (doc, existed) =
+                        Self::set_tx(&mut tx, &op.collection, &op.id, body, merge, must_exist).await?;
+                    out.push(TxOut { existed, doc: Some(doc) });
+                }
+                TxOpKind::Delete => {
+                    let old = Self::delete_tx(&mut tx, &op.collection, &op.id).await?;
+                    out.push(TxOut { existed: old.is_some(), doc: old });
+                }
+            }
+        }
+        tx.commit().await.map_err(|_| AppError::Internal("db error".into()))?;
+        Ok(out)
+    }
+
 
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         let table = hakobackend_core::flat_table_name(collection);

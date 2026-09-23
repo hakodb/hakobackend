@@ -212,6 +212,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             get(get_or_list).post(create).put(put).patch(patch).delete(remove),
         )
         .route("/api/indexes", post(index_create).get(index_list).delete(index_drop))
+        .route("/api/batch", post(batch))
+        .route("/api/transaction", post(transaction))
+        .route("/api/collectionGroup/{name}", get(collection_group))
+        .route("/api/aggregate/{*path}", post(aggregate))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler))
@@ -465,11 +469,24 @@ fn base_uri(tls: bool, headers: &HeaderMap, path: &str) -> String {
 }
 
 fn forbidden() -> Response {
-    (StatusCode::FORBIDDEN, "Permission denied by policy").into_response()
+    err(StatusCode::FORBIDDEN, "Permission denied by policy")
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, "authentication required").into_response()
+    err(StatusCode::UNAUTHORIZED, "authentication required")
+}
+
+/// Legacy wire shape: every failure is JSON `{error}` (writes add `code`).
+fn err(status: StatusCode, msg: impl ToString) -> Response {
+    (status, Json(serde_json::json!({ "error": msg.to_string() }))).into_response()
+}
+
+fn err_code(status: StatusCode, msg: impl ToString, code: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": msg.to_string(), "code": code })),
+    )
+        .into_response()
 }
 
 async fn health() -> impl IntoResponse {
@@ -491,12 +508,12 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     }
     let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data).await {
         Ok(db) => db,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     let identity = s.policy.get().await.identity.clone();
     let (chain, local, github) = match open_auth_result(cfg.auth.as_deref(), db.clone(), identity) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     *s.db.write().await = db;
     *s.auth.write().await = Arc::new(chain);
@@ -514,7 +531,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
 async fn list_collections(State(s): State<AppState>) -> impl IntoResponse {
     match s.db.read().await.list_collections().await {
         Ok(c) => Json(serde_json::json!(c)).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -541,11 +558,11 @@ async fn get_or_list(
                 }
                 Json(serde_json::to_value(doc).unwrap()).into_response()
             }
-            Ok(None) => (StatusCode::NOT_FOUND, "Document not found").into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Ok(None) => err(StatusCode::NOT_FOUND, "Document not found"),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         },
         PathKind::Collection { collection } => match parse_options(&q) {
-            Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            Err(msg) => err(StatusCode::BAD_REQUEST, msg),
             Ok(opts) => match db.list(&collection, &opts).await {
                 // Per-doc filter (replacement for the server.ts:233 loop): documents
                 // failing the rule are excluded from the response, with no extra N+1
@@ -557,7 +574,7 @@ async fn get_or_list(
                         .collect();
                     Json(serde_json::to_value(visible).unwrap()).into_response()
                 }
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             },
         },
     }
@@ -594,7 +611,7 @@ async fn index_create(
 ) -> impl IntoResponse {
     let collection = match body.get("collection").and_then(|v| v.as_str()) {
         Some(c) if !c.is_empty() => c.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "collection required").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "collection required"),
     };
     index_create_inner(s, auth, collection, body).await
 }
@@ -617,7 +634,7 @@ async fn index_create_inner(
 ) -> Response {
     let spec = match parse_index_spec(&body) {
         Ok(spec) => spec,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
@@ -627,7 +644,7 @@ async fn index_create_inner(
     let _ = db.ensure_collection(&collection).await;
     match db.create_index(&collection, &spec).await {
         Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
-        Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
 
@@ -638,7 +655,7 @@ async fn index_list(
 ) -> impl IntoResponse {
     let collection = match q.get("collection").map(|s| s.as_str()) {
         Some(c) if !c.is_empty() => c.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "query ?collection= required").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "query ?collection= required"),
     };
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
@@ -646,7 +663,7 @@ async fn index_list(
     }
     match s.db.read().await.list_indexes(&collection).await {
         Ok(indexes) => Json(serde_json::to_value(indexes).unwrap()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -657,7 +674,7 @@ async fn index_drop(
 ) -> impl IntoResponse {
     let (collection, name) = match (q.get("collection"), q.get("name")) {
         (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => (c.clone(), n.clone()),
-        _ => return (StatusCode::BAD_REQUEST, "query ?collection= & ?name= required").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "query ?collection= & ?name= required"),
     };
     let policy = s.policy.get().await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
@@ -665,7 +682,7 @@ async fn index_drop(
     }
     match s.db.read().await.drop_index(&collection, &name).await {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
-        Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
 
@@ -697,7 +714,7 @@ async fn create(
             let _ = db.ensure_collection(&collection).await;
             match db.insert(&collection, incoming).await {
                 Ok(doc) => Json(serde_json::to_value(doc).unwrap()).into_response(),
-                Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+                Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
     }
@@ -740,7 +757,7 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             let _ = db.ensure_collection(&collection).await;
             match db.set(&collection, &id, incoming_doc(&id, body), merge).await {
                 Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
-                Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+                Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
     }
@@ -767,12 +784,333 @@ async fn remove(
             let _ = db.ensure_collection(&collection).await;
             match db.delete(&collection, &id).await {
                 Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
-                Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+                Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
     }
 }
 
+// --- Batch + transaction (legacy server.ts:392-603 parity) ---
+//
+// One op = `{type, collection, id?, data?, options?}`. Gates run per op
+// (method mapped like legacy, collection created only after the gate),
+// then the whole write set applies in ONE driver transaction: all or none.
+// `add` forces merge (create path); `set` honors `options.merge`;
+// `update` errors when absent; unknown types map by existence (transaction
+// only — batch treats them as creates, like legacy).
+
+#[derive(Debug, serde::Deserialize)]
+struct BatchOpBody {
+    #[serde(rename = "type")]
+    op_type: String,
+    collection: String,
+    id: Option<String>,
+    data: Option<serde_json::Value>,
+    options: Option<BatchOpOptions>,
+}
+
+#[derive(Debug, serde::Deserialize, Default)]
+struct BatchOpOptions {
+    #[serde(default)]
+    merge: bool,
+}
+
+fn op_method(op_type: &str, existed: bool, is_tx: bool) -> Method {
+    match op_type {
+        "get" => Method::Get,
+        "delete" => Method::Delete,
+        "update" => Method::Update,
+        "set" => {
+            if existed {
+                Method::Update
+            } else {
+                Method::Create
+            }
+        }
+        _ if is_tx => {
+            if existed {
+                Method::Update
+            } else {
+                Method::Create
+            }
+        }
+        _ => Method::Create, // 'add' and anything else in batch mode
+    }
+}
+
+/// Shared runner. Batch shapes: every op → `{id, success}`. Transaction
+/// shapes: `get` → doc-or-null, writes → `{success: true}`.
+async fn run_ops(
+    db: &Arc<dyn Database>,
+    policy: &Arc<PolicyFile>,
+    auth: Option<&AuthContext>,
+    ops: Vec<BatchOpBody>,
+    is_tx: bool,
+) -> Result<Vec<serde_json::Value>, (StatusCode, String, &'static str)> {
+    use hakobackend_core::{TxOp, TxOpKind};
+    // Phase 1: resolve + gate each op (reads tolerate missing tables).
+    struct Gated {
+        body: BatchOpBody,
+        id: String,
+        existed: bool,
+    }
+    let mut gated = Vec::with_capacity(ops.len());
+    for op in ops {
+        let id = op
+            .id
+            .clone()
+            .filter(|s| !s.is_empty())
+            .ok_or((StatusCode::BAD_REQUEST, "op requires id".to_string(), "bad-request"))?;
+        let existing = db.get(&op.collection, &id).await.ok().flatten();
+        let existed = existing.is_some();
+        let method = op_method(&op.op_type.to_ascii_lowercase(), existed, is_tx);
+        if !policy.allow(auth, &op.collection, method, existing.as_ref()) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("Permission denied: {method:?} on {}/{}", op.collection, id),
+                "permission-denied",
+            ));
+        }
+        let _ = db.ensure_collection(&op.collection).await;
+        gated.push(Gated { body: op, id, existed });
+    }
+    // Phase 2: one atomic transaction.
+    if !db.capabilities().supports_transactions {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("driver {} has no transaction support", db.capabilities().driver),
+            "bad-request",
+        ));
+    }
+    let tx_ops: Vec<TxOp> = gated
+        .iter()
+        .map(|g| {
+            let t = g.body.op_type.to_ascii_lowercase();
+            let kind = match t.as_str() {
+                "get" => TxOpKind::Read,
+                "delete" => TxOpKind::Delete,
+                "add" => TxOpKind::Put { merge: true, must_exist: false },
+                "set" => TxOpKind::Put {
+                    merge: g.body.options.as_ref().is_some_and(|o| o.merge),
+                    must_exist: false,
+                },
+                "update" => TxOpKind::Put { merge: true, must_exist: true },
+                _ if is_tx => {
+                    if g.existed {
+                        TxOpKind::Put { merge: true, must_exist: true }
+                    } else {
+                        TxOpKind::Put { merge: false, must_exist: false }
+                    }
+                }
+                _ => TxOpKind::Put { merge: false, must_exist: false },
+            };
+            TxOp {
+                collection: g.body.collection.clone(),
+                id: g.id.clone(),
+                kind,
+                doc: g.body.data.as_ref().map(|v| incoming_doc(&g.id, v.clone())),
+            }
+        })
+        .collect();
+    // Reads resolve against the batch's own writes (driver overlay/tx reads).
+    let outs = db
+        .run_transaction(tx_ops)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                e.to_string(),
+                e.code(),
+            )
+        })?;
+    // Phase 3: legacy result shapes — batch: every op → `{id, success}`;
+    // transaction: `get` → doc-or-null, writes → `{success: true}`.
+    Ok(gated
+        .into_iter()
+        .zip(outs)
+        .map(|(g, o)| {
+            let t = g.body.op_type.to_ascii_lowercase();
+            if !is_tx {
+                serde_json::json!({ "id": g.id, "success": true })
+            } else {
+                match t.as_str() {
+                    "get" => o.doc.map(|d| serde_json::to_value(d).unwrap()).unwrap_or(serde_json::Value::Null),
+                    _ => serde_json::json!({ "success": true }),
+                }
+            }
+        })
+        .collect())
+}
+
+async fn batch(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Legacy quirk preserved: batch failures are always 500, no code.
+    let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
+        Ok(v) => v,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
+    };
+    let db = s.db.read().await.clone();
+    let policy = s.policy.get().await;
+    match run_ops(&db, &policy, auth.as_ref(), ops, false).await {
+        Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
+        Err((StatusCode::INTERNAL_SERVER_ERROR, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+        Err((_, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    }
+}
+
+async fn transaction(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
+        Ok(v) => v,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
+    };
+    let db = s.db.read().await.clone();
+    let policy = s.policy.get().await;
+    match run_ops(&db, &policy, auth.as_ref(), ops, true).await {
+        Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
+        Err((status, msg, code)) => err_code(status, msg, code),
+    }
+}
+
+// --- Collection group (legacy server.ts:325-362 parity) ---
+//
+// `GET /api/collectionGroup/:name`: every collection whose name matches the
+// group (exact, path suffix, or `_` suffix) lists under a List gate, then
+// each doc passes its own Get gate (resolved against the real parent path
+// when the doc carries one).
+
+async fn collection_group(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(name): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let opts = match parse_options(&q) {
+        Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
+        Ok(o) => o,
+    };
+    let policy = s.policy.get().await;
+    let db = s.db.read().await.clone();
+    let collections = match db.list_collections().await {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    let mut out = Vec::new();
+    for coll in collections {
+        if !realtime::matches_group(&coll, &name) {
+            continue;
+        }
+        if !policy.allow(auth.as_ref(), &coll, Method::List, None) {
+            continue;
+        }
+        let docs = match db.list(&coll, &opts).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for doc in docs {
+            let doc_coll = doc
+                .data
+                .get("_collectionPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&coll);
+            if policy.allow(auth.as_ref(), doc_coll, Method::Get, Some(&doc)) {
+                out.push(doc);
+            }
+        }
+    }
+    Json(serde_json::to_value(out).unwrap()).into_response()
+}
+
+// --- Aggregates (legacy POST /api/aggregate/* parity) ---
+//
+// Body `{options?, aggregations: [{type: count|sum|avg, field?, alias?}]}`.
+// Key = alias, else `{type}_{field|'count'}`. Gateway-side reduce (uniform
+// across drivers; pushdown is a driver optimization for later).
+
+#[derive(Debug, serde::Deserialize)]
+struct AggBody {
+    #[serde(default)]
+    options: QueryOptions,
+    #[serde(default)]
+    aggregations: Vec<AggSpec>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AggSpec {
+    #[serde(rename = "type")]
+    agg_type: String,
+    field: Option<String>,
+    alias: Option<String>,
+}
+
+fn agg_number(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
+async fn aggregate(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Json(body): Json<AggBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "aggregate needs a collection path");
+    }
+    let policy = s.policy.get().await;
+    if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
+        return forbidden();
+    }
+    let db = s.db.read().await.clone();
+    // Aggregates ignore paging (legacy passes options through to count/sum/avg).
+    let mut opts = body.options.clone();
+    opts.limit = None;
+    opts.offset = None;
+    let mut result = serde_json::Map::new();
+    for agg in body.aggregations {
+        let t = agg.agg_type.to_ascii_lowercase();
+        let key = agg.alias.clone().unwrap_or_else(|| match t.as_str() {
+            "count" => "count_count".to_string(),
+            _ => format!("{t}_{}", agg.field.as_deref().unwrap_or("count")),
+        });
+        let value = match t.as_str() {
+            "count" => match db.count(&collection, &opts).await {
+                Ok(n) => serde_json::json!(n),
+                Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
+            },
+            "sum" | "avg" => {
+                let field = match agg.field.as_deref().filter(|f| !f.is_empty()) {
+                    Some(f) => f,
+                    None => return err(StatusCode::BAD_REQUEST, format!("{t} needs a field")),
+                };
+                let docs = match db.list(&collection, &opts).await {
+                    Ok(d) => d,
+                    Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
+                };
+                let nums: Vec<f64> = docs.iter().filter_map(|d| d.data.get(field).and_then(agg_number)).collect();
+                if t == "sum" {
+                    serde_json::json!(nums.iter().sum::<f64>())
+                } else if nums.is_empty() {
+                    serde_json::json!(0.0)
+                } else {
+                    serde_json::json!(nums.iter().sum::<f64>() / nums.len() as f64)
+                }
+            }
+            _ => return err(StatusCode::BAD_REQUEST, format!("unknown aggregation: {}", agg.agg_type)),
+        };
+        result.insert(key, value);
+    }
+    Json(serde_json::Value::Object(result)).into_response()
+}
 // --- Local auth (BFF): two HttpOnly cookies, browser never holds tokens ---
 
 fn session_cookies(local: &LocalAuth, tokens: &hakobackend_auth_local::SessionTokens) -> HeaderMap {
@@ -815,17 +1153,17 @@ async fn auth_register(State(s): State<AppState>, Json(body): Json<serde_json::V
     };
     let mut body = match body.as_object() {
         Some(m) => m.clone().into_iter().collect::<HashMap<_, _>>(),
-        None => return (StatusCode::BAD_REQUEST, "JSON object body required").into_response(),
+        None => return err(StatusCode::BAD_REQUEST, "JSON object body required"),
     };
     let id = body.remove("id").and_then(|v| v.as_str().map(str::to_string));
     let email = body.remove("email").and_then(|v| v.as_str().map(str::to_string));
     let password = match body.remove("password").and_then(|v| v.as_str().map(str::to_string)) {
         Some(p) => p,
-        None => return (StatusCode::BAD_REQUEST, "password required").into_response(),
+        None => return err(StatusCode::BAD_REQUEST, "password required"),
     };
     match local.register(id, email, &password, body).await {
         Ok(doc) => (StatusCode::CREATED, Json(serde_json::json!({ "id": doc.id }))).into_response(),
-        Err(e) => (StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
 
@@ -848,7 +1186,7 @@ async fn auth_login(
     };
     let map = match body.as_object() {
         Some(m) => m,
-        None => return (StatusCode::BAD_REQUEST, "JSON object body required").into_response(),
+        None => return err(StatusCode::BAD_REQUEST, "JSON object body required"),
     };
     let owned: HashMap<String, serde_json::Value> = map.clone().into_iter().collect();
     let login = str_field(&owned, &["login", "id", "email", "username"]);
@@ -863,10 +1201,10 @@ async fn auth_login(
                     (StatusCode::OK, headers, Json(serde_json::json!({ "uid": ctx.uid, "roles": ctx.roles }))).into_response()
                 }
                 // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
-                Err(_) => (StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
+                Err(_) => err(StatusCode::UNAUTHORIZED, "invalid credentials"),
             }
         }
-        _ => (StatusCode::BAD_REQUEST, "login + password required").into_response(),
+        _ => err(StatusCode::BAD_REQUEST, "login + password required"),
     }
 }
 
@@ -887,7 +1225,7 @@ async fn auth_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl Int
             (StatusCode::OK, h, Json(serde_json::json!({ "uid": ctx.uid, "roles": ctx.roles }))).into_response()
         }
         // Reuse/expired/foreign: clear cookies + reject (fail-closed).
-        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(), "invalid session").into_response(),
+        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(), Json(serde_json::json!({ "error": "invalid session" }))).into_response(),
     }
 }
 
@@ -1079,7 +1417,7 @@ async fn sse_handler(
 ) -> Response {
     let collection = match parse_collection_path(&path) {
         PathKind::Collection { collection } if !collection.is_empty() => collection,
-        _ => return (StatusCode::BAD_REQUEST, "SSE only supports collection endpoints").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "SSE only supports collection endpoints"),
     };
     let auth = match bearer(&headers)
         .or_else(|| read_cookie(&headers, ACCESS_COOKIE))
@@ -1090,7 +1428,7 @@ async fn sse_handler(
     };
     let options = match parse_options(&q) {
         Ok(o) => o,
-        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
     let group = matches!(q.get("group").map(|g| g.as_str()), Some("1") | Some("true"));
     let db = s.db.read().await.clone();
@@ -1126,10 +1464,10 @@ async fn sse_handler(
 
 async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
     match s.github.read().await.clone() {
-        None => (StatusCode::BAD_REQUEST, "github oauth is not configured").into_response(),
+        None => err(StatusCode::BAD_REQUEST, "github oauth is not configured"),
         Some(g) => match g.login_url().await {
             Ok(url) => Redirect::to(&url).into_response(),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         },
     }
 }
@@ -1140,16 +1478,16 @@ async fn github_callback(
 ) -> impl IntoResponse {
     let (g, local) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
         (Some(g), Some(l)) => (g, l),
-        _ => return (StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain"),
     };
     let (code, state) = match (q.get("code").cloned(), q.get("state").cloned()) {
         (Some(c), Some(st)) => (c, st),
-        _ => return (StatusCode::BAD_REQUEST, "code + state required").into_response(),
+        _ => return err(StatusCode::BAD_REQUEST, "code + state required"),
     };
     // Obfuscate all failures (bad code, stale state, github down).
     let (uid, email, login) = match g.callback(&code, &state).await {
         Ok(v) => v,
-        Err(_) => return (StatusCode::UNAUTHORIZED, "github verification failed").into_response(),
+        Err(_) => return err(StatusCode::UNAUTHORIZED, "github verification failed"),
     };
     let mut profile = HashMap::new();
     if let Some(l) = login {
@@ -1162,7 +1500,7 @@ async fn github_callback(
             h.insert(header::LOCATION, g.after_login().parse().unwrap());
             (StatusCode::FOUND, h).into_response()
         }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -1212,12 +1550,86 @@ mod tests {
     }
 
     #[test]
-    fn skema_base_uri_mengikuti_tls() {
-        let mut h = HeaderMap::new();
+    fn schema_base_uri_follows_tls() {        let mut h = HeaderMap::new();
         h.insert(header::HOST, "api.x.id:8080".parse().unwrap());
         assert_eq!(base_uri(false, &h, "/api/auth/login"), "http://api.x.id:8080/api/auth/login");
         assert_eq!(base_uri(true, &h, "/api/auth/login"), "https://api.x.id:8080/api/auth/login");
         // Missing Host → "unknown" (fail-closed in htu verification).
         assert_eq!(base_uri(true, &HeaderMap::new(), "/x"), "https://unknown/x");
+    }
+
+    #[test]
+    fn op_method_mapping() {
+        use Method::*;
+        assert_eq!(op_method("get", false, false), Get);
+        assert_eq!(op_method("delete", true, true), Delete);
+        assert_eq!(op_method("update", true, false), Update);
+        assert_eq!(op_method("set", false, false), Create);
+        assert_eq!(op_method("set", true, false), Update);
+        assert_eq!(op_method("add", false, false), Create);
+        assert_eq!(op_method("bogus", true, true), Update);
+        assert_eq!(op_method("bogus", false, true), Create);
+        assert_eq!(op_method("bogus", true, false), Create);
+    }
+
+    fn batch_op(t: &str, collection: &str, id: &str, data: serde_json::Value) -> BatchOpBody {
+        BatchOpBody {
+            op_type: t.into(),
+            collection: collection.into(),
+            id: Some(id.into()),
+            data: Some(data),
+            options: None,
+        }
+    }
+
+    /// Batch shapes + atomicity on sqlite: set/add/update/delete roundtrip,
+    /// unknown-type-as-create, and must_exist abort rolling everything back.
+    #[tokio::test]
+    async fn batch_end_to_end_sqlite() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_batch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let d = |age: i64| serde_json::json!({"age": age});
+
+        let res = run_ops(
+            &db,
+            &policy,
+            None,
+            vec![
+                batch_op("set", "w", "a", d(1)),
+                batch_op("add", "w", "b", d(2)),
+                batch_op("bogus", "w", "c", d(3)),
+                batch_op("get", "w", "a", d(0)),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.len(), 4);
+        assert!(res.iter().all(|r| r.get("success") == Some(&serde_json::json!(true))));
+        assert_eq!(res[0].get("id"), Some(&serde_json::json!("a")));
+
+        // must_exist failure aborts the whole batch (d is untouched).
+        let bad = run_ops(
+            &db,
+            &policy,
+            None,
+            vec![batch_op("set", "w", "d", d(4)), batch_op("update", "w", "ghost", d(5))],
+            false,
+        )
+        .await;
+        assert!(bad.is_err());
+        assert!(db.get("w", "d").await.unwrap().is_none());
+
+        // Transaction shapes: get → doc, writes → {success}.
+        let res = run_ops(&db, &policy, None, vec![batch_op("get", "w", "a", d(0))], true)
+            .await
+            .unwrap();
+        assert_eq!(res[0].get("age"), Some(&serde_json::json!(1)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -361,6 +361,66 @@ impl Database for HakoDb {
     async fn drop_index(&self, _collection: &str, _name: &str) -> Result<(), AppError> {
         Err(AppError::BadRequest("hako driver has no drop-index API".into()))
     }
+
+    async fn run_transaction(&self, ops: Vec<hakobackend_core::TxOp>) -> Result<Vec<hakobackend_core::TxOut>, AppError> {
+        use hakobackend_core::{TxOpKind, TxOut};
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut tx = db.begin_serializable_transaction();
+            let mut out = Vec::with_capacity(ops.len());
+            // Overlay of this batch's own writes: staged puts are invisible
+            // to tx.get (it reads committed state), but later ops in the
+            // same batch must observe earlier ones (legacy parity).
+            let mut staged: std::collections::HashMap<(String, String), Option<Doc>> =
+                std::collections::HashMap::new();
+            let read = |tx: &mut hakodb::engine::SerializableTransaction,
+                        db: &Arc<hakodb::Hako>,
+                        staged: &std::collections::HashMap<(String, String), Option<Doc>>,
+                        collection: &str,
+                        id: &str| {
+                if let Some(hit) = staged.get(&(collection.to_string(), id.to_string())) {
+                    return Ok::<_, AppError>(hit.clone());
+                }
+                tx.get(db, collection, id)
+                    .map_err(|e| AppError::Internal(e.to_string()))
+                    .map(|h| h.map(|d| HakoDb::to_doc(id.to_string(), d)))
+            };
+            for op in ops {
+                let key = (op.collection.clone(), op.id.clone());
+                match op.kind {
+                    TxOpKind::Read => {
+                        let doc = read(&mut tx, &db, &staged, &op.collection, &op.id)?;
+                        out.push(TxOut { existed: doc.is_some(), doc });
+                    }
+                    TxOpKind::Put { merge, must_exist } => {
+                        let old = read(&mut tx, &db, &staged, &op.collection, &op.id)?;
+                        if must_exist && old.is_none() {
+                            return Err(AppError::NotFound);
+                        }
+                        let body = op.doc.map(|d| d.data).unwrap_or_default();
+                        let existed = old.is_some();
+                        let mut data =
+                            if merge { old.map(|d| d.data).unwrap_or_default() } else { Default::default() };
+                        data.extend(body);
+                        let doc = Doc { id: op.id.clone(), data };
+                        tx.put(&op.collection, &op.id, Self::to_hako(&doc));
+                        staged.insert(key, Some(doc.clone()));
+                        out.push(TxOut { existed, doc: Some(doc) });
+                    }
+                    TxOpKind::Delete => {
+                        let old = read(&mut tx, &db, &staged, &op.collection, &op.id)?;
+                        tx.delete(&op.collection, &op.id);
+                        staged.insert(key, None);
+                        out.push(TxOut { existed: old.is_some(), doc: old });
+                    }
+                }
+            }
+            tx.commit(&db).map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(out)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
 }
 
 fn uuid_like() -> String {

@@ -44,6 +44,7 @@ path = "postgres://user:pass@host/db"
 | `get` missing document | `Ok(None)`, not an error |
 | `list` filter/order/limit | **identical** semantics (§5) on every driver |
 | `subscribe` | return a receiver; where the engine has no push, return an empty channel and set `watch=false` so core polls |
+| `run_transaction` | **atomic**: all ops apply or none do; reads inside observe the batch's own writes; `Put.must_exist` on a missing doc aborts with `NotFound` |
 
 ## 4. Mandatory conformance
 
