@@ -1,0 +1,11 @@
+[package]
+name = "ub-db-hako"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ub-core = { path = "../ub-core" }
+hakodb = { path = "../../../hakodb" }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

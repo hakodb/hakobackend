@@ -1,0 +1,16 @@
+[package]
+name = "ub-auth-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ub-core = { path = "../ub-core" }
+ub-policy = { path = "../ub-policy" }
+ub-auth-firebase = { path = "../ub-auth-firebase" }
+ub-auth-github = { path = "../ub-auth-github" }
+ub-auth-oidc = { path = "../ub-auth-oidc" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }

@@ -1,0 +1,23 @@
+# Manifest addon driver HakoDB (lihat DRIVER_CONTRACT.md).
+[driver]
+name = "hako"
+version = "0.1.0"
+ub_core = "0.1"
+description = "Embedded document DB (crate hakodb) — driver default, nol-setup"
+
+[capabilities]
+watch = true
+transactions = true
+composite = true
+fts = true
+# drop_index = false: tanpa API hapus index (tolak jelas)
+# unique = false: tanpa constraint unik (tolak jelas)
+# named = false: nama custom diabaikan, selalu auto (didokumentasikan)
+
+[config]
+# path = file database; contoh: path = "./data/hako.ub"
+path = "./data/hako.ub"
+
+[notes]
+sync_api = "HakoDB sinkron; adapter memakai spawn_blocking (lihat src/lib.rs)"
+cursor = "Cursor native bekerja pada sorted KEYS + full-scan mendorong limit sebelum sort manual (planner.rs:286) — keduanya tak cocok kontrak. Adapter emulasi cursor+offset+limit via helper kontrak bila ada cursor ATAU order_by (biaya full-scan); limit/offset native hanya untuk list tanpa order"

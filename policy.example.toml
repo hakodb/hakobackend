@@ -1,0 +1,24 @@
+# policy.toml — aturan endpoint. EDIT SAAT SERVER JALAN, langsung berlaku.
+# Nilai rule: public | auth | owner | deny | role:<nama>
+# Slot per koleksi: get list create update delete (opsional), fallback read/write,
+# fallback terakhir [defaults]. Typo = deny (fail-closed).
+# Slot `owner` menilai field owner_field (default ownerId, fallback uid).
+
+[defaults]
+read = "public"
+write = "deny"
+
+[collections.posts]
+read = "public"
+create = "auth"
+update = "auth"
+delete = "role:maintainer"
+
+[collections.profiles]
+read = "owner"
+write = "owner"
+owner_field = "ownerId"
+
+[collections.ai_configs]
+read = "role:admin"
+write = "role:admin"

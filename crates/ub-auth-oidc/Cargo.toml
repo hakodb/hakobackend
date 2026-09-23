@@ -1,0 +1,12 @@
+[package]
+name = "ub-auth-oidc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ub-core = { path = "../ub-core" }
+async-trait = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

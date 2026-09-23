@@ -1,0 +1,21 @@
+[package]
+name = "ub-auth-local"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ub-core = { path = "../ub-core" }
+ub-policy = { path = "../ub-policy" }
+async-trait = { workspace = true }
+argon2 = { workspace = true }
+serde = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+rsa = "0.9"
+signature = "2"
