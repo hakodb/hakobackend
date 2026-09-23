@@ -15,6 +15,55 @@ use hakobackend_policy::PolicyFile;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
+/// One poller task per (db, collection), shared by all polling
+/// subscriptions: a single `list` per tick no matter how many watchers.
+/// Registry entry; the task prunes itself once the last receiver is gone.
+static POLLERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, tokio::sync::broadcast::Sender<Vec<Doc>>>>> =
+    std::sync::OnceLock::new();
+
+/// Subscribe to the shared poller for one collection, spawning it on first
+/// use. Each tick carries the FULL doc list (unfiltered — subscribers apply
+/// their own filters when diffing), so a missed tick self-heals on the next.
+async fn shared_poll_stream(
+    db: Arc<dyn Database>,
+    collection: &str,
+) -> tokio::sync::broadcast::Receiver<Vec<Doc>> {
+    let key = format!("{:p}/{collection}", Arc::as_ptr(&db));
+    {
+        let reg = POLLERS.get_or_init(Default::default).lock().unwrap();
+        if let Some(tx) = reg.get(&key) {
+            if tx.receiver_count() > 0 {
+                return tx.subscribe();
+            }
+        }
+    }
+    let (tx, rx0) = tokio::sync::broadcast::channel(4);
+    let txc = tx.clone();
+    let dbc = db.clone();
+    let coll = collection.to_string();
+    let keyc = key.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(POLL_INTERVAL);
+        loop {
+            tick.tick().await;
+            if txc.receiver_count() == 0 {
+                if let Some(reg) = POLLERS.get() {
+                    reg.lock().unwrap().remove(&keyc);
+                }
+                return;
+            }
+            let docs = dbc.list(&coll, &QueryOptions::default()).await.unwrap_or_default();
+            let _ = txc.send(docs);
+        }
+    });
+    POLLERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(key, tx);
+    rx0
+}
+
 /// Polling interval for drivers without watch (single-instance; Redis fan-out follows).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Subscription limit per WS connection (legacy backend parity).
@@ -178,42 +227,62 @@ async fn run_source(
             }
         }
     } else {
-        let snap_q = snapshot_options(&options);
-        let mut tick = tokio::time::interval(POLL_INTERVAL);
+        // Shared pollers (one list per collection per tick) merged back
+        // into per-subscription diffs: N watchers cost 1 list, not N.
+        use tokio_stream::StreamMap;
+        let mut map = StreamMap::new();
+        for coll in &collections {
+            map.insert(coll.clone(), BroadcastStream::new(shared_poll_stream(db.clone(), coll).await));
+        }
         loop {
-            tick.tick().await;
-            let mut fresh: HashMap<String, Doc> = HashMap::new();
-            for coll in &collections {
-                if let Ok(docs) = db.list(coll, &snap_q).await {
+            match map.next().await {
+                Some((coll, Ok(docs))) => {
+                    let mut fresh: HashMap<String, Doc> = HashMap::new();
                     for doc in docs {
                         fresh.insert(format!("{coll}\0{}", doc.id), doc);
                     }
+                    apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, fresh, &tx).await;
                 }
+                // Lagged tick: skipped on purpose — the next tick carries
+                // the full state, so the diff below self-heals.
+                Some((_, Err(_))) => {}
+                None => return,
             }
-            // Diff: adds/changes + removals.
-            for (key, doc) in &fresh {
-                let coll = key.split('\0').next().unwrap_or("");
-                let old = snapshot.get(key);
-                let old_match = old.map(|d| matches_full(d, &options)).unwrap_or(false);
-                let new_match = matches_full(doc, &options);
-                if old.map(|d| &d.data) != Some(&doc.data) || !old_match || !new_match {
-                    deliver_in(&policy, auth.as_ref(), coll, old, Some(doc), old_match, new_match, &tx).await;
-                }
-            }
-            for (key, old) in &snapshot {
-                if !fresh.contains_key(key) {
-                    let coll = key.split('\0').next().unwrap_or("");
-                    if matches_full(old, &options) {
-                        deliver_in(&policy, auth.as_ref(), coll, Some(old), None, true, false, &tx).await;
-                    }
-                }
-            }
-            snapshot = fresh;
             if tx.is_closed() {
                 return;
             }
         }
     }
+}
+
+/// Diff a fresh full-state list against the subscription snapshot,
+/// delivering Add/Change/Remove per the subscription's own filters.
+async fn apply_diff(
+    policy: &PolicyFile,
+    auth: Option<&AuthContext>,
+    options: &QueryOptions,
+    snapshot: &mut HashMap<String, Doc>,
+    fresh: HashMap<String, Doc>,
+    tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
+) {
+    for (key, doc) in &fresh {
+        let coll = key.split('\0').next().unwrap_or("");
+        let old = snapshot.get(key);
+        let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
+        let new_match = matches_full(doc, options);
+        if old.map(|d| &d.data) != Some(&doc.data) || !old_match || !new_match {
+            deliver_in(policy, auth, coll, old, Some(doc), old_match, new_match, tx).await;
+        }
+    }
+    for (key, old) in snapshot.iter() {
+        if !fresh.contains_key(key) {
+            let coll = key.split('\0').next().unwrap_or("");
+            if matches_full(old, options) {
+                deliver_in(policy, auth, coll, Some(old), None, true, false, tx).await;
+            }
+        }
+    }
+    *snapshot = fresh;
 }
 
 /// Apply one watch change to the snapshot + send on match.
@@ -315,8 +384,7 @@ mod tests {
     /// from the server snapshot, never from the bridge kind); a delete
     /// emits `Remove`.
     #[tokio::test]
-    async fn watch_end_to_end_add_then_remove() {
-        use hakobackend_db_hako::HakoDb;
+    async fn watch_end_to_end_add_then_remove() {        use hakobackend_db_hako::HakoDb;
         let dir = std::env::temp_dir().join(format!("hakobackend_rte_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let db: Arc<dyn Database> =
@@ -331,21 +399,59 @@ mod tests {
         .await
         .unwrap();
 
-        db.set("rt", "a", Doc { id: "a".into(), data: Default::default() }, false)
-            .await
-            .unwrap();
-        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), sub.rx.recv())
-            .await
-            .expect("watch delivers the put")
-            .unwrap();
-        assert_eq!(ev.kind, ChangeKind::Add);
+        // Watch has no backlog: a put that lands before the bridge thread
+        // starts listening is lost. Retry with fresh ids until one lands,
+        // then delete that same id.
+        let mut landed: Option<String> = None;
+        for i in 0..8 {
+            let id = if i == 0 { "a".to_string() } else { format!("a{i}") };
+            db.set("rt", &id, Doc { id: id.clone(), data: Default::default() }, false)
+                .await
+                .unwrap();
+            if let Ok(got) = tokio::time::timeout(std::time::Duration::from_secs(1), sub.rx.recv()).await {
+                let ev = got.unwrap();
+                assert_eq!(ev.kind, ChangeKind::Add);
+                landed = Some(id);
+                break;
+            }
+        }
+        let landed = landed.expect("watch delivers the put");
 
-        db.delete("rt", "a").await.unwrap();
+        db.delete("rt", &landed).await.unwrap();
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), sub.rx.recv())
             .await
             .expect("watch delivers the delete")
             .unwrap();
         assert_eq!(ev.kind, ChangeKind::Remove);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Polling path through the shared poller (sqlite has no watch): two
+    /// subscriptions on one collection share a single list per tick, and
+    /// both still observe the Add.
+    #[tokio::test]
+    async fn poll_shared_two_subscribers_one_list() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_poll_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let mut s1 = subscribe(db.clone(), policy.clone(), None, spec.clone()).await.unwrap();
+        let mut s2 = subscribe(db.clone(), policy, None, spec).await.unwrap();
+
+        db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        for rx in [&mut s1.rx, &mut s2.rx] {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("shared poller delivers to every subscriber")
+                .unwrap();
+            assert_eq!(ev.kind, ChangeKind::Add);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

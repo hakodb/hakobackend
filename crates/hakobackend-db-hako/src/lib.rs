@@ -443,19 +443,27 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
 
         let mut rx2 = db.subscribe("events").await.unwrap();
-        db.set(
-            "events",
-            "a",
-            hakobackend_core::Doc { id: "a".into(), data: Default::default() },
-            false,
-        )
-        .await
-        .unwrap();
-        let change = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+        // Watch has no backlog: retry with fresh ids until a put lands
+        // after the respawned bridge starts listening.
+        let mut landed: Option<hakobackend_core::Change> = None;
+        for i in 0..8 {
+            let id = if i == 0 { "a".to_string() } else { format!("a{i}") };
+            db.set(
+                "events",
+                &id,
+                hakobackend_core::Doc { id: id.clone(), data: Default::default() },
+                false,
+            )
             .await
-            .expect("respawned bridge delivers")
             .unwrap();
-        assert_eq!(change.id, "a");
+            if let Ok(got) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), rx2.recv()).await
+            {
+                landed = Some(got.unwrap());
+                break;
+            }
+        }
+        let change = landed.expect("respawned bridge delivers");
         assert_eq!(change.kind, hakobackend_core::ChangeKind::Change);
         let _ = std::fs::remove_dir_all(&dir);
     }
