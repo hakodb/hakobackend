@@ -68,6 +68,12 @@ async fn shared_poll_stream(
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Subscription limit per WS connection (legacy backend parity).
 pub const MAX_SUBS_PER_SOCKET: usize = 100;
+/// Snapshot guard: a filtered universe bigger than this is rejected so one
+/// greedy subscription can't OOM the server (narrow with filters instead).
+pub const MAX_SNAPSHOT_DOCS: usize = 5000;
+/// Fan-out guard: deliveries per subscription per second; overflow resyncs
+/// the snapshot instead of queueing unboundedly.
+pub const MAX_EVENTS_PER_SEC: u64 = 200;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubSpec {
@@ -130,6 +136,44 @@ fn snapshot_options(q: &QueryOptions) -> QueryOptions {
     QueryOptions { filters: q.filters.clone(), ..Default::default() }
 }
 
+/// Flood guard: counts deliveries per 1 s window; when the cap trips the
+/// caller resyncs the snapshot (drop the burst, keep consistency).
+struct RateGate {
+    window: tokio::time::Instant,
+    count: u64,
+}
+
+impl RateGate {
+    fn new() -> Self {
+        Self { window: tokio::time::Instant::now(), count: 0 }
+    }
+
+    fn observe(&mut self, n: u64) -> bool {
+        let now = tokio::time::Instant::now();
+        if now.duration_since(self.window) >= Duration::from_secs(1) {
+            self.window = now;
+            self.count = 0;
+        }
+        self.count += n;
+        self.count > MAX_EVENTS_PER_SEC
+    }
+}
+
+/// Re-list one collection into the snapshot (lag/flood recovery).
+async fn resync_collection(
+    db: &Arc<dyn Database>,
+    snap_q: &QueryOptions,
+    snapshot: &mut HashMap<String, Doc>,
+    coll: &str,
+) {
+    if let Ok(docs) = db.list(coll, snap_q).await {
+        let prefix = format!("{coll}\0");
+        snapshot.retain(|k, _| !k.starts_with(&prefix));
+        for doc in docs {
+            snapshot.insert(format!("{coll}\0{}", doc.id), doc);
+        }
+    }
+}
 /// Transition classification (legacy changeHandler parity): (old_match, new_match).
 fn transition(old_match: bool, new_match: bool) -> Option<ChangeKind> {
     match (old_match, new_match) {
@@ -168,6 +212,11 @@ pub async fn subscribe(
             snapshot.insert(format!("{coll}\0{}", doc.id), doc);
         }
     }
+    if snapshot.len() > MAX_SNAPSHOT_DOCS {
+        return Err(AppError::BadRequest(
+            "collection too large for realtime: narrow with filters".into(),
+        ));
+    }
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let watch = db.capabilities().supports_watch;
@@ -201,23 +250,21 @@ async fn run_source(
             return;
         }
         let snap_q = snapshot_options(&options);
+        let mut gate = RateGate::new();
         loop {
             match map.next().await {
                 // (collection, Ok(change)): normal path.
                 Some((coll, Ok(change))) => {
-                    ingest_change(&policy, auth.as_ref(), &options, &mut snapshot, &coll, change, &tx).await;
-                }
-                // Lagged: we missed broadcasts; re-list this collection so
-                // the snapshot (and future transitions) resync instead of
-                // silently diverging.
-                Some((coll, Err(_))) => {
-                    if let Ok(docs) = db.list(&coll, &snap_q).await {
-                        let prefix = format!("{coll}\0");
-                        snapshot.retain(|k, _| !k.starts_with(&prefix));
-                        for doc in docs {
-                            snapshot.insert(format!("{coll}\0{}", doc.id), doc);
-                        }
+                    let sent =
+                        ingest_change(&policy, auth.as_ref(), &options, &mut snapshot, &coll, change, &tx).await;
+                    // Flood: drop the burst, resync, keep consistency.
+                    if sent && gate.observe(1) {
+                        resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
                     }
+                }
+                // Lagged: we missed broadcasts; resync instead of drifting.
+                Some((coll, Err(_))) => {
+                    resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
                 }
                 // All streams closed (bridges torn down): nothing left to hear.
                 None => return,
@@ -230,6 +277,7 @@ async fn run_source(
         // Shared pollers (one list per collection per tick) merged back
         // into per-subscription diffs: N watchers cost 1 list, not N.
         use tokio_stream::StreamMap;
+        let mut gate = RateGate::new();
         let mut map = StreamMap::new();
         for coll in &collections {
             map.insert(coll.clone(), BroadcastStream::new(shared_poll_stream(db.clone(), coll).await));
@@ -237,11 +285,20 @@ async fn run_source(
         loop {
             match map.next().await {
                 Some((coll, Ok(docs))) => {
-                    let mut fresh: HashMap<String, Doc> = HashMap::new();
-                    for doc in docs {
-                        fresh.insert(format!("{coll}\0{}", doc.id), doc);
+                    let sent =
+                        apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, {
+                            let mut fresh: HashMap<String, Doc> = HashMap::new();
+                            for doc in docs {
+                                fresh.insert(format!("{coll}\0{}", doc.id), doc);
+                            }
+                            fresh
+                        }, &tx)
+                        .await;
+                    // Flood: the next tick carries full state, so just reset
+                    // the window — the diff below already self-heals.
+                    if gate.observe(sent) {
+                        gate = RateGate::new();
                     }
-                    apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, fresh, &tx).await;
                 }
                 // Lagged tick: skipped on purpose — the next tick carries
                 // the full state, so the diff below self-heals.
@@ -257,6 +314,7 @@ async fn run_source(
 
 /// Diff a fresh full-state list against the subscription snapshot,
 /// delivering Add/Change/Remove per the subscription's own filters.
+/// Returns the number of delivered events (for the flood guard).
 async fn apply_diff(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
@@ -264,28 +322,35 @@ async fn apply_diff(
     snapshot: &mut HashMap<String, Doc>,
     fresh: HashMap<String, Doc>,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
-) {
+) -> u64 {
+    let mut sent = 0u64;
     for (key, doc) in &fresh {
         let coll = key.split('\0').next().unwrap_or("");
         let old = snapshot.get(key);
         let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
         let new_match = matches_full(doc, options);
         if old.map(|d| &d.data) != Some(&doc.data) || !old_match || !new_match {
-            deliver_in(policy, auth, coll, old, Some(doc), old_match, new_match, tx).await;
+            if deliver_in(policy, auth, coll, old, Some(doc), old_match, new_match, tx).await {
+                sent += 1;
+            }
         }
     }
     for (key, old) in snapshot.iter() {
         if !fresh.contains_key(key) {
             let coll = key.split('\0').next().unwrap_or("");
             if matches_full(old, options) {
-                deliver_in(policy, auth, coll, Some(old), None, true, false, tx).await;
+                if deliver_in(policy, auth, coll, Some(old), None, true, false, tx).await {
+                    sent += 1;
+                }
             }
         }
     }
     *snapshot = fresh;
+    sent
 }
 
 /// Apply one watch change to the snapshot + send on match.
+/// Returns true when an event was actually delivered.
 async fn ingest_change(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
@@ -294,30 +359,35 @@ async fn ingest_change(
     collection: &str,
     change: hakobackend_core::Change,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
-) {
+) -> bool {
     // Snapshot key includes the collection (multi-collection groups safe).
     let key = format!("{collection}\0{}", change.id);
     match change.kind {
         ChangeKind::Remove => {
             if let Some(old) = snapshot.remove(&key) {
                 if matches_full(&old, options) {
-                    deliver_in(policy, auth, collection, Some(&old), None, true, false, tx).await;
+                    return deliver_in(policy, auth, collection, Some(&old), None, true, false, tx).await;
                 }
             }
+            false
         }
         ChangeKind::Add | ChangeKind::Change => {
             if let Some(doc) = change.new {
                 let old = snapshot.get(&key);
                 let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
                 let new_match = matches_full(&doc, options);
-                deliver_in(policy, auth, collection, old, Some(&doc), old_match, new_match, tx).await;
+                let sent =
+                    deliver_in(policy, auth, collection, old, Some(&doc), old_match, new_match, tx).await;
                 snapshot.insert(key, doc);
+                return sent;
             }
+            false
         }
     }
 }
 
 /// Collection-aware deliver wrapper (for hierarchical rule resolution).
+/// Returns true when the event reached the subscriber.
 pub async fn deliver_in(
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
@@ -327,18 +397,18 @@ pub async fn deliver_in(
     old_match: bool,
     new_match: bool,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
-) {
+) -> bool {
     let Some(kind) = transition(old_match, new_match) else {
-        return;
+        return false;
     };
     let doc = match kind {
         ChangeKind::Add | ChangeKind::Change => new,
         ChangeKind::Remove => old,
     };
     if !policy.allow(auth, collection, Method::Get, doc) {
-        return;
+        return false;
     }
-    let _ = tx.send(OutEvent { kind, doc: doc.cloned() });
+    tx.send(OutEvent { kind, doc: doc.cloned() }).is_ok()
 }
 
 #[cfg(test)]

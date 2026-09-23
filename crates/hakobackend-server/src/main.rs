@@ -232,9 +232,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/ready", get(ready))
         .merge(api)
         .merge(auth_routes)
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        // gzip JSON responses, but never the live streams: compressing
+        // SSE would buffer flushes and add event latency for little gain
+        // (stream frames are already tiny; WS upgrades carry no body).
+        .layer(
+            tower_http::compression::CompressionLayer::new().compress_when(
+                tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+            ),
+        )
         .with_state(state);
     if tls {
         // HSTS only meaningful via TLS (no effect on plain http).
@@ -245,6 +254,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = cfg.listen();
+    // Graceful drain on Ctrl+C / SIGTERM: in-flight requests finish, then
+    // sockets close. Subscriptions abort with their tasks (client resubscribes).
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("[ub] shutdown: draining connections");
+    };
     // ConnectInfo required so the rate-limit key = real peer IP.
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     if tls {
@@ -256,13 +271,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("[ub] TLS failed to load: {e}"))?;
         println!("[ub] listening (TLS) on https://{addr}");
+        let handle = axum_server::Handle::new();
+        let drain = handle.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            drain.graceful_shutdown(None);
+        });
         axum_server::bind_rustls(addr.parse().map_err(|e| format!("[ub] invalid listen address: {e}"))?, rustls)
+            .handle(handle)
             .serve(svc)
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!("[ub] listening on http://{addr}");
-        axum::serve(listener, svc).await?;
+        axum::serve(listener, svc).with_graceful_shutdown(shutdown).await?;
     }
     Ok(())
 }
@@ -491,6 +513,14 @@ fn err_code(status: StatusCode, msg: impl ToString, code: &str) -> Response {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "db": "hakodb" }))
+}
+
+/// Readiness (LBs/K8s): the driver answers, not just the socket.
+async fn ready(State(s): State<AppState>) -> impl IntoResponse {
+    match s.db.read().await.list_collections().await {
+        Ok(_) => Json(serde_json::json!({ "ready": true })).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
 }
 
 /// Re-read config + driver + auth chain. "Hot-swap while running":

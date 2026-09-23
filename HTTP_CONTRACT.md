@@ -14,6 +14,7 @@ must produce exactly the same behavior.
 |---|---|---|---|
 | `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
 | `GET /api/collections` | — (ungated) | `list_collections` | 200 |
+| `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
@@ -102,6 +103,8 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
   `?token=` fallback (lands in the URL — TLS only).
 - Delivery semantics = snapshot + full filter/cursor (legacy changeHandler parity);
   `List` gate at subscribe, `Get` per document. No initial burst (clients GET first).
+- Realtime guards: snapshot capped at 5.000 docs (400 with a narrow-with-filters
+  hint past it); deliveries capped at 200/sub/sec (overflow resyncs, never queues).
 - Watch drivers (HakoDB) = push with lagged resync; others = shared poller
   (one list per collection per 2 s tick no matter the watcher count;
   single-instance; Redis fan-out for multi-instance to follow). Groups: `/name` suffix or `_name`.
@@ -112,3 +115,10 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
 (`max-age=31536000; includeSubDomains`). DPoP `htu` scheme + `Secure` cookies
 follow automatically. Neither = plain http. Port/listen changes need a restart
 (reload covers DB/auth/policy/limits/indexes, not sockets).
+
+## 9. Performance posture
+
+- JSON responses are gzip-compressed, except the live streams (`/api/stream`,
+  `/ws` — compression would buffer flushes and add event latency).
+- Ctrl+C / SIGTERM drains in-flight requests before sockets close
+  (TLS and plain paths alike); subscriptions abort with their tasks.
