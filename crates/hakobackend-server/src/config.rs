@@ -18,7 +18,7 @@ pub struct Args {
     /// Database driver (see KNOWN_DRIVERS).
     #[arg(long)]
     pub driver: Option<String>,
-    /// File path (hako/sqlite) or DSN (postgres/mysql/rethink).
+    /// File path (hako/sqlite) or DSN (postgres/mysql).
     #[arg(long)]
     pub data: Option<String>,
     /// Endpoint rules file (TOML, hot-reload).
