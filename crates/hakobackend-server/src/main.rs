@@ -206,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let global = LimitScope { limiter: limits.global.clone(), trust_proxy: limits.trust_proxy };
     let strict = LimitScope { limiter: limits.auth.clone(), trust_proxy: limits.trust_proxy };
     let api = Router::new()
-        .route("/api/collections", get(list_collections))
+        .route("/api/collections", get(list_collections).post(create_collection))
         .route(
             "/api/collections/{*path}",
             get(get_or_list).post(create).put(put).patch(patch).delete(remove),
@@ -594,6 +594,32 @@ async fn list_collections(
                 .collect();
             Json(serde_json::to_value(out).unwrap()).into_response()
         }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+/// Explicit collection creation (legacy `POST /api/collections {name}`).
+/// Gated Create; drivers create lazily anyway, so this is a checked no-op
+/// that fails closed instead of 405.
+async fn create_collection(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return err(StatusCode::BAD_REQUEST, "body requires {name}"),
+    };
+    if denied_internal(&name).is_some() {
+        return err(StatusCode::FORBIDDEN, "internal collection");
+    }
+    let policy = s.policy.get().await;
+    if !policy.allow(auth.as_ref(), &name, Method::Create, None) {
+        return forbidden();
+    }
+    let tenant = caller_tenant(auth.as_ref());
+    match s.db.read().await.ensure_collection(&stored(tenant.as_deref(), &name)).await {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
