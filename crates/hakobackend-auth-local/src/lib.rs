@@ -189,6 +189,27 @@ impl LocalAuth {
         if self.db.get(self.users(), &id).await.map_err(internal)?.is_some() {
             return Err(AppError::AlreadyExists);
         }
+        // Email must be unique: login accepts id-or-email and errors on
+        // ambiguity, so a second account on the same email would lock the
+        // victim out of email login. Fail-closed at registration.
+        if let Some(e) = email.clone().filter(|s| !s.is_empty()) {
+            let mut q = hakobackend_core::QueryOptions::default();
+            q.filters.push(hakobackend_core::Filter {
+                field: "email".into(),
+                op: hakobackend_core::FilterOp::Eq,
+                value: serde_json::Value::String(e),
+            });
+            let clash = self
+                .db
+                .list(self.users(), &q)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .any(|d| d.id != id);
+            if clash {
+                return Err(AppError::AlreadyExists);
+            }
+        }
         let hash = hash_password(password.to_string()).await?;
         let mut data = profile;
         data.remove(PASSWORD_FIELD);

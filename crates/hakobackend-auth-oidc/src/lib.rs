@@ -30,7 +30,11 @@ impl OidcVerifier {
     pub fn from_env() -> Result<Arc<dyn AuthProvider>, String> {
         let issuer = std::env::var("UB_OIDC_ISSUER")
             .map_err(|_| "auth oidc requires env UB_OIDC_ISSUER".to_string())?;
-        let audience = std::env::var("UB_OIDC_AUDIENCE").ok();
+        // Audience is mandatory: without it a token minted for another
+        // client on the same issuer would verify here (cross-client replay).
+        let audience = std::env::var("UB_OIDC_AUDIENCE")
+            .map_err(|_| "auth oidc requires env UB_OIDC_AUDIENCE".to_string())
+            .map(Some)?;
         let jwks_url = std::env::var("UB_OIDC_JWKS_URL").ok();
         Ok(Self::with_config(issuer, audience, jwks_url))
     }

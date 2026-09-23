@@ -89,6 +89,19 @@ fn jpath(field: &str) -> String {
     format!("json_extract(data, '$.{}')", segs.join("."))
 }
 
+/// Bare path string for `json_each(data, '<path>')`: segments backslash-
+/// escaped per JSON-path syntax. Single-quote doubling applies to the INNER
+/// path only — never to the wrapping delimiters (double-escaping them
+/// corrupts the literal into `'$."tags"'` with stray quotes).
+fn jpath_str(field: &str) -> String {
+    let segs: Vec<String> = field
+        .split('.')
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    let inner = format!("$.{}", segs.join(".")).replace('\'', "''");
+    format!("'{inner}'")
+}
+
 /// Bound param: number→REAL, string→TEXT, bool→INTEGER, null→special IS NULL.
 enum P {
     F(f64),
@@ -177,7 +190,7 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
             let Some(p) = to_param(&f.value) else {
                 return Err(AppError::BadRequest("array-contains needs a scalar".into()));
             };
-            sql.push_str(&format!("EXISTS (SELECT 1 FROM json_each(data, '$.{field}') WHERE value = ?)", field = f.field.replace('\'', "''")));
+            sql.push_str(&format!("EXISTS (SELECT 1 FROM json_each(data, {}) WHERE value = ?)", jpath_str(&f.field)));
             params.push(p);
         }
         FilterOp::ArrayContainsAny => {
@@ -191,7 +204,7 @@ fn push_filter(sql: &mut String, f: &Filter, params: &mut Vec<P>) -> Result<(), 
                 let Some(p) = to_param(v) else {
                     return Err(AppError::BadRequest("array-contains-any needs scalars".into()));
                 };
-                parts.push(format!("EXISTS (SELECT 1 FROM json_each(data, '$.{field}') WHERE value = ?)", field = f.field.replace('\'', "''")));
+                parts.push(format!("EXISTS (SELECT 1 FROM json_each(data, {}) WHERE value = ?)", jpath_str(&f.field)));
                 params.push(p);
             }
             sql.push_str(&format!("({})", parts.join(" OR ")));
@@ -798,6 +811,15 @@ impl Database for SqliteDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpath_str_quotes_once() {
+        // Delimiters stay single; hostile content is escaped inside.
+        assert_eq!(jpath_str("tags"), "'$.\"tags\"'");
+        assert_eq!(jpath_str("a.b"), "'$.\"a\".\"b\"'");
+        assert_eq!(jpath_str("o'clock"), "'$.\"o''clock\"'");
+        assert_eq!(jpath_str("a\\b\"c"), "'$.\"a\\\\b\\\"c\"'");
+    }
 
     fn filter(field: &str, op: FilterOp, value: serde_json::Value) -> Filter {
         Filter { field: field.into(), op, value }

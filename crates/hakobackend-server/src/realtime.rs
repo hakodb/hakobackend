@@ -74,6 +74,13 @@ pub const MAX_SNAPSHOT_DOCS: usize = 5000;
 /// Fan-out guard: deliveries per subscription per second; overflow resyncs
 /// the snapshot instead of queueing unboundedly.
 pub const MAX_EVENTS_PER_SEC: u64 = 200;
+/// Subscription budget per WS connection: 100 subs × 5000-doc snapshots
+/// would be ~500k docs on one socket without this.
+pub const MAX_CONN_SNAPSHOT_DOCS: usize = 20_000;
+/// Batch/transaction op cap (cloudserver parity: batch ≤ 1000).
+pub const MAX_BATCH_OPS: usize = 1000;
+/// Aggregate reduce guard: sum/avg list into RAM — refuse past this.
+pub const MAX_AGG_SCAN_DOCS: u64 = 50_000;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubSpec {
@@ -113,6 +120,8 @@ impl OutEvent {
 pub struct Subscription {
     pub rx: tokio::sync::mpsc::UnboundedReceiver<OutEvent>,
     handle: tokio::task::JoinHandle<()>,
+    /// Snapshot size at subscribe time (per-connection budgeting).
+    pub snapshot_docs: usize,
 }
 
 impl Drop for Subscription {
@@ -240,10 +249,11 @@ pub async fn subscribe(
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let watch = db.capabilities().supports_watch;
+    let snapshot_docs = snapshot.len();
     let handle = tokio::spawn(run_source(
         db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx,
     ));
-    Ok(Subscription { rx, handle })
+    Ok(Subscription { rx, handle, snapshot_docs })
 }
 
 #[allow(clippy::too_many_arguments)]

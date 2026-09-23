@@ -108,9 +108,13 @@ fn qi(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-/// JSON path: "a.b" → `$."a"."b"`.
+/// JSON path: "a.b" → `$."a"."b"`. Backslashes escaped first so a
+/// hostile field can't smuggle path escapes (`\"` collapsing).
 fn jpath(field: &str) -> String {
-    let segs: Vec<String> = field.split('.').map(|s| format!("\"{}\"", s.replace('"', "\\\""))).collect();
+    let segs: Vec<String> = field
+        .split('.')
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
     format!("$.{}", segs.join("."))
 }
 

@@ -119,6 +119,11 @@ impl GithubOAuth {
         let token_url = std::env::var("UB_GITHUB_TOKEN_URL").unwrap_or_else(|_| GITHUB_TOKEN.into());
         let authorize_url = std::env::var("UB_GITHUB_AUTHORIZE_URL").unwrap_or_else(|_| GITHUB_AUTHORIZE.into());
         let after_login = std::env::var("UB_GITHUB_AFTER_LOGIN").unwrap_or_else(|_| "/".into());
+        // Open-redirect guard: the post-login landing must be a same-origin
+        // path (`/app`), never `//evil` or a full URL (fail-closed at boot).
+        if !(after_login.starts_with('/') && !after_login.starts_with("//")) {
+            return Err("UB_GITHUB_AFTER_LOGIN must be a same-origin path (e.g. /)".to_string());
+        }
         Ok(Some(Self::new(client_id, secret, public, api_base, token_url, authorize_url, after_login, db)))
     }
 
@@ -152,34 +157,48 @@ impl GithubOAuth {
     }
 
     /// Redirect URL to github.com + store pending state/PKCE (single-use, 10 min).
-    pub async fn login_url(&self) -> Result<String, AppError> {
+    /// Returns (url, browser_nonce): the caller must set the nonce as an
+    /// HttpOnly cookie — the callback requires it back, binding the flow to
+    /// the browser that started it (login-CSRF protection).
+    pub async fn login_url(&self) -> Result<(String, String), AppError> {
         let state = rand_hex(16);
         let verifier = rand_hex(64);
+        let nonce = rand_hex(16);
         let doc = hakobackend_core::Doc {
             id: state.clone(),
             data: [
                 ("provider".to_string(), serde_json::Value::String("github".into())),
                 ("verifier".to_string(), serde_json::Value::String(verifier.clone())),
+                ("nonce".to_string(), serde_json::Value::String(sha_hex(&nonce))),
                 ("created_at".to_string(), serde_json::Value::from(now_secs())),
             ]
             .into_iter()
             .collect(),
         };
         self.db.insert(PENDING_COLLECTION, doc).await.map_err(|_| AppError::Internal("oauth store error".into()))?;
-        Ok(format!(
-            "{}?client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-            self.authorize_url,
-            urlenc(&self.client_id),
-            urlenc(&self.redirect_uri),
-            urlenc("read:user user:email"),
-            urlenc(&state),
-            urlenc(&pkce_challenge(&verifier)),
+        Ok((
+            format!(
+                "{}?client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+                self.authorize_url,
+                urlenc(&self.client_id),
+                urlenc(&self.redirect_uri),
+                urlenc("read:user user:email"),
+                urlenc(&state),
+                urlenc(&pkce_challenge(&verifier)),
+            ),
+            nonce,
         ))
     }
 
     /// Callback result: (namespaced uid, email, github login). Sessions are issued
     /// server-side via `LocalAuth::login_external` (kept separate to avoid a circular crate).
-    pub async fn callback(&self, code: &str, state: &str) -> Result<(String, Option<String>, Option<String>), AppError> {
+    /// `nonce` is the browser cookie from login: mismatch = login CSRF, rejected.
+    pub async fn callback(
+        &self,
+        code: &str,
+        state: &str,
+        nonce: Option<&str>,
+    ) -> Result<(String, Option<String>, Option<String>), AppError> {
         let pending = self.db.get(PENDING_COLLECTION, state).await.map_err(|_| AppError::Internal("oauth store error".into()))?
             .ok_or(AppError::PermissionDenied)?;
         // Single-use + expiry (fail-closed; stale entries discarded).
@@ -190,7 +209,12 @@ impl GithubOAuth {
             .and_then(|v| v.as_u64())
             .is_some_and(|t| t + PENDING_TTL_SECS > now_secs());
         let verifier = pending.data.get("verifier").and_then(|v| v.as_str()).unwrap_or("");
-        if !fresh || verifier.is_empty() || pending.data.get("provider").and_then(|v| v.as_str()) != Some("github") {
+        let nonce_ok = match (pending.data.get("nonce").and_then(|v| v.as_str()), nonce) {
+            (Some(expected), Some(got)) => timing_safe_eq(expected, &sha_hex(got)),
+            // Legacy pending entries (pre-nonce) are rejected, not grandfathered.
+            _ => false,
+        };
+        if !fresh || verifier.is_empty() || !nonce_ok || pending.data.get("provider").and_then(|v| v.as_str()) != Some("github") {
             return Err(AppError::PermissionDenied);
         }
         let token = self.exchange(code, verifier).await?;
@@ -236,6 +260,20 @@ fn pkce_challenge(verifier: &str) -> String {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
     use sha2::{Digest, Sha256};
     B64.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn sha_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))
+}
+
+/// Timing-safe string compare (nonces, hashes — never `==` on secrets).
+fn timing_safe_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Minimal percent-encoding for OAuth queries (no extra crate).
@@ -478,24 +516,28 @@ mod tests {
         let db: Arc<dyn hakobackend_core::Database> = Arc::new(FakeDb { store: std::sync::Mutex::new(HashMap::new()) });
         let h = oauth_handle(&base, db);
 
-        let url = h.login_url().await.unwrap();
+        let (url, nonce) = h.login_url().await.unwrap();
         assert!(url.contains("client_id=cid-123"));
         assert!(url.contains("code_challenge=") && url.contains("code_challenge_method=S256"));
         assert!(url.contains("state="));
         assert!(!url.contains("do-not-leak-secret"), "secret must not leak into URL");
 
-        // Happy-path callback: good code + correct state → identity triple.
-        let (uid, email, login) = h.callback("good-code", &state_of(&url)).await.unwrap();
+        // Happy-path callback: good code + correct state + browser nonce.
+        let (uid, email, login) = h.callback("good-code", &state_of(&url), Some(&nonce)).await.unwrap();
         assert_eq!(uid, "github:7");
         assert_eq!(email, None);
         assert_eq!(login.as_deref(), Some("octocat"));
 
         // Single-use state: retry → rejected.
-        assert!(h.callback("good-code", &state_of(&url)).await.is_err());
+        assert!(h.callback("good-code", &state_of(&url), Some(&nonce)).await.is_err());
         // Unknown state / bad code → rejected.
-        assert!(h.callback("good-code", "state-asing").await.is_err());
-        let url2 = h.login_url().await.unwrap();
-        assert!(h.callback("bad-code", &state_of(&url2)).await.is_err());
+        assert!(h.callback("good-code", "state-asing", Some(&nonce)).await.is_err());
+        // Wrong or missing browser nonce → rejected (login CSRF).
+        let (url3, _) = h.login_url().await.unwrap();
+        assert!(h.callback("good-code", &state_of(&url3), Some("wrong-nonce")).await.is_err());
+        assert!(h.callback("good-code", &state_of(&url3), None).await.is_err());
+        let (url2, nonce2) = h.login_url().await.unwrap();
+        assert!(h.callback("bad-code", &state_of(&url2), Some(&nonce2)).await.is_err());
 
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
@@ -522,7 +564,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(h.callback("good-code", "state-basi").await.is_err());
+        assert!(h.callback("good-code", "state-basi", Some("whatever")).await.is_err());
         stop.store(true, Ordering::SeqCst);
         server.join().unwrap();
     }

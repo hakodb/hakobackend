@@ -245,6 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
             ),
         )
+        // 8 MB bodies (legacy json-limit parity); larger payloads 413.
+        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(state);
     if tls {
         // HSTS only meaningful via TLS (no effect on plain http).
@@ -432,18 +434,18 @@ async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
     chain.resolve(&policy.identity, Some(db_ref), token).await
 }
 
-/// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
-/// chain resolve → DPoP enforcement (local tokens) → `Extension<Option<AuthContext>>`.
-/// No token / DPoP failure = anonymous (policy rules decide, not middleware).
-async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
-    let token = bearer(req.headers()).or_else(|| read_cookie(req.headers(), ACCESS_COOKIE));
-    let dpop_proof = req.headers().get("DPoP").and_then(|v| v.to_str().ok()).map(str::to_string);
-    let method = req.method().to_string();
-    let uri = base_uri(s.tls, req.headers(), req.uri().path());
-    let mut ctx = match &token {
-        Some(t) => resolve_token(&s, t).await,
-        None => None,
-    };
+/// DPoP enforcement shared by HTTP middleware, WS upgrade, and SSE open:
+/// returns the context only when the token survives the mode check.
+/// No token / DPoP failure = anonymous (policy rules decide, not this fn).
+async fn enforce_dpop(
+    s: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    uri: &str,
+    token: Option<String>,
+    mut ctx: Option<AuthContext>,
+) -> Option<AuthContext> {
+    let dpop_proof = headers.get("DPoP").and_then(|v| v.to_str().ok()).map(str::to_string);
     if let (Some(local), Some(tok)) = (s.local.read().await.clone(), &token) {
         let is_local = ctx
             .as_ref()
@@ -456,14 +458,65 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
             DpopAction::Strip => false,
             DpopAction::MustVerify => dpop_proof
                 .as_deref()
-                .is_some_and(|p| local.check_dpop(p, &method, &uri, tok, binding.as_deref()).is_ok()),
+                .is_some_and(|p| local.check_dpop(p, method, uri, tok, binding.as_deref()).is_ok()),
         };
         if !ok {
             ctx = None;
         }
     }
+    ctx
+}
+
+/// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
+/// chain resolve → DPoP enforcement (local tokens) → `Extension<Option<AuthContext>>`.
+/// No token / DPoP failure = anonymous (policy rules decide, not middleware).
+async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    let from_cookie = read_cookie(req.headers(), ACCESS_COOKIE);
+    let token = bearer(req.headers()).or_else(|| from_cookie.clone());
+    let method = req.method().to_string();
+    let uri = base_uri(s.tls, req.headers(), req.uri().path());
+    let ctx = match &token {
+        Some(t) => resolve_token(&s, t).await,
+        None => None,
+    };
+    let mut ctx = enforce_dpop(&s, req.headers(), &method, &uri, token, ctx).await;
+    // CSRF: cookie-authenticated state-changing requests must prove origin.
+    // Browsers always send Origin/Referer; its absence (curl) is allowed,
+    // a mismatch is not — the context drops to anonymous (policy denies).
+    if from_cookie.is_some() && ctx.is_some() && matches!(req.method(), &axum::http::Method::POST | &axum::http::Method::PUT | &axum::http::Method::PATCH | &axum::http::Method::DELETE) {
+        let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let origin_ok = req
+            .headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(|o| {
+                let o = o.trim_start_matches("https://").trim_start_matches("http://");
+                let o_host = o.split('/').next().unwrap_or("");
+                o_host.eq_ignore_ascii_case(host)
+            })
+            .unwrap_or(true);
+        if !origin_ok {
+            ctx = None;
+        }
+    }
     req.extensions_mut().insert(ctx);
     next.run(req).await
+}
+
+/// `?token=` fallback is a URL-leak vector: honor it only over TLS or
+/// loopback (dev), ignore it on plain LAN traffic.
+fn query_token_allowed(tls: bool, headers: &HeaderMap) -> bool {
+    if tls {
+        return true;
+    }
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            let host = h.split(':').next().unwrap_or("");
+            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+        })
+        .unwrap_or(false)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<String> {
@@ -1066,6 +1119,13 @@ async fn run_ops(
     // must never silently become a write, e.g. dodging an Update-deny via
     // the legacy create-fallback).
     const KNOWN: &[&str] = &["get", "set", "add", "update", "delete", "create"];
+    if ops.len() > realtime::MAX_BATCH_OPS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("too many ops (max {})", realtime::MAX_BATCH_OPS),
+            "bad-request",
+        ));
+    }
     struct Gated {
         body: BatchOpBody,
         id: String,
@@ -1351,6 +1411,17 @@ async fn aggregate(
                     Some(f) => f,
                     None => return err(StatusCode::BAD_REQUEST, format!("{t} needs a field")),
                 };
+                // Reduce guard: sum/avg list into RAM — refuse past the cap.
+                match db.count(&stored, &opts).await {
+                    Ok(n) if n > realtime::MAX_AGG_SCAN_DOCS => {
+                        return err(
+                            StatusCode::BAD_REQUEST,
+                            "collection too large to reduce: narrow with filters",
+                        )
+                    }
+                    Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
+                    _ => {}
+                }
                 let docs = match db.list(&stored, &opts).await {
                     Ok(d) => d,
                     Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
@@ -1525,11 +1596,21 @@ async fn ws_handler(
 ) -> Response {
     let init = bearer(&headers)
         .or_else(|| read_cookie(&headers, ACCESS_COOKIE))
-        .or_else(|| q.get("token").cloned());
+        .or_else(|| {
+            if query_token_allowed(s.tls, &headers) {
+                q.get("token").cloned()
+            } else {
+                None
+            }
+        });
+    let uri = base_uri(s.tls, &headers, "/ws");
     let mut auth = None;
-    if let Some(t) = init {
+    if let Some(t) = init.clone() {
         auth = resolve_token(&s, &t).await;
     }
+    // DPoP-bound tokens must prove at upgrade (per-message proofs don't
+    // exist on WS); failure degrades to anonymous like HTTP.
+    auth = enforce_dpop(&s, &headers, "GET", &uri, init, auth).await;
     ws.on_upgrade(move |socket| ws_loop(s, socket, auth))
 }
 
@@ -1580,7 +1661,20 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                 }
                 Some("auth") => {
                     let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
-                    auth = resolve_token(&s, token).await;
+                    let mut next = resolve_token(&s, token).await;
+                    // No headers mid-socket: a DPoP-bound token can't prove
+                    // here, so Require/MustVerify degrades it to anonymous.
+                    if let Some(local) = s.local.read().await.clone() {
+                        let is_local = next
+                            .as_ref()
+                            .and_then(|c| c.extra.get("provider"))
+                            .and_then(|vv| vv.as_str())
+                            == Some(hakobackend_auth_local::NAME);
+                        if !matches!(dpop_action(local.dpop_mode(), is_local, false), DpopAction::Keep) {
+                            next = None;
+                        }
+                    }
+                    auth = next;
                     let ok = auth.is_some();
                     if !ws_send(&mut socket, serde_json::json!({"type": "auth", "ok": ok})).await {
                         break;
@@ -1610,14 +1704,37 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                         group: v.get("group").and_then(|g| g.as_bool()).unwrap_or(false),
                     };
                     // Per-subscribe token (legacy authData pattern) overrides connection auth.
-                    let sub_auth = match v.get("token").and_then(|t| t.as_str()) {
+                    // Same DPoP rule as the `auth` message: no proof possible here.
+                    let mut sub_auth = match v.get("token").and_then(|t| t.as_str()) {
                         Some(t) => resolve_token(&s, t).await,
                         None => auth.clone(),
                     };
+                    if v.get("token").is_some() {
+                        if let Some(local) = s.local.read().await.clone() {
+                            let is_local = sub_auth
+                                .as_ref()
+                                .and_then(|c| c.extra.get("provider"))
+                                .and_then(|vv| vv.as_str())
+                                == Some(hakobackend_auth_local::NAME);
+                            if !matches!(dpop_action(local.dpop_mode(), is_local, false), DpopAction::Keep) {
+                                sub_auth = None;
+                            }
+                        }
+                    }
                     let db = s.db.read().await.clone();
                     let policy = s.policy.get().await;
                     match realtime::subscribe(db, policy, sub_auth, spec).await {
                         Ok(sub) => {
+                            // Per-connection snapshot budget (anti memory-bomb).
+                            let total: usize =
+                                subs.values().map(|s| s.snapshot_docs).sum::<usize>() + sub.snapshot_docs;
+                            if total > realtime::MAX_CONN_SNAPSHOT_DOCS {
+                                drop(sub);
+                                if !ws_send(&mut socket, ws_err(Some(&key), "connection snapshot budget exceeded")).await {
+                                    break;
+                                }
+                                continue;
+                            }
                             subs.insert(key.clone(), sub);
                             if !ws_send(&mut socket, serde_json::json!({"type": "ready", "key": key})).await {
                                 break;
@@ -1678,13 +1795,22 @@ async fn sse_handler(
         PathKind::Collection { collection } if !collection.is_empty() => collection,
         _ => return err(StatusCode::BAD_REQUEST, "SSE only supports collection endpoints"),
     };
-    let auth = match bearer(&headers)
+    let token = bearer(&headers)
         .or_else(|| read_cookie(&headers, ACCESS_COOKIE))
-        .or_else(|| q.get("token").cloned())
-    {
+        .or_else(|| {
+            if query_token_allowed(s.tls, &headers) {
+                q.get("token").cloned()
+            } else {
+                None
+            }
+        });
+    let uri = base_uri(s.tls, &headers, &format!("/api/stream/{path}"));
+    let auth = match token.clone() {
         Some(t) => resolve_token(&s, &t).await,
         None => None,
     };
+    // SSE is a GET: the DPoP proof (if any) rides the handshake headers.
+    let auth = enforce_dpop(&s, &headers, "GET", &uri, token, auth).await;
     let options = match parse_options(&q) {
         Ok(o) => o,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
@@ -1725,7 +1851,17 @@ async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
     match s.github.read().await.clone() {
         None => err(StatusCode::BAD_REQUEST, "github oauth is not configured"),
         Some(g) => match g.login_url().await {
-            Ok(url) => Redirect::to(&url).into_response(),
+            Ok((url, nonce)) => {
+                // Browser-binding nonce for the callback (login-CSRF guard).
+                let mut h = HeaderMap::new();
+                h.append(
+                    header::SET_COOKIE,
+                    format!("__Host-gh_nonce={nonce}; Path=/; Max-Age=600; Secure; HttpOnly; SameSite=Lax")
+                        .parse()
+                        .unwrap(),
+                );
+                (StatusCode::FOUND, h, Redirect::to(&url)).into_response()
+            }
             Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         },
     }
@@ -1733,6 +1869,7 @@ async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
 
 async fn github_callback(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let (g, local) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
@@ -1744,7 +1881,8 @@ async fn github_callback(
         _ => return err(StatusCode::BAD_REQUEST, "code + state required"),
     };
     // Obfuscate all failures (bad code, stale state, github down).
-    let (uid, email, login) = match g.callback(&code, &state).await {
+    let nonce = read_cookie(&headers, "__Host-gh_nonce");
+    let (uid, email, login) = match g.callback(&code, &state, nonce.as_deref()).await {
         Ok(v) => v,
         Err(_) => return err(StatusCode::UNAUTHORIZED, "github verification failed"),
     };
@@ -1755,6 +1893,11 @@ async fn github_callback(
     match local.login_external(&uid, email, profile).await {
         Ok((_ctx, tokens)) => {
             let mut h = session_cookies(&local, &tokens);
+            // Single-use nonce: consume the cookie too.
+            h.append(
+                header::SET_COOKIE,
+                "__Host-gh_nonce=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax".parse().unwrap(),
+            );
             // BFF: browser returns to the app with a session cookie; no tokens in URL.
             h.insert(header::LOCATION, g.after_login().parse().unwrap());
             (StatusCode::FOUND, h).into_response()
