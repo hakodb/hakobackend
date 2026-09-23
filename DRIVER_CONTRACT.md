@@ -92,7 +92,6 @@ Itu saja. Handler, policy, realtime tidak tahu driver apa yang dipakai.
 | `sqlite` | `ub-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | ya |
 | `mysql` | `ub-db-mysql` | ✅ via sqlx (pool, JSON, FTS generated) | polling | ya |
 | `mongodb` | `ub-db-mongo` | 🔜 fase berikutnya (crate resmi `mongodb`, async) | change stream | ya |
-| `rethink` | `ub-db-rethink` | ⏸️ pending (tanpa driver Rust matang) | changefeed | emulasi |
 
 ### Fase berikutnya: MongoDB
 
@@ -105,4 +104,3 @@ order/limit/offset/cursor native, index via `create_index` (single/compound/
 `text`), FTS via text index (`supports_fts: true`), registry `__ub_indexes`
 di DB yang sama. Estimasi ringan karena kontrak + suite sudah ada.
 | `mysql` | `ub-db-mysql` | ⬜ peta jalan fase 3 | polling | ya |
-| `rethink` | `ub-db-rethink` | ⬜ peta jalan fase 3 (kompatibel SDK lama) | changefeed | emulasi |

@@ -263,7 +263,11 @@ impl Database for HakoDb {
         tokio::task::spawn_blocking(move || {
             match spec.kind {
                 ub_core::IndexKind::Simple => {
-                    let f = spec.fields.into_iter().next().unwrap();
+                    let f = spec
+                        .fields
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AppError::BadRequest("index spec needs at least one field".into()))?;
                     db.create_index(&c, &f).map_err(|e| AppError::Internal(e.to_string()))?;
                     // Nama auto = nama field (hako tanpa penamaan; terdokumentasi).
                     Ok(ub_core::IndexInfo { name: f.clone(), fields: vec![f], unique: false, kind: ub_core::IndexKind::Simple })
@@ -287,7 +291,11 @@ impl Database for HakoDb {
                 }
                 ub_core::IndexKind::FullText => {
                     let logical = spec.name.clone().unwrap_or_else(|| ub_core::conformance::auto_index_name(&spec));
-                    let f = spec.fields.into_iter().next().unwrap();
+                    let f = spec
+                        .fields
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| AppError::BadRequest("index spec needs at least one field".into()))?;
                     db.create_fts_index(&c, &f).map_err(|e| AppError::Internal(e.to_string()))?;
                     Ok(ub_core::IndexInfo {
                         name: logical,

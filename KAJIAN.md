@@ -47,7 +47,7 @@
   Engine sudah punya `SecurityRule{collection_prefix, op, allow}` + audit log —
   dipakai sebagai **lapisan 0 (deny kasar)**, policy gateway sebagai lapisan 1 (peran/owner).
 - **Posisi org:** repo ini = `hakobackend`: gateway HTTP universal; HakoDB = embedded
-  default (zero-setup, local-first, 50K+ OPS klaim internal); postgres/mysql/sqlite/rethink
+  default (zero-setup, local-first; throughput TBD — bench before claiming); postgres/mysql/sqlite
   = plugin untuk deployment sentral.
 
 ## 4. Axum sebagai "saingan FastAPI" (kajian video `oLoQH1xwbW0`)
@@ -76,7 +76,7 @@ FastAPI tetap menang untuk prototipe cepat + ekosistem Python/ML.
 crates/
   ub-core/          trait Database, AuthProvider, Policy; Doc; QueryOptions; AppError
   ub-db-hako/       adapter HakoDB (default; spawn_blocking + watch bridge)
-  ub-db-postgres/ ub-db-mysql/ ub-db-sqlite/ ub-db-rethink/   plugin (menyusul)
+  ub-db-postgres/ ub-db-mysql/ ub-db-sqlite/   plugin (menyusul)
   ub-auth-core/     AuthContext{uid, roles, tenant}, Claims, Session
   ub-auth-internal/ default: argon2id + JWT akses pendek + refresh opaque rotasi
   ub-auth-firebase/ opsional: verifikasi JWT via JWKS Google (tanpa Admin SDK)
@@ -106,7 +106,7 @@ config/ub.example.toml
 0. Kontrak: `ub-core` + shared contract-test (semua driver wajib lolos).
 1. Inti REST: wildcard + sqlite (dev instan) + postgres; bench vs Express lama.
 2. Auth internal dual-token + cookie + CSRF + `policy.toml` dasar.
-3. Driver mysql/mariadb + rethink (changefeed → watch) + Redis fan-out.
+3. Driver mysql/mariadb + Redis fan-out.
 4. Realtime WS/SSE + per-doc filter.
 5. Provider firebase/oidc + chain; skrip konversi `userrules.ts` → `policy.toml`.
 6. Hardening: rate-limit, audit log, batch/tx, image distroless, e2e SDK lama.

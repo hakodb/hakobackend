@@ -87,5 +87,5 @@ build penuh belakangan.
   Kunci = IP peer (atau X-Forwarded-For pertama bila `--trust-proxy`).
 
 Fase 0 kontrak → 1 REST inti → 2 auth internal dual-token + `policy.toml` →
-3 driver mysql/rethink + Redis → 4 WS/SSE realtime → 5 firebase/oidc →
+3 driver mysql + Redis → 4 WS/SSE realtime → 5 firebase/oidc →
 6 hardening. Detail di `KAJIAN.md §7`.
