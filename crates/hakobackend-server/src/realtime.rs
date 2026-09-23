@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use hakobackend_core::{AppError, AuthContext, ChangeKind, Database, Doc, Method, QueryOptions};
 use hakobackend_policy::PolicyFile;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 /// Polling interval for drivers without watch (single-instance; Redis fan-out follows).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -136,36 +138,43 @@ async fn run_source(
     tx: tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) {
     if watch {
-        // One receiver per collection; round-robin select (contract: watch = push engine).
-        let mut rxs = Vec::new();
+        // One stream per collection in a StreamMap: true push (no polling
+        // sleep, no added latency), keyed so a lagged collection resyncs
+        // from a fresh list instead of drifting on a skipped change.
+        use tokio_stream::StreamMap;
+        let mut map = StreamMap::new();
         for coll in &collections {
             if let Ok(rx) = db.subscribe(coll).await {
-                rxs.push((coll.clone(), rx));
+                map.insert(coll.clone(), BroadcastStream::new(rx));
             }
         }
-        if rxs.is_empty() {
+        if map.is_empty() {
             return;
         }
+        let snap_q = snapshot_options(&options);
         loop {
-            let mut got: Option<(usize, hakobackend_core::Change)> = None;
-            // Non-blocking round-robin poll across receivers (no dynamic select! macro).
-            for (i, (_, rx)) in rxs.iter_mut().enumerate() {
-                match rx.try_recv() {
-                    Ok(change) => {
-                        got = Some((i, change));
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
-                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                }
-            }
-            match got {
-                Some((i, change)) => {
-                    let coll = rxs[i].0.clone();
+            match map.next().await {
+                // (collection, Ok(change)): normal path.
+                Some((coll, Ok(change))) => {
                     ingest_change(&policy, auth.as_ref(), &options, &mut snapshot, &coll, change, &tx).await;
                 }
-                None => tokio::time::sleep(Duration::from_millis(50)).await,
+                // Lagged: we missed broadcasts; re-list this collection so
+                // the snapshot (and future transitions) resync instead of
+                // silently diverging.
+                Some((coll, Err(_))) => {
+                    if let Ok(docs) = db.list(&coll, &snap_q).await {
+                        let prefix = format!("{coll}\0");
+                        snapshot.retain(|k, _| !k.starts_with(&prefix));
+                        for doc in docs {
+                            snapshot.insert(format!("{coll}\0{}", doc.id), doc);
+                        }
+                    }
+                }
+                // All streams closed (bridges torn down): nothing left to hear.
+                None => return,
+            }
+            if tx.is_closed() {
+                return;
             }
         }
     } else {
@@ -294,11 +303,50 @@ mod tests {
     }
 
     #[test]
-    fn group_cocok_legacy() {
+    fn group_match_legacy() {
         assert!(matches_group("revisions", "revisions"));
         assert!(matches_group("posts/p1/revisions", "revisions"));
         assert!(matches_group("posts_revisions", "revisions"));
         assert!(!matches_group("posts", "revisions"));
+    }
+
+    /// End-to-end through the hako bridge: a Put crosses as `Change`, yet
+    /// the server still emits `Add` for a first-seen id (transition comes
+    /// from the server snapshot, never from the bridge kind); a delete
+    /// emits `Remove`.
+    #[tokio::test]
+    async fn watch_end_to_end_add_then_remove() {
+        use hakobackend_db_hako::HakoDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_rte_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.to_string_lossy().as_ref()).unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let mut sub = subscribe(
+            db.clone(),
+            policy,
+            None,
+            SubSpec { collection: "rt".into(), options: QueryOptions::default(), group: false },
+        )
+        .await
+        .unwrap();
+
+        db.set("rt", "a", Doc { id: "a".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), sub.rx.recv())
+            .await
+            .expect("watch delivers the put")
+            .unwrap();
+        assert_eq!(ev.kind, ChangeKind::Add);
+
+        db.delete("rt", "a").await.unwrap();
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), sub.rx.recv())
+            .await
+            .expect("watch delivers the delete")
+            .unwrap();
+        assert_eq!(ev.kind, ChangeKind::Remove);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

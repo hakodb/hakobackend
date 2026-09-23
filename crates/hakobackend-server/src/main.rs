@@ -577,7 +577,7 @@ fn incoming_doc(id: &str, body: serde_json::Value) -> Doc {
 // Legacy shape (POST /api/collections/<coll>/index) handled by the shim in create().
 // Policy gate: Update (schema ops = write), except list = List.
 
-/// Detect the legacy shim: ".../<coll>/index" → Some(coll). Plain "index" (a real
+/// Detect the legacy shim: ".../`<coll>`/index" → Some(coll). Plain "index" (a real
 /// collection named index) → None so it stays a document operation.
 fn legacy_index_collection(path: &str) -> Option<String> {
     path.trim_matches('/').strip_suffix("/index").map(|s| s.to_string())

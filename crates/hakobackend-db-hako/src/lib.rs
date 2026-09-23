@@ -239,6 +239,10 @@ impl Database for HakoDb {
     ) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
         use std::collections::hash_map::Entry;
         let mut channels = self.channels.lock().await;
+        // Lazy both ways: prune bridges whose last receiver is gone (their
+        // thread exits on its own within one idle tick — see spawn_bridge),
+        // then share or spawn.
+        channels.retain(|_, tx| tx.receiver_count() > 0);
         match channels.entry(collection.to_string()) {
             Entry::Occupied(e) => Ok(e.into_mut().subscribe()),
             Entry::Vacant(v) => {
@@ -368,49 +372,53 @@ fn uuid_like() -> String {
     format!("{:x}{:x}", nanos, std::process::id())
 }
 
-/// Fan-out HakoDB `watch_collection` into a broadcast channel (one OS thread per
-/// watched collection, living for the process lifetime). Coarse add/change classification
-/// via the visible id set (seeded once from list); the server re-verifies
-/// via its own snapshot so the final classification is ALWAYS consistent.
+/// Fan-out HakoDB `watch_collection` into a broadcast channel: one OS thread
+/// per watched collection, living only while receivers exist. Add/Change
+/// classification is deliberately coarse (every Put crosses as `Change`):
+/// the server re-derives the true transition from its own snapshot, so the
+/// bridge skips both the O(n) seeding scan and the per-id `seen` set.
 fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broadcast::Sender<Change>) {
     std::thread::spawn(move || {
         let rx = db.watch_collection(&collection);
-        let mut seen: std::collections::HashSet<String> = db
-            .collection(&collection)
-            .all()
-            .get()
-            .map(|rows| rows.into_iter().map(|(id, _)| id).collect())
-            .unwrap_or_default();
-        for ev in rx {
-            let id = ev.path.to_string();
-            match ev.kind {
-                hakodb::engine::ChangeKind::Put => {
-                    if let Ok(Some(hako)) = db.get(&collection, &id) {
-                        let doc = HakoDb::to_doc(id.clone(), hako);
-                        let kind = if seen.insert(id.clone()) {
-                            hakobackend_core::ChangeKind::Add
-                        } else {
-                            hakobackend_core::ChangeKind::Change
-                        };
-                        let _ = tx.send(Change {
-                            collection: collection.clone(),
-                            id,
-                            kind,
-                            old: None,
-                            new: Some(doc),
-                        });
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(ev) => {
+                    // No listeners left: skip the point-get; the idle branch
+                    // below reaps this thread within one tick.
+                    if tx.receiver_count() == 0 {
+                        continue;
+                    }
+                    let id = ev.path.to_string();
+                    match ev.kind {
+                        hakodb::engine::ChangeKind::Put => {
+                            if let Ok(Some(hako)) = db.get(&collection, &id) {
+                                let doc = HakoDb::to_doc(id.clone(), hako);
+                                let _ = tx.send(Change {
+                                    collection: collection.clone(),
+                                    id,
+                                    kind: hakobackend_core::ChangeKind::Change,
+                                    old: None,
+                                    new: Some(doc),
+                                });
+                            }
+                        }
+                        hakodb::engine::ChangeKind::Delete => {
+                            let _ = tx.send(Change {
+                                collection: collection.clone(),
+                                id,
+                                kind: hakobackend_core::ChangeKind::Remove,
+                                old: None,
+                                new: None,
+                            });
+                        }
                     }
                 }
-                hakodb::engine::ChangeKind::Delete => {
-                    seen.remove(&id);
-                    let _ = tx.send(Change {
-                        collection: collection.clone(),
-                        id,
-                        kind: hakobackend_core::ChangeKind::Remove,
-                        old: None,
-                        new: None,
-                    });
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if tx.receiver_count() == 0 {
+                        return; // last receiver gone: entry pruned on next subscribe
+                    }
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     });
@@ -419,6 +427,38 @@ fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hakobackend_core::Database as _;
+
+    /// Lazy teardown: dropping the last receiver reaps the bridge thread
+    /// (within one idle tick) and prunes the entry, so a later subscribe
+    /// respawns cleanly and still delivers.
+    #[tokio::test]
+    async fn subscribe_teardown_and_respawn() {
+        let dir = std::env::temp_dir().join(format!("hakobackend_sub_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+
+        let rx1 = db.subscribe("events").await.unwrap();
+        drop(rx1);
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
+        let mut rx2 = db.subscribe("events").await.unwrap();
+        db.set(
+            "events",
+            "a",
+            hakobackend_core::Doc { id: "a".into(), data: Default::default() },
+            false,
+        )
+        .await
+        .unwrap();
+        let change = tokio::time::timeout(std::time::Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("respawned bridge delivers")
+            .unwrap();
+        assert_eq!(change.id, "a");
+        assert_eq!(change.kind, hakobackend_core::ChangeKind::Change);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Must pass before the driver may be registered (DRIVER_CONTRACT.md §4).
     /// Heavy (pulls in HakoDB) — run on full builds, not every edit.
