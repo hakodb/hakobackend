@@ -125,7 +125,6 @@ follow automatically. Neither = plain http. Port/listen changes need a restart
   (TLS and plain paths alike); subscriptions abort with their tasks.
 
 ## 10. Tenants (prefix design)
-
 One backend serves many consumers: tenant `acme` reads/writes `users`,
 stored as `acme__users`. The prefix comes ONLY from the authenticated
 identity (`AuthContext.tenant`, e.g. the `tenant` field on local user
@@ -142,3 +141,20 @@ docs) — never from client input; no tenant = legacy unprefixed namespace.
 - Scaling note: collections multiply by tenant count (lazy-created, no
   per-collection background work). Comfortable into the low thousands;
   beyond that, split backends per tenant.
+
+## 11. TTL + unique + coalescing
+
+- **TTL**: a numeric `__ttl_at` (microsecond epoch, same clock as `_time`)
+  marks expiry. Expired docs read as missing everywhere (`get`/`list`/
+  `count`/subscriptions); a 5-minute sweeper deletes them (emitting normal
+  `Remove` events), 100 per collection per pass. Docs without the field
+  are immortal — zero behavior change.
+- **Unique**: `create_index` with `unique:true` (simple single-field).
+  SQL drivers enforce natively (constraint → `already-exists`); hako
+  enforces via shadow `__uniq_{coll}` docs inside the same serializable
+  tx (concurrent duplicates cannot both commit). Missing values exempt.
+- **Coalescing** (opt-in `--coalesce-writes`): eligible PATCH bodies
+  (plain top-level keys, no `__type__` sentinels) merge per doc over a
+  100 ms window; one stored write per window, GETs overlay pending
+  bodies. Atomic PATCHes bypass. Acks happen at merge time; flush
+  failures log + retry (10×), SIGKILL can lose one window.

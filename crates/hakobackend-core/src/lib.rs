@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 pub mod atomics;
 pub mod tenant;
+pub mod ttl;
 
 // --- Document: id + flexible fields (schemaless, like Firestore) ---
 
@@ -352,6 +353,33 @@ pub trait Database: Send + Sync {
     /// must override).
     async fn run_transaction(&self, _ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
         Err(AppError::BadRequest("driver has no transaction support".into()))
+    }
+    /// Delete expired (`__ttl_at`) docs; returns (collections, deleted).
+    /// Default lists + deletes through normal paths (works for bare
+    /// drivers); TTL decorators override to reach past their own filter.
+    async fn sweep_expired(&self, per_collection_cap: usize) -> Result<(usize, usize), AppError> {
+        let mut visited = 0;
+        let mut deleted = 0;
+        for coll in self.list_collections().await? {
+            if coll.starts_with("__") {
+                continue;
+            }
+            visited += 1;
+            let expired: Vec<String> = self
+                .list(&coll, &QueryOptions::default())
+                .await?
+                .into_iter()
+                .filter(|d| ttl::is_expired(d))
+                .take(per_collection_cap)
+                .map(|d| d.id)
+                .collect();
+            for id in expired {
+                if self.delete(&coll, &id).await.is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        Ok((visited, deleted))
     }
 }
 

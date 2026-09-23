@@ -334,6 +334,17 @@ fn fts_column(physical: &str) -> String {
     format!("__fts_{physical}")
 }
 
+/// Unique-violation mapping: concurrent same-value writes race past any
+/// read-check, so the DB constraint is the arbiter — translate it back.
+fn constraint_err(e: sqlx::Error) -> AppError {
+    let conflict = matches!(e, sqlx::Error::Database(ref d) if d.code().as_deref() == Some("1062"));
+    if conflict {
+        AppError::AlreadyExists
+    } else {
+        AppError::Internal("db error".into())
+    }
+}
+
 impl MysqlDb {
     async fn get_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
@@ -376,7 +387,7 @@ impl MysqlDb {
             .bind(&text)
             .execute(&mut **tx)
             .await
-            .map_err(|_| AppError::Internal("db error".into()))?;
+            .map_err(constraint_err)?;
         if r.rows_affected() == 0 {
             return Err(AppError::AlreadyExists);
         }
@@ -410,7 +421,7 @@ impl MysqlDb {
                 sql.push_str(&format!(" AND JSON_UNQUOTE(JSON_EXTRACT(data, '$.\"{PATH_FIELD}\"')) = ?"));
                 q = sqlx::query(&sql).bind(&text).bind(id).bind(collection);
             }
-            let r = q.execute(&mut **tx).await.map_err(|_| AppError::Internal("db error".into()))?;
+            let r = q.execute(&mut **tx).await.map_err(constraint_err)?;
             if r.rows_affected() == 0 {
                 let doc = Self::insert_tx(&mut *tx, collection, Doc { id: id.into(), data }).await?;
                 return Ok((doc, existed));
@@ -424,7 +435,7 @@ impl MysqlDb {
             .bind(&text)
             .execute(&mut **tx)
             .await
-            .map_err(|_| AppError::Internal("db error".into()))?;
+            .map_err(constraint_err)?;
         }
         data.remove(PATH_FIELD);
         Ok((Doc { id: id.into(), data }, existed))

@@ -8,6 +8,7 @@
 //! Endpoint flexibility: automatic wildcard (zero-config) + `policy.toml` that
 //! **hot-reloads** (mtime checked on each request; file edits take effect immediately, no restart).
 
+mod coalesce;
 mod config;
 mod realtime;
 
@@ -56,6 +57,10 @@ struct AppState {
     admin_role: String,
     /// CLI flags for reload (file re-read, flags still win).
     cli: Args,
+    /// PATCH coalescer (active only with --coalesce-writes).
+    coalescer: Arc<coalesce::Coalescer>,
+    /// Whether the coalescer accepts merges (snapshot of the flag at boot).
+    coalesce_on: bool,
 }
 
 /// Two token buckets: loose global + strict auth. Cheap clone (Arc inside).
@@ -134,16 +139,25 @@ fn mtime(path: &str) -> Option<SystemTime> {
 /// The only place that knows the driver list. New driver = 1 new arm.
 /// Unimplemented drivers return a clear message, not a panic.
 async fn open_driver(driver: &str, path: &str) -> Result<Arc<dyn Database>, String> {
-    match driver {
-        "hako" => HakoDb::open(path).map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
-        "postgres" => PgDb::open(path).await.map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
-        "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
-        "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(db) as Arc<dyn Database>).map_err(|e| e.to_string()),
-        other => Err(format!(
-            "driver `{other}` not available yet (duckdb follows if requested). Available choices: {}.",
-            crate::config::KNOWN_DRIVERS.join(", ")
-        )),
-    }
+    use hakobackend_core::ttl::TtlDb;
+    // Every driver is wrapped once: TTL expiry filters uniformly, and the
+    // sweeper below owns the wrapped handle (reload swaps it too).
+    let db: Arc<dyn Database> = match driver {
+        "hako" => HakoDb::open(path).map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        "postgres" => PgDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        other => {
+            return Err(format!(
+                "driver `{other}` not available yet. Available choices: {}.",
+                crate::config::KNOWN_DRIVERS.join(", ")
+            ))
+        }
+    };
+    // One sweeper per open (reloads are rare; the old task idles on the
+    // swapped-out handle and exits with the process).
+    hakobackend_core::ttl::spawn_sweeper(db.clone(), std::time::Duration::from_secs(300), 100);
+    Ok(db)
 }
 
 #[tokio::main]
@@ -193,13 +207,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         db: Arc::new(tokio::sync::RwLock::new(db)),
         policy,
         auth: Arc::new(tokio::sync::RwLock::new(Arc::new(chain))),
-        local: Arc::new(tokio::sync::RwLock::new(local)),
-        github: Arc::new(tokio::sync::RwLock::new(github)),
+        local: Arc::new(tokio::sync::RwLock::new(local)),        github: Arc::new(tokio::sync::RwLock::new(github)),
         limits: limits.clone(),
         tls,
         admin_role: cfg.admin_role.clone(),
         cli,
+        coalescer: Arc::new(coalesce::Coalescer::default()),
+        coalesce_on: cfg.coalesce_writes,
     };
+    if cfg.coalesce_writes {
+        state.coalescer.spawn_flusher(state.db.clone());
+    }
 
     // Layered flood protection (before any expensive work):
     // /health open (LB probes), /api/auth/* strict, rest loose global.
@@ -645,6 +663,21 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     *s.auth.write().await = Arc::new(chain);
     *s.local.write().await = local;
     *s.github.write().await = github;
+    // Drain coalesced PATCHes into the fresh driver before serving it.
+    {
+        let dbh = s.db.read().await.clone();
+        s.coalescer
+            .flush_all(|coll, id, body| {
+                let dbh = dbh.clone();
+                async move {
+                    dbh.set(&coll, &id, Doc { id: id.clone(), data: body }, true)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                }
+            })
+            .await;
+    }
     // Rate-limit numbers + auto-provision hot-reload too (no restart).
     s.limits.global.set_quota(Quota::per_minute(cfg.limit_global.0, cfg.limit_global.1));
     s.limits.auth.set_quota(Quota::per_minute(cfg.limit_auth.0, cfg.limit_auth.1));
@@ -778,13 +811,28 @@ async fn get_or_list(
             }
             let stored = stored(tenant.as_deref(), &collection);
             match db.get(&stored, &id).await {
-                Ok(Some(doc)) => {
-                    if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
-                        return forbidden();
+                Ok(maybe_doc) => {
+                    // Coalescer overlay: pending PATCHes merge over storage
+                    // so read-your-write holds inside the window.
+                    let overlaid = s.coalescer.overlay(
+                        &stored,
+                        &id,
+                        maybe_doc.as_ref().map(|d| d.data.clone()),
+                    );
+                    let doc = match overlaid {
+                        Some(data) => Some(Doc { id: id.clone(), data }),
+                        None => maybe_doc,
+                    };
+                    match doc {
+                        Some(doc) => {
+                            if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
+                                return forbidden();
+                            }
+                            Json(serde_json::to_value(doc).unwrap()).into_response()
+                        }
+                        None => err(StatusCode::NOT_FOUND, "Document not found"),
                     }
-                    Json(serde_json::to_value(doc).unwrap()).into_response()
                 }
-                Ok(None) => err(StatusCode::NOT_FOUND, "Document not found"),
                 Err(_) => err_internal(),
             }
         }
@@ -1036,6 +1084,20 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             // Legacy parity: PATCH on a missing doc is 404 (use PUT to create).
             if merge && existing.is_none() {
                 return err(StatusCode::NOT_FOUND, "Document not found");
+            }
+            // Opt-in coalescing: eligible PATCH bodies merge into the pending
+            // entry and ack now; the flusher stores once per window.
+            // Atomics/dot-paths bypass (exactness, see coalesce.rs).
+            if merge && s.coalesce_on {
+                if let Some(obj) = body.as_object() {
+                    let map: HashMap<String, serde_json::Value> =
+                        obj.clone().into_iter().collect();
+                    if coalesce::Coalescer::eligible(&body)
+                        && s.coalescer.merge(&stored, &id, map)
+                    {
+                        return Json(serde_json::json!({ "success": true })).into_response();
+                    }
+                }
             }
             let _ = db.ensure_collection(&stored).await;
             let created_at = existing.as_ref().and_then(|d| d.data.get("createdAt").cloned());

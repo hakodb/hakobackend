@@ -12,16 +12,75 @@ pub struct HakoDb {
     // ponytail: one broadcast per collection created lazily; most
     // collections are never watched, so don't allocate up front.
     channels: tokio::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Change>>>,
+    /// Unique-enforced fields per collection (from `create_index(unique)`).
+    /// std mutex: read inside spawn_blocking threads where await is illegal.
+    unique: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+}
+
+/// Schema registry + unique shadows live here (covered by the `__*` HTTP
+/// deny like other internals).
+const SCHEMA_COLLECTION: &str = "__schema";
+
+/// Shadow collection holding one doc per unique value: id = `{field}\0{key}`,
+/// body = holder doc id. Checked + staged inside the same serializable tx
+/// as the main write, so concurrent duplicates cannot both commit.
+fn uniq_collection(coll: &str) -> String {
+    format!("__uniq_{coll}")
+}
+
+/// Canonical key for a unique value. Missing/null exempt (SQL parity).
+fn uniq_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(format!("b:{b}")),
+        serde_json::Value::Number(n) => Some(format!("n:{n}")),
+        serde_json::Value::String(s) => Some(format!("s:{s}")),
+        other => Some(format!("j:{other}")),
+    }
 }
 
 impl HakoDb {
     pub fn open(path: &str) -> Result<Self, AppError> {
         let db = hakodb::Hako::open(path, hakodb::config::HakoConfig::default())
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        Ok(Self {
+        let this = Self {
             inner: Arc::new(db),
             channels: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        })
+            unique: std::sync::Mutex::new(std::collections::HashMap::new()),
+        };
+        this.load_unique_registry();
+        Ok(this)
+    }
+
+    /// Best-effort load of persisted unique declarations (fresh DB: none).
+    fn load_unique_registry(&self) {
+        let Ok(rows) = self.inner.query(hakodb::query::query::Query::new(SCHEMA_COLLECTION)) else {
+            return;
+        };
+        let mut map = self.unique.lock().unwrap();
+        for (id, doc) in rows {
+            if let Some(suffix) = id.strip_prefix("uniq:") {
+                if let Some(fields) = doc.get("fields") {
+                    let list: Vec<String> = match fields {
+                        hakodb::document::value::Value::Array(items) => items
+                            .iter()
+                            .filter_map(|v| match v {
+                                hakodb::document::value::Value::String(s) => Some(s.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    };
+                    if !list.is_empty() {
+                        map.insert(suffix.to_string(), list);
+                    }
+                }
+            }
+        }
+    }
+
+    fn unique_fields(&self, collection: &str) -> Vec<String> {
+        self.unique.lock().unwrap().get(collection).cloned().unwrap_or_default()
     }
 
     fn to_doc(id: String, hako: hakodb::document::hako_doc::HakoDoc) -> Doc {
@@ -101,9 +160,10 @@ impl Database for HakoDb {
             supports_transactions: true,
             supports_composite: true,
             supports_fts: true,
-            // HakoDB has no drop-index API or unique constraints — reject clearly.
+            // HakoDB has no drop-index API — reject clearly.
             supports_drop_index: false,
-            supports_unique: false,
+            // Unique via shadow registry + serializable tx (see SCHEMA_COLLECTION).
+            supports_unique: true,
             // HakoDB doesn't store custom names — always auto (documented).
             supports_named_index: false,
         }
@@ -197,6 +257,19 @@ impl Database for HakoDb {
     }
 
     async fn set(&self, collection: &str, id: &str, doc: Doc, merge: bool) -> Result<Doc, AppError> {
+        // Unique-enforced collections go through the serializable tx (shadow
+        // checks); the plain path stays a single put.
+        if !self.unique_fields(collection).is_empty() {
+            let mut out = self
+                .run_transaction(vec![hakobackend_core::TxOp {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    kind: hakobackend_core::TxOpKind::Put { merge, must_exist: false },
+                    doc: Some(doc),
+                }])
+                .await?;
+            return out.pop().and_then(|o| o.doc).ok_or_else(|| AppError::Internal("tx without output".into()));
+        }
         // Contract: merge=true = shallow top-level merge (read-merge-write).
         let data = if merge {
             let mut base = self
@@ -223,6 +296,18 @@ impl Database for HakoDb {
     }
 
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        // Unique shadows must be unlinked atomically with the doc.
+        if !self.unique_fields(collection).is_empty() {
+            let mut out = self
+                .run_transaction(vec![hakobackend_core::TxOp {
+                    collection: collection.to_string(),
+                    id: id.to_string(),
+                    kind: hakobackend_core::TxOpKind::Delete,
+                    doc: None,
+                }])
+                .await?;
+            return Ok(out.pop().and_then(|o| o.doc));
+        }
         let prev = self.get(collection, id).await?;
         let db = self.inner.clone();
         let (c, i) = (collection.to_string(), id.to_string());
@@ -254,7 +339,7 @@ impl Database for HakoDb {
             Entry::Vacant(v) => {
                 let (tx, _) = tokio::sync::broadcast::channel(256);
                 let rx = tx.subscribe();
-                // The watch→broadcast bridge lives for the process lifetime (one thread per collection).
+                // The bridge lives only while receivers exist (lazy teardown).
                 spawn_bridge(self.inner.clone(), v.key().clone(), tx.clone());
                 v.insert(tx);
                 Ok(rx)
@@ -264,9 +349,45 @@ impl Database for HakoDb {
 
     async fn create_index(&self, collection: &str, spec: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
         hakobackend_core::conformance::validate_spec(self.capabilities(), spec)?;
+        // Unique on hako = engine index (lookup speed) + shadow registry
+        // (enforcement). Single-field simple only; composite/FTS unique
+        // stays a clear rejection like the SQL drivers' FTS rule.
         if spec.unique {
-            // ponytail: HakoDB has no unique constraints — reject clearly, don't stay silent.
-            return Err(AppError::BadRequest("hako driver has no unique index".into()));
+            if spec.kind != hakobackend_core::IndexKind::Simple || spec.fields.len() != 1 {
+                return Err(AppError::BadRequest("hako unique needs exactly one simple field".into()));
+            }
+            let field = spec.fields[0].clone();
+            let db = self.inner.clone();
+            let c = collection.to_string();
+            let f2 = field.clone();
+            tokio::task::spawn_blocking(move || {
+                db.create_index(&c, &f2).map_err(|e| AppError::Internal(e.to_string()))
+            })
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))??;
+            let mut doc = hakodb::document::hako_doc::HakoDoc::default();
+            doc.insert(
+                "fields",
+                hakodb::document::value::Value::Array(vec![hakodb::document::value::Value::String(
+                    field.clone().into(),
+                )]),
+            );
+            let db = self.inner.clone();
+            let c = collection.to_string();
+            tokio::task::spawn_blocking(move || {
+                db.put(SCHEMA_COLLECTION, &format!("uniq:{c}"), &doc)
+                    .map_err(|e| AppError::Internal(e.to_string()))
+            })
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))??;
+            self.unique.lock().unwrap().insert(collection.to_string(), vec![field.clone()]);
+            let logical = spec.name.clone().unwrap_or(field.clone());
+            return Ok(hakobackend_core::IndexInfo {
+                name: logical,
+                fields: vec![field],
+                unique: true,
+                kind: hakobackend_core::IndexKind::Simple,
+            });
         }
         let db = self.inner.clone();
         let (c, spec) = (collection.to_string(), spec.clone());
@@ -323,6 +444,7 @@ impl Database for HakoDb {
     async fn list_indexes(&self, collection: &str) -> Result<Vec<hakobackend_core::IndexInfo>, AppError> {
         let db = self.inner.clone();
         let c = collection.to_string();
+        let uniq = self.unique_fields(&c);
         tokio::task::spawn_blocking(move || {
             let list = db.list_indexes(Some(c.as_str()));
             let mut out = Vec::new();
@@ -330,7 +452,7 @@ impl Database for HakoDb {
                 out.push(hakobackend_core::IndexInfo {
                     name: fields.clone(),
                     fields: vec![fields.clone()],
-                    unique: false,
+                    unique: uniq.iter().any(|f| f == fields),
                     kind: hakobackend_core::IndexKind::Simple,
                 });
             }
@@ -371,6 +493,7 @@ impl Database for HakoDb {
     async fn run_transaction(&self, ops: Vec<hakobackend_core::TxOp>) -> Result<Vec<hakobackend_core::TxOut>, AppError> {
         use hakobackend_core::{TxOpKind, TxOut};
         let db = self.inner.clone();
+        let uniq_map = self.unique.lock().unwrap().clone();
         tokio::task::spawn_blocking(move || {
             let mut tx = db.begin_serializable_transaction();
             let mut out = Vec::with_capacity(ops.len());
@@ -391,6 +514,58 @@ impl Database for HakoDb {
                     .map_err(|e| AppError::Internal(e.to_string()))
                     .map(|h| h.map(|d| HakoDb::to_doc(id.to_string(), d)))
             };
+            // Unique enforcement inside the same tx: shadow `__uniq_{coll}`
+            // docs (`{field}\0{key}` → holder id) are checked + staged
+            // atomically with the main write, so concurrent duplicates
+            // cannot both commit. Old keys are unlinked on overwrite/delete.
+            let claim = |tx: &mut hakodb::engine::SerializableTransaction,
+                             db: &Arc<hakodb::Hako>,
+                             staged: &mut std::collections::HashMap<(String, String), Option<Doc>>,
+                             collection: &str,
+                             id: &str,
+                             old: &Option<Doc>,
+                             new: &Option<Doc>| {
+                let fields = uniq_map.get(collection).cloned().unwrap_or_default();
+                if fields.is_empty() {
+                    return Ok::<_, AppError>(());
+                }
+                let keys_of = |d: &Doc| {
+                    fields
+                        .iter()
+                        .filter_map(|f| d.data.get(f).and_then(uniq_key).map(|k| (f.clone(), k)))
+                        .collect::<Vec<_>>()
+                };
+                let scol = uniq_collection(collection);
+                if let Some(prev) = old {
+                    for (f, k) in keys_of(prev) {
+                        let sid = format!("{f}\0{k}");
+                        let keep = new.as_ref().is_some_and(|n| {
+                            n.data.get(&f).and_then(uniq_key).as_deref() == Some(k.as_str())
+                        });
+                        if !keep {
+                            tx.delete(&scol, &sid);
+                            staged.insert((scol.clone(), sid), None);
+                        }
+                    }
+                }
+                if let Some(next) = new {
+                    for (f, k) in keys_of(next) {
+                        let sid = format!("{f}\0{k}");
+                        let holder = read(tx, db, staged, &scol, &sid)?.and_then(|d| {
+                            d.data.get("holder").and_then(|v| v.as_str()).map(str::to_string)
+                        });
+                        if holder.as_deref().is_some_and(|h| h != id) {
+                            return Err(AppError::AlreadyExists);
+                        }
+                        let mut sdata = std::collections::HashMap::new();
+                        sdata.insert("holder".to_string(), serde_json::Value::String(id.to_string()));
+                        let sdoc = Doc { id: sid.clone(), data: sdata };
+                        tx.put(&scol, &sid, Self::to_hako(&sdoc));
+                        staged.insert((scol.clone(), sid), Some(sdoc));
+                    }
+                }
+                Ok(())
+            };
             for op in ops {
                 let key = (op.collection.clone(), op.id.clone());
                 match op.kind {
@@ -405,18 +580,23 @@ impl Database for HakoDb {
                         }
                         let body = op.doc.map(|d| d.data).unwrap_or_default();
                         let existed = old.is_some();
-                        let mut data =
-                            if merge { old.map(|d| d.data).unwrap_or_default() } else { Default::default() };
+                        let mut data = if merge {
+                            old.as_ref().map(|d| d.data.clone()).unwrap_or_default()
+                        } else {
+                            Default::default()
+                        };
                         data.extend(body);
                         let doc = Doc { id: op.id.clone(), data };
                         tx.put(&op.collection, &op.id, Self::to_hako(&doc));
                         staged.insert(key, Some(doc.clone()));
+                        claim(&mut tx, &db, &mut staged, &op.collection, &op.id, &old, &Some(doc.clone()))?;
                         out.push(TxOut { existed, doc: Some(doc) });
                     }
                     TxOpKind::Delete => {
                         let old = read(&mut tx, &db, &staged, &op.collection, &op.id)?;
                         tx.delete(&op.collection, &op.id);
                         staged.insert(key, None);
+                        claim(&mut tx, &db, &mut staged, &op.collection, &op.id, &old, &None)?;
                         out.push(TxOut { existed: old.is_some(), doc: old });
                     }
                 }
@@ -534,12 +714,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Unique enforcement: duplicate values rejected, freed values reusable,
+    /// composite/FTS unique stays a clear rejection.
+    #[tokio::test]
+    async fn unique_shadow_registry() {
+        use hakobackend_core::{IndexKind, IndexSpec};
+        let dir = std::env::temp_dir().join(format!("hakobackend_uniq_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        let spec = IndexSpec { name: None, fields: vec!["email".into()], unique: true, kind: IndexKind::Simple };
+        let info = db.create_index("users", &spec).await.unwrap();
+        assert!(info.unique);
+
+        let d = |id: &str, email: &str| hakobackend_core::Doc {
+            id: id.into(),
+            data: [("email".to_string(), serde_json::json!(email))].into_iter().collect(),
+        };
+        db.set("users", "u1", d("u1", "a@x.id"), false).await.unwrap();
+        // Same value, other id → AlreadyExists (not silent overwrite).
+        let dup = db.set("users", "u2", d("u2", "a@x.id"), false).await;
+        assert!(matches!(dup, Err(AppError::AlreadyExists)));
+        // Same id, same value → fine (idempotent rewrite).
+        db.set("users", "u1", d("u1", "a@x.id"), false).await.unwrap();
+        // Delete frees the value for reuse.
+        db.delete("users", "u1").await.unwrap();
+        db.set("users", "u2", d("u2", "a@x.id"), false).await.unwrap();
+        // Missing values are exempt (SQL NULL parity).
+        db.set("users", "u3", hakobackend_core::Doc { id: "u3".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        db.set("users", "u4", hakobackend_core::Doc { id: "u4".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        // Non-simple unique stays rejected.
+        let bad = IndexSpec { name: None, fields: vec!["a".into(), "b".into()], unique: true, kind: IndexKind::Composite };
+        assert!(db.create_index("users", &bad).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Must pass before the driver may be registered (DRIVER_CONTRACT.md §4).
     /// Heavy (pulls in HakoDB) — run on full builds, not every edit.
     #[tokio::test]
     #[ignore = "requires a full HakoDB build; run on release builds"]
-    async fn conformance_hako() {
-        let dir = std::env::temp_dir().join(format!("hakobackend_conform_{}", std::process::id()));
+    async fn conformance_hako() {        let dir = std::env::temp_dir().join(format!("hakobackend_conform_{}", std::process::id()));
         let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
         hakobackend_core::conformance::run_conformance_suite(&db).await;
         // Drop is unsupported by hako → the index suite asserts its clear rejection.

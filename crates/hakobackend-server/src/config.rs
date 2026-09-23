@@ -61,6 +61,10 @@ pub struct Args {
     /// Print the default config template and exit.
     #[arg(long)]
     pub print_default_config: bool,
+    /// Merge rapid PATCHes to the same doc (100 ms window). Opt-in:
+    /// acks at merge time, driver failures surface in logs.
+    #[arg(long, default_value_t = false)]
+    pub coalesce_writes: bool,
 }
 
 /// Final result after merge (the only one the server uses).
@@ -77,6 +81,7 @@ pub struct UbConfig {
     pub limit_global: (u32, u32),
     pub limit_auth: (u32, u32),
     pub trust_proxy: bool,
+    pub coalesce_writes: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     /// Ready-to-use index declarations (created at startup + reload — legacy
@@ -149,6 +154,8 @@ struct FileConfig {
     trust_proxy: Option<bool>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    #[serde(default)]
+    coalesce_writes: bool,
     #[serde(default)]
     indexes: Vec<IndexDecl>,
     #[serde(default)]
@@ -265,6 +272,7 @@ pub fn resolve(args: &Args) -> UbConfig {
             args.limit_auth_burst.or(file.limit_auth_burst).unwrap_or(5),
         ),
         trust_proxy: args.trust_proxy || file.trust_proxy.unwrap_or(false),
+        coalesce_writes: args.coalesce_writes || file.coalesce_writes,
         tls_cert: args.tls_cert.clone().or(file.tls_cert),
         tls_key: args.tls_key.clone().or(file.tls_key),
         indexes: file.indexes,
@@ -368,6 +376,7 @@ mod tests {
             tls_key: None,
             validate: false,
             print_default_config: false,
+            coalesce_writes: false,
         }
     }
 

@@ -228,6 +228,17 @@ fn uuid_like() -> String {
     format!("pg{nanos:x}{:x}", std::process::id())
 }
 
+/// Unique-violation mapping: concurrent same-value writes race past any
+/// read-check, so the DB constraint is the arbiter — translate it back.
+fn constraint_err(e: sqlx::Error) -> AppError {
+    let conflict = matches!(e, sqlx::Error::Database(ref d) if d.code().as_deref() == Some("23505"));
+    if conflict {
+        AppError::AlreadyExists
+    } else {
+        AppError::Internal(safe_db_err(e))
+    }
+}
+
 /// Safe index name (<=60 chars, alnum+underscore).
 fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
     let base = spec.name.clone().unwrap_or_else(|| match spec.kind {
@@ -287,7 +298,7 @@ impl PgDb {
             .bind(&data)
             .execute(&mut **tx)
             .await
-            .map_err(|e| AppError::Internal(safe_db_err(e)))?;
+            .map_err(constraint_err)?;
         if r.rows_affected() == 0 {
             return Err(AppError::AlreadyExists);
         }
@@ -324,7 +335,7 @@ impl PgDb {
                 sql.push_str(&format!(" AND (data#>>'{{{PATH_FIELD}}}') = $3"));
                 q = sqlx::query(&sql).bind(&data).bind(id).bind(collection);
             }
-            let r = q.execute(&mut **tx).await.map_err(|e| AppError::Internal(safe_db_err(e)))?;
+            let r = q.execute(&mut **tx).await.map_err(constraint_err)?;
             if r.rows_affected() == 0 {
                 let data: std::collections::HashMap<String, serde_json::Value> = data.as_object().map(|m| m.clone().into_iter().collect()).unwrap_or_default();
                 let doc = Self::insert_tx(&mut *tx, collection, Doc { id: id.into(), data }).await?;
@@ -339,7 +350,7 @@ impl PgDb {
             .bind(&data)
             .execute(&mut **tx)
             .await
-            .map_err(|e| AppError::Internal(safe_db_err(e)))?;
+            .map_err(constraint_err)?;
         }
         let mut data: std::collections::HashMap<String, serde_json::Value> = data.as_object().map(|m| m.clone().into_iter().collect()).unwrap_or_default();
         data.remove(PATH_FIELD);

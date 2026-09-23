@@ -323,6 +323,16 @@ fn uuid_like() -> String {
     format!("sq{nanos:x}{:x}", std::process::id())
 }
 
+/// Unique-violation mapping: concurrent same-value writes race past any
+/// read-check, so the DB constraint is the arbiter — translate it back.
+fn constraint_err(e: sqlx::Error) -> AppError {
+    if e.to_string().contains("UNIQUE constraint failed") {
+        AppError::AlreadyExists
+    } else {
+        AppError::Internal("db error".into())
+    }
+}
+
 fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
     // FTS tables use the internal `__fts_` prefix to stay hidden from list_collections.
     let base = spec.name.clone().unwrap_or_else(|| match spec.kind {
@@ -391,7 +401,7 @@ impl SqliteDb {
             .bind(&text)
             .execute(&mut **tx)
             .await
-            .map_err(|_| AppError::Internal("db error".into()))?;
+            .map_err(constraint_err)?;
         if r.rows_affected() == 0 {
             return Err(AppError::AlreadyExists);
         }
@@ -425,7 +435,7 @@ impl SqliteDb {
                 sql.push_str(&format!(" AND json_extract(data, '$.\"{PATH_FIELD}\"') = ?3"));
                 q = sqlx::query(&sql).bind(&text).bind(id).bind(collection);
             }
-            let r = q.execute(&mut **tx).await.map_err(|_| AppError::Internal("db error".into()))?;
+            let r = q.execute(&mut **tx).await.map_err(constraint_err)?;
             if r.rows_affected() == 0 {
                 let doc = Self::insert_tx(&mut *tx, collection, Doc { id: id.into(), data }).await?;
                 return Ok((doc, existed));
@@ -439,7 +449,7 @@ impl SqliteDb {
             .bind(&text)
             .execute(&mut **tx)
             .await
-            .map_err(|_| AppError::Internal("db error".into()))?;
+            .map_err(constraint_err)?;
         }
         data.remove(PATH_FIELD);
         Ok((Doc { id: id.into(), data }, existed))
@@ -871,8 +881,37 @@ mod tests {
     /// Full conformance needs live sqlite (file/:memory:) — runs without a server.
     #[tokio::test]
     async fn conformance_sqlite_memory() {
-        let db = SqliteDb::open(":memory:").await.unwrap();
+        let db =
+SqliteDb::open(":memory:").await.unwrap();
         hakobackend_core::conformance::run_conformance_suite(&db).await;
         hakobackend_core::conformance::run_index_suite(&db).await;
+    }
+
+    /// Native UNIQUE index: the DB constraint (not a read-check) arbitrates
+    /// concurrent duplicates; the driver maps it back to AlreadyExists.
+    #[tokio::test]
+    async fn unique_native_conflict() {
+        use hakobackend_core::{Database as _, IndexKind, IndexSpec};
+        let db = SqliteDb::open(":memory:").await.unwrap();
+        db.create_index(
+            "users",
+            &IndexSpec { name: None, fields: vec!["email".into()], unique: true, kind: IndexKind::Simple },
+        )
+        .await
+        .unwrap();
+        let d = |id: &str, email: &str| hakobackend_core::Doc {
+            id: id.into(),
+            data: [("email".to_string(), serde_json::json!(email))].into_iter().collect(),
+        };
+        db.set("users", "u1", d("u1", "a@x.id"), false).await.unwrap();
+        let dup = db
+            .run_transaction(vec![hakobackend_core::TxOp {
+                collection: "users".into(),
+                id: "u2".into(),
+                kind: hakobackend_core::TxOpKind::Put { merge: false, must_exist: false },
+                doc: Some(d("u2", "a@x.id")),
+            }])
+            .await;
+        assert!(matches!(dup, Err(hakobackend_core::AppError::AlreadyExists)));
     }
 }
