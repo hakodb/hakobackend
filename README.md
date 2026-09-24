@@ -47,8 +47,10 @@ Library crates are path-only on purpose — publishing 13 crates to
 crates.io would be release churn for zero runtime benefit. Ship the binary:
 
 - **Release assets:** tag `v*` → `release.yml` builds
-  `hakobackend-<ver>-linux-x86_64.tar.gz` + `-windows-x86_64.zip`
-  (binary renamed to `hakobackend`, plus the example config).
+  `hakobackend-<ver>-windows-x86_64.zip` (binary renamed to
+  `hakobackend`, plus the example config). No Linux tarball on
+  purpose: ubuntu-runner glibc (2.35+) does not run on EL8-class
+  targets — Linux binaries are built natively per target family.
 - **Docker:** `docker.yml` generates its Dockerfile inline on every run
   (repo policy: no Dockerfile/compose committed) and pushes
   `ghcr.io/hakodb/hakobackend:<tag>` (`:latest`, `:edge`) for

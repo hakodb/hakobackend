@@ -1,4 +1,10 @@
-# Release: Linux + Windows server binaries on every `v*` tag.
+# Release: Windows server binary on every `v*` tag.
+#
+# Linux is DELIBERATELY absent: ubuntu-runner binaries need glibc 2.35+
+# and OpenSSL 3, which do not run on EL8-class targets (proven at deploy:
+# libssl.so.3 + GLIBC_2.30..2.38 missing). Linux binaries are built
+# natively per target family (e.g. EL8 container) until a static/musl
+# story lands — never ship an artifact that cannot run.
 #
 # No crates.io involved (13 path-crates would all need publishing, in
 # order, on every change — pure churn for a binary people run).
@@ -23,9 +29,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            pkg: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             pkg: zip
@@ -41,17 +44,7 @@ jobs:
       - name: build
         run: cargo build --release --locked -p hakobackend-server --target ${{ matrix.target }}
 
-      - name: package (linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          STAGE="hakobackend-${{ github.ref_name }}-linux-x86_64"
-          mkdir "$STAGE"
-          cp "target/${{ matrix.target }}/release/hakobackend-server" "$STAGE/hakobackend"
-          cp hakobackend.example.toml "$STAGE/" 2>/dev/null || true
-          tar -czf "$STAGE.tar.gz" "$STAGE"
-
       - name: package (windows)
-        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           $STAGE = "hakobackend-${{ github.ref_name }}-windows-x86_64"
@@ -64,6 +57,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            hakobackend-*.tar.gz
             hakobackend-*.zip
           generate_release_notes: true
