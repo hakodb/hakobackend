@@ -188,6 +188,13 @@ fn missing_table(e: &unreql::Error) -> bool {
     e.to_string().contains("does not exist")
 }
 
+/// One applied write to undo (emulated-transaction rollback log entry).
+struct RollbackStep {
+    collection: String,
+    id: String,
+    prev: Option<Doc>,
+}
+
 impl RethinkDb {
     pub async fn open(data: &str) -> Result<Self, AppError> {
         let dsn = parse_dsn(data).map_err(AppError::BadRequest)?;
@@ -276,6 +283,72 @@ impl RethinkDb {
             .await
             .map_err(|_| AppError::Internal("rethinkdb feed connect failed".into()))
     }
+
+    /// Raw table write used by the emulated transaction (no gate, no
+    /// merge recompute — the caller prepared the final body).
+    async fn raw_put(&self, collection: &str, id: &str, doc: &Doc, existed: bool) -> Result<(), AppError> {
+        let table = encode_table(collection);
+        let body = to_rethink(doc);
+        let res: serde_json::Value = if existed {
+            self.exec_one(
+                r.db(self.db.clone()).table(table.clone()).get(id.to_string()).replace(body),
+            )
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?
+        } else {
+            self.exec_one(r.db(self.db.clone()).table(table.clone()).insert(body))
+                .await
+                .map_err(|_| AppError::Internal("db error".into()))?
+        };
+        if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
+            return Err(write_err("tx put", &res));
+        }
+        Ok(())
+    }
+
+    async fn raw_delete(&self, collection: &str, id: &str) -> Result<(), AppError> {
+        let table = encode_table(collection);
+        let id = id.to_string();
+        let res: serde_json::Value = self
+            .exec_one(r.db(self.db.clone()).table(table.clone()).get(id.clone()).delete(()))
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?;
+        if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
+            return Err(write_err("tx delete", &res));
+        }
+        Ok(())
+    }
+
+    /// Best-effort inverse rollback (fire and forget the failures —
+    /// the original error is what the caller sees).
+    async fn rollback(&self, done: Vec<RollbackStep>) {
+        for d in done.into_iter().rev() {
+            match d.prev {
+                // Restore: replace-or-insert (the apply phase may itself
+                // have deleted the doc before failing).
+                Some(doc) => {
+                    let table = encode_table(&d.collection);
+                    let body = to_rethink(&doc);
+                    let resp: Result<serde_json::Value, _> = self
+                        .exec_one(
+                            r.db(self.db.clone())
+                                .table(table.clone())
+                                .get(d.id.clone())
+                                .replace(body.clone()),
+                        )
+                        .await;
+                    if resp.is_err() {
+                        let _: Result<serde_json::Value, _> = self
+                            .exec_one(r.db(self.db.clone()).table(table.clone()).insert(body))
+                            .await;
+                    }
+                }
+                None => {
+                    let _ = self.raw_delete(&d.collection, &d.id).await;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -284,7 +357,10 @@ impl Database for RethinkDb {
         Capabilities {
             driver: "rethinkdb",
             supports_watch: true,
-            supports_transactions: false,
+            // Emulated (see run_transaction): validation + sequential
+            // apply + best-effort rollback. Atomic except under
+            // concurrent conflicting writes mid-batch.
+            supports_transactions: true,
             supports_composite: false,
             supports_fts: false,
             supports_drop_index: true,
@@ -438,6 +514,94 @@ impl Database for RethinkDb {
 
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         Ok(self.list(collection, q).await?.len() as u64)
+    }
+
+    /// Emulated transaction (RethinkDB has no multi-doc transactions):
+    /// validate everything first (must_exist aborts before anything is
+    /// applied), then apply sequentially with an overlay so reads observe
+    /// the batch's own writes. An apply-phase failure triggers
+    /// best-effort inverse rollback and returns the original error.
+    /// Truly atomic except under concurrent conflicting writes mid-batch
+    /// (documented in driver.toml + capabilities).
+    async fn run_transaction(&self, ops: Vec<hakobackend_core::TxOp>) -> Result<Vec<hakobackend_core::TxOut>, AppError> {
+        use hakobackend_core::{TxOpKind, TxOut};
+        use std::collections::hash_map::Entry;
+        // Phase 1: gather current state (also fails fast on missing tables
+        // for must_exist — reads tolerate absence).
+        struct Seen {
+            prev: Option<Doc>,
+        }
+        let mut seen: HashMap<(String, String), Seen> = HashMap::new();
+        for op in &ops {
+            let key = (op.collection.clone(), op.id.clone());
+            if let Entry::Vacant(e) = seen.entry(key) {
+                let prev = self.get(&op.collection, &op.id).await?;
+                if matches!(op.kind, TxOpKind::Put { must_exist: true, .. }) && prev.is_none() {
+                    return Err(AppError::NotFound);
+                }
+                e.insert(Seen { prev });
+            }
+        }
+        // Phase 2: apply in order over an overlay.
+        let mut overlay: HashMap<(String, String), Option<Doc>> = HashMap::new();
+        // Inverse log for best-effort rollback.
+        let mut done: Vec<RollbackStep> = Vec::new();
+        let mut outs: Vec<TxOut> = Vec::with_capacity(ops.len());
+        let at = |overlay: &HashMap<(String, String), Option<Doc>>, seen: &HashMap<(String, String), Seen>, coll: &str, id: &str| -> Option<Doc> {
+            let key = (coll.to_string(), id.to_string());
+            match overlay.get(&key) {
+                Some(v) => v.clone(),
+                None => seen.get(&key).and_then(|s| s.prev.clone()),
+            }
+        };
+        for op in &ops {
+            match &op.kind {
+                TxOpKind::Read => {
+                    let doc = at(&overlay, &seen, &op.collection, &op.id);
+                    outs.push(TxOut { existed: doc.is_some(), doc });
+                }
+                TxOpKind::Delete => {
+                    let prev = at(&overlay, &seen, &op.collection, &op.id);
+                    if prev.is_some() {
+                        if let Err(e) = self.raw_delete(&op.collection, &op.id).await {
+                            self.rollback(done).await;
+                            return Err(e);
+                        }
+                        done.push(RollbackStep { collection: op.collection.clone(), id: op.id.clone(), prev: prev.clone() });
+                    }
+                    outs.push(TxOut { existed: prev.is_some(), doc: prev });
+                }
+                TxOpKind::Put { merge, .. } => {
+                    let mut id = op.id.clone();
+                    if id.is_empty() {
+                        id = uuid_like();
+                    }
+                    let base = at(&overlay, &seen, &op.collection, &id).map(|d| d.data).unwrap_or_default();
+                    let raw = op.doc.as_ref().map(|d| d.data.clone()).unwrap_or_default();
+                    let mut data = if *merge {
+                        let mut m = base;
+                        m.extend(raw);
+                        m
+                    } else {
+                        raw
+                    };
+                    // Stamps like the single-write paths (server preprocesses
+                    // too; belt and suspenders for direct driver use).
+                    data = hakobackend_core::atomics::stamp_update(data, None);
+                    let prev = at(&overlay, &seen, &op.collection, &id);
+                    let existed = prev.is_some();
+                    let final_doc = Doc { id: id.clone(), data };
+                    if let Err(e) = self.raw_put(&op.collection, &id, &final_doc, existed).await {
+                        self.rollback(done).await;
+                        return Err(e);
+                    }
+                    done.push(RollbackStep { collection: op.collection.clone(), id: id.clone(), prev });
+                    overlay.insert((op.collection.clone(), id.clone()), Some(final_doc.clone()));
+                    outs.push(TxOut { existed, doc: Some(final_doc) });
+                }
+            }
+        }
+        Ok(outs)
     }
 
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
