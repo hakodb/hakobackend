@@ -92,7 +92,7 @@ That is all. Handlers, policy, and realtime never know which driver is in use.
 | `postgres` | `hakobackend-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | yes |
 | `sqlite` | `hakobackend-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | yes |
 | `mysql` | `hakobackend-db-mysql` | ✅ via sqlx (pool, JSON, generated FTS) | polling | yes |
-| `rethinkdb` | `hakobackend-db-rethinkdb` | 🧪 SPIKE (unreql 0.2; compiles + offline tests green, live conformance pending a server) | changefeed push | no (single-doc atomic only) |
+| `rethinkdb` | `hakobackend-db-rethinkdb` | 🧪 SPIKE (unreql 0.2; live verification in progress, see RETHINKDB_SPIKE.md) | changefeed push | emulated (validate+apply+rollback; see driver notes) |
 | `mongodb` | `hakobackend-db-mongo` | 🔜 next phase (official `mongodb` crate, async) | change stream | yes |
 
 ### Next phase: MongoDB
