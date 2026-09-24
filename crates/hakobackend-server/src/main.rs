@@ -676,24 +676,33 @@ async fn enforce_dpop(
     token: Option<String>,
     mut ctx: Option<AuthContext>,
 ) -> Option<AuthContext> {
+    // Fast paths first (identical outcomes, no crypto): no token or no
+    // local provider means nothing to enforce; DPoP Off keeps everything.
+    let Some(tok) = token else { return ctx };
+    let Some(local) = s.local.read().await.clone() else { return ctx };
+    if local.dpop_mode() == DpopMode::Off {
+        return ctx;
+    }
     let dpop_proof = headers.get("DPoP").and_then(|v| v.to_str().ok()).map(str::to_string);
-    if let (Some(local), Some(tok)) = (s.local.read().await.clone(), &token) {
-        let is_local = ctx
-            .as_ref()
-            .and_then(|c| c.extra.get("provider"))
-            .and_then(|v| v.as_str())
-            == Some(hakobackend_auth_local::NAME);
-        let binding = local.bound_jkt(tok).ok().flatten();
-        let ok = match dpop_action(local.dpop_mode(), is_local, dpop_proof.is_some()) {
-            DpopAction::Keep => true,
-            DpopAction::Strip => false,
-            DpopAction::MustVerify => dpop_proof
+    let is_local = ctx
+        .as_ref()
+        .and_then(|c| c.extra.get("provider"))
+        .and_then(|v| v.as_str())
+        == Some(hakobackend_auth_local::NAME);
+    let ok = match dpop_action(local.dpop_mode(), is_local, dpop_proof.is_some()) {
+        DpopAction::Keep => true,
+        DpopAction::Strip => false,
+        // The JWT decode (bound_jkt) runs ONLY here — the one arm that
+        // needs the binding. Previously it ran on every authed request.
+        DpopAction::MustVerify => {
+            let binding = local.bound_jkt(&tok).ok().flatten();
+            dpop_proof
                 .as_deref()
-                .is_some_and(|p| local.check_dpop(p, method, uri, tok, binding.as_deref()).is_ok()),
-        };
-        if !ok {
-            ctx = None;
+                .is_some_and(|p| local.check_dpop(p, method, uri, &tok, binding.as_deref()).is_ok())
         }
+    };
+    if !ok {
+        ctx = None;
     }
     ctx
 }

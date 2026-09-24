@@ -19,11 +19,32 @@ use std::collections::HashMap;
 /// Current UTC time as `YYYY-MM-DDTHH:MM:SSZ` (hand-rolled: one stamp
 /// function is not worth a date crate dependency).
 pub fn now_iso() -> String {
-    // Days → civil date (Hinnant algorithm), seconds → clock.
+    format_iso(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+/// Second-precision cache: output-identical to `now_iso` (the format has
+/// no sub-second digits), minus the clock read + format machinery on
+/// repeat calls inside the same second. Stamps call this, not `now_iso`.
+pub fn now_iso_cached() -> String {
+    static CACHED: std::sync::Mutex<(u64, String)> = std::sync::Mutex::new((u64::MAX, String::new()));
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let mut g = CACHED.lock().unwrap();
+    if g.0 != secs {
+        *g = (secs, format_iso(secs));
+    }
+    g.1.clone()
+}
+
+fn format_iso(secs: u64) -> String {
+    // Days → civil date (Hinnant algorithm), seconds → clock.
     let days = (secs / 86_400) as i64;
     let sod = (secs % 86_400) as i64;
     let z = days + 719_468;
@@ -41,6 +62,18 @@ pub fn now_iso() -> String {
 
 fn is_sentinel(v: &serde_json::Value) -> bool {
     v.as_object().is_some_and(|o| o.get("__type__").and_then(|t| t.as_str()).is_some())
+}
+
+/// Borrowed deep scan: does this value contain ANY sentinel (top-level
+/// or nested)? No allocation — the fast path gate for the resolvers.
+fn has_sentinel(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Array(items) => items.iter().any(has_sentinel),
+        serde_json::Value::Object(map) => {
+            map.get("__type__").and_then(|t| t.as_str()).is_some() || map.values().any(has_sentinel)
+        }
+        _ => false,
+    }
 }
 
 fn op_of(v: &serde_json::Value) -> Option<&str> {
@@ -95,7 +128,11 @@ fn resolve_sentinel(
 
 /// Insert / full-replace path: collapse sentinels to plain values.
 pub fn resolve_for_create(data: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
-    let ts = now_iso();
+    // Fast path (the 99% case): no sentinel anywhere → zero allocs.
+    if !data.values().any(has_sentinel) {
+        return data;
+    }
+    let ts = now_iso_cached();
     data.into_iter()
         .filter_map(|(k, v)| {
             if is_sentinel(&v) {
@@ -156,7 +193,7 @@ pub fn apply_update(
     base: HashMap<String, serde_json::Value>,
     updates: HashMap<String, serde_json::Value>,
 ) -> HashMap<String, serde_json::Value> {
-    let ts = now_iso();
+    let ts = now_iso_cached();
     let mut root = serde_json::Value::Object(base.into_iter().collect());
     for (path, value) in updates {
         if is_sentinel(&value) {
@@ -211,6 +248,10 @@ pub fn apply_update(
                     }
                 }
             }
+        } else if !has_sentinel(&value) {
+            // Fast path: plain value needs no resolve (still goes through
+            // set_path for dot-path keys).
+            set_path(&mut root, &path, value);
         } else if let Some(r) = resolve_deep(value, &ts) {
             set_path(&mut root, &path, r);
         }
@@ -223,7 +264,7 @@ pub fn apply_update(
 
 /// Stamp a brand-new document: user-supplied stamps win, else now.
 pub fn stamp_new(mut data: HashMap<String, serde_json::Value>) -> HashMap<String, serde_json::Value> {
-    let ts = serde_json::Value::String(now_iso());
+    let ts = serde_json::Value::String(now_iso_cached());
     data.entry("createdAt".to_string()).or_insert_with(|| ts.clone());
     data.entry("updatedAt".to_string()).or_insert(ts);
     data
@@ -237,7 +278,7 @@ pub fn stamp_update(
     if let Some(c) = created_at {
         data.entry("createdAt".to_string()).or_insert(c);
     }
-    data.insert("updatedAt".to_string(), serde_json::Value::String(now_iso()));
+    data.insert("updatedAt".to_string(), serde_json::Value::String(now_iso_cached()));
     data
 }
 
@@ -255,6 +296,32 @@ mod tests {
         assert_eq!(ts.len(), 20);
         assert!(ts.ends_with('Z'));
         assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn timestamp_cache_matches_primitive() {
+        // Output-identical to now_iso (second granularity): the cached
+        // value always formats either the pre- or post-call second.
+        let secs = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        };
+        let before = secs();
+        let _ = now_iso_cached(); // refresh: cache now holds `before`'s second (or newer)
+        let c = now_iso_cached();
+        let after = secs();
+        assert!(c == format_iso(before) || c == format_iso(after));
+        assert_eq!(c.len(), 20);
+    }
+
+    #[test]
+    fn has_sentinel_finds_nested() {
+        assert!(!has_sentinel(&serde_json::json!({"a": 1, "b": [1, {"c": "x"}]})));
+        assert!(!has_sentinel(&serde_json::json!("__type__")));
+        assert!(has_sentinel(&serde_json::json!({"__type__": "increment", "n": 1})));
+        assert!(has_sentinel(&serde_json::json!({"a": {"b": {"__type__": "deleteField"}}})));
     }
 
     #[test]
