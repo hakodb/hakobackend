@@ -20,7 +20,12 @@ impl SqliteDb {
         use std::str::FromStr;
         let opts = SqliteConnectOptions::from_str(if path.is_empty() { ":memory:" } else { path })
             .map_err(|_| AppError::BadRequest("invalid sqlite DSN".into()))?
-            .create_if_missing(true);
+            .create_if_missing(true)
+            // Concurrent writers otherwise hit SQLITE_BUSY (surfaced as
+            // 500s under load): wait instead, plus WAL so readers never
+            // block writers. Found by the pre-release load run.
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
         // :memory: = 1 connection (each pool connection owns its own DB!).
         let max = if path.is_empty() || path == ":memory:" { 1 } else { 5 };
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
