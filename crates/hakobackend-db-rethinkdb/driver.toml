@@ -1,6 +1,6 @@
 # RethinkDB driver addon manifest (see DRIVER_CONTRACT.md).
-# Status: SPIKE (unreql 0.2) — compiles + maps the full trait; live
-# verification against a real server in progress.
+# Status: SUPPORTED — shared conformance + index suites pass live vs
+# RethinkDB 2.4.3 (see RETHINKDB_SPIKE.md for findings).
 [driver]
 name = "rethinkdb"
 version = "0.1.0"

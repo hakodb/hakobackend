@@ -1,17 +1,16 @@
-# RethinkDB driver spike (reql via `unreql`)
+# RethinkDB driver (was spike, now validated live)
 
 ## Verdict up front
 
-Viable, with one honest gap: everything compiles and all
-server-independent logic is tested, but **no live RethinkDB server
-exists in this environment, so the conformance suite has not run.**
-The crate is wired `#[ignore]` (same convention as hako) and the
-`--driver rethinkdb` arm is live. To verify:
+PROMOTED: the shared conformance + index suites pass against
+RethinkDB 2.4.3 live, plus an 11-point HTTP/SSE verification
+(CRUD, PATCH-merge, filtered list, index create/list/drop,
+changefeed add+remove, session survival across feeds).
+Verify again any time (needs a server + `RDB_DSN`):
 
 ```sh
-docker run -d --name rdb -p 28015:28015 rethinkdb:2.4
-cargo test -p hakobackend-db-rethinkdb -- --ignored
-./hakobackend-server --driver rethinkdb --data localhost/hakobackend
+RDB_DSN='rethinkdb://admin:secret@localhost/db' \
+  cargo test -p hakobackend-db-rethinkdb -- --ignored
 ```
 
 ## Why `unreql` 0.2, not `reql` 0.11.2
@@ -61,8 +60,9 @@ remains an interop *assumption* until the live run — stated, not hidden.
 
 ## Recommendation
 
-Keep the spike wired but **do not depend on it yet**: promote to
-supported only after the live conformance run + a soak test of the
-changefeed bridge under reconnects. If RethinkDB itself is the goal
-(migration tool vs native driver debate), this spike says the native
-driver is ~1 live-test away from working, not a rewrite.
+Promoted to supported after the live run above: conformance green,
+feed bridge soak-verified (add/remove + session survival), reconnect
+in place. Remaining watch items (not blockers): changefeed behavior
+under server reconnect storms (only unit-covered), and ReQL pushdown
+for filtered lists (currently table scan + core helpers — correct,
+not fast, on huge tables).
