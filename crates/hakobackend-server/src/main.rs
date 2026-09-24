@@ -44,8 +44,9 @@ use tower_http::compression::predicate::Predicate;
 
 // Profiling showed allocator churn (malloc/free/memmove) as the top
 // user-space cost: jemalloc replaces the system allocator process-wide
-// (one line, no API change). SQLite/HakoDB internals keep their own
-// allocators; everything Rust-side benefits.
+// (one line, no API change) on Unix. MSVC builds keep the system
+// allocator (jemalloc upstream is untested there).
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

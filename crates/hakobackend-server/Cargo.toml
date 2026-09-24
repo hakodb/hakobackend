@@ -27,4 +27,8 @@ clap = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 tokio-stream = { workspace = true }
+
+# jemalloc only where it builds (Linux/macOS): MSVC is unsupported
+# upstream. Windows keeps the system allocator.
+[target.'cfg(not(windows))'.dependencies]
 tikv-jemallocator = { workspace = true }
