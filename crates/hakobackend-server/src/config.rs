@@ -7,7 +7,7 @@
 
 use clap::Parser;
 
-pub const KNOWN_DRIVERS: &[&str] = &["hako", "postgres", "sqlite", "mysql"];
+pub const KNOWN_DRIVERS: &[&str] = &["hako", "postgres", "sqlite", "mysql", "rethinkdb"];
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "universalbackend", version, about = "1 backend, multi database")]

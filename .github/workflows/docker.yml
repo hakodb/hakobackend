@@ -1,0 +1,80 @@
+# Docker images without a Dockerfile in the repo (repo policy: no
+# Dockerfile / docker-compose committed). The file is generated inline
+# on every run, then built multi-arch and pushed to GHCR.
+#
+# Tags: ghcr.io/hakodb/hakobackend:<tag> + :latest on releases,
+# :edge on manual runs. PRs build (amd64, no push) as a smoke check.
+
+name: docker
+
+on:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: generate Dockerfile (not committed, by policy)
+        run: |
+          cat > Dockerfile.gen <<'EOF'
+          FROM rust:1-bookworm AS build
+          WORKDIR /src
+          COPY . .
+          RUN --mount=type=cache,target=/usr/local/cargo/registry \
+              --mount=type=cache,target=/src/target \
+              cargo build --release --locked -p hakobackend-server \
+              && cp target/release/hakobackend-server /hakobackend
+          FROM debian:bookworm-slim
+          RUN apt-get update \
+              && apt-get install -y --no-install-recommends ca-certificates \
+              && rm -rf /var/lib/apt/lists \
+              && useradd -m app
+          COPY --from=build /hakobackend /usr/local/bin/hakobackend
+          USER app
+          WORKDIR /data
+          EXPOSE 3000
+          ENTRYPOINT ["hakobackend"]
+          EOF
+
+      - name: tags
+        id: tags
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VER="${{ github.ref_name }}"
+            echo "list=ghcr.io/hakodb/hakobackend:${VER},ghcr.io/hakodb/hakobackend:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "list=ghcr.io/hakodb/hakobackend:edge" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          else
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.gen
+          platforms: ${{ steps.tags.outputs.platforms }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.tags.outputs.list }}

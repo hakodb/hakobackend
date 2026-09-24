@@ -1,0 +1,69 @@
+# Release: Linux + Windows server binaries on every `v*` tag.
+#
+# No crates.io involved (13 path-crates would all need publishing, in
+# order, on every change — pure churn for a binary people run).
+# Distribution = GitHub Release assets here (+ GHCR images in docker.yml).
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            pkg: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            pkg: zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release --locked -p hakobackend-server --target ${{ matrix.target }}
+
+      - name: package (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          STAGE="hakobackend-${{ github.ref_name }}-linux-x86_64"
+          mkdir "$STAGE"
+          cp "target/${{ matrix.target }}/release/hakobackend-server" "$STAGE/hakobackend"
+          cp hakobackend.example.toml "$STAGE/" 2>/dev/null || true
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+
+      - name: package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $STAGE = "hakobackend-${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory $STAGE | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/hakobackend-server.exe" "$STAGE/hakobackend.exe"
+          Copy-Item hakobackend.example.toml $STAGE -ErrorAction SilentlyContinue
+          Compress-Archive $STAGE "$STAGE.zip"
+
+      - name: upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hakobackend-*.tar.gz
+            hakobackend-*.zip
+          generate_release_notes: true

@@ -37,6 +37,7 @@ use hakobackend_db_hako::HakoDb;
 use hakobackend_db_postgres::PgDb;
 use hakobackend_db_sqlite::SqliteDb;
 use hakobackend_db_mysql::MysqlDb;
+use hakobackend_db_rethinkdb::RethinkDb;
 use hakobackend_policy::{Identity, PolicyFile};
 use hakobackend_ratelimit::{Limiter, Quota};
 
@@ -251,6 +252,8 @@ async fn open_driver(driver: &str, path: &str) -> Result<Arc<dyn Database>, Stri
         "postgres" => PgDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
         "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
         "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        // Spike: compiles + maps the trait; live conformance pending a server.
+        "rethinkdb" => RethinkDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
         other => {
             return Err(format!(
                 "driver `{other}` not available yet. Available choices: {}.",

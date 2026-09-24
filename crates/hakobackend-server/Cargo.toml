@@ -15,6 +15,7 @@ hakobackend-auth-oidc = { path = "../hakobackend-auth-oidc" }
 hakobackend-db-postgres = { path = "../hakobackend-db-postgres" }
 hakobackend-db-sqlite = { path = "../hakobackend-db-sqlite" }
 hakobackend-db-mysql = { path = "../hakobackend-db-mysql" }
+hakobackend-db-rethinkdb = { path = "../hakobackend-db-rethinkdb" }
 hakobackend-ratelimit = { path = "../hakobackend-ratelimit" }
 tokio = { workspace = true }
 axum = { workspace = true }

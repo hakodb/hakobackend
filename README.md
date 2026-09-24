@@ -41,6 +41,21 @@ cargo run -p hakobackend-server -- --print-default-config     # print template
 Precedence: CLI flags > config file > defaults. The legacy config shape
 (`[server] listen`, `[database]`, `policy_file`) is still read (deprecated).
 
+## Install / deploy (no crates.io)
+
+Library crates are path-only on purpose — publishing 13 crates to
+crates.io would be release churn for zero runtime benefit. Ship the binary:
+
+- **Release assets:** tag `v*` → `release.yml` builds
+  `hakobackend-<ver>-linux-x86_64.tar.gz` + `-windows-x86_64.zip`
+  (binary renamed to `hakobackend`, plus the example config).
+- **Docker:** `docker.yml` generates its Dockerfile inline on every run
+  (repo policy: no Dockerfile/compose committed) and pushes
+  `ghcr.io/hakodb/hakobackend:<tag>` (`:latest`, `:edge`) for
+  linux/amd64+arm64. Run with a mounted config + data dir.
+- **From source:** `cargo install --git https://github.com/hakodb/hakobackend`
+  (or `cargo run -p hakobackend-server` above).
+
 Endpoints (same as the legacy backend):
 
 - `GET /api/health`
