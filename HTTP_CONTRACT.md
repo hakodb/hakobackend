@@ -148,6 +148,35 @@ docs) — never from client input; no tenant = legacy unprefixed namespace.
   per-collection background work). Comfortable into the low thousands;
   beyond that, split backends per tenant.
 
+## 12. Service modes + tenant admins (phase B)
+
+`--mode managed` (default): tenants are admin-provisioned
+(`POST /api/tenants`, `GET /api/tenants`); tenantless callers keep the
+legacy global namespace. `--mode open` adds public self-service:
+`POST /api/tenants/register {slug, id|email, password}` creates the
+tenant + an owned local profile + the first user (stamped with
+`--tenant-admin-role`, default `tenant-admin`) + a starter policy
+granting that role full reign; slug taken → 400; partial failure rolls
+back. `--mode single --tenant <slug>` pins one tenant: client hints are
+ignored, `/api/tenants*` + `/api/auth-profiles*` return 403, the tenant
++ owned local profile are ensured at boot, and every caller (even
+anonymous) is scoped to it. Mode/tenant/role need a restart
+(reload covers DB/auth/policy/limits/indexes, not these).
+
+- Tenant admins: a caller passes for `{slug}` endpoints when it holds the
+  global admin role OR its verified JWT claim binds it to `{slug}` with
+  the tenant-admin role (claim, never the request hint). Scoped:
+  `PUT/GET /api/tenants/{slug}/policy`, `GET /api/tenants/{slug}`,
+  own `PUT /api/auth-profiles/{id}` (`owner_tenant` must equal the claim),
+  `GET /api/auth-profiles` (own + org-global, still redacted).
+- Claim adoption: a hintless tenant token is re-resolved through its own
+  bundle, so roles come from `{tenant}__users` on HTTP, WS upgrade,
+  WS `auth`/per-subscribe tokens, and SSE alike. Single-mode operators
+  stamp roles directly in `{tenant}__users` (no registry to do it).
+- Tenant `list_collections` shows logical names only; stored names
+  (`acme__users`) and tenanted internals (`acme____sessions`) are never
+  addressable nor listed (double-prefix reads 404 by design).
+
 ## 11. TTL + unique + coalescing
 
 - **TTL**: a numeric `__ttl_at` (microsecond epoch, same clock as `_time`)

@@ -34,6 +34,17 @@ pub struct Args {
     /// Role allowed to call /api/admin/reload (free-form user role name, default "admin").
     #[arg(long)]
     pub admin_role: Option<String>,
+    /// Service mode: managed (default, admin-provisioned tenants) | open
+    /// (public self-registration) | single (one pinned tenant, no registry).
+    #[arg(long)]
+    pub mode: Option<String>,
+    /// Pinned tenant slug (required in single mode; ignored otherwise).
+    #[arg(long)]
+    pub tenant: Option<String>,
+    /// Role scoped to administer ONE tenant (tenant doc role field,
+    /// default "tenant-admin"). Global admins keep full access.
+    #[arg(long)]
+    pub tenant_admin_role: Option<String>,
     /// Public origin URL (for OAuth callbacks). UB_PUBLIC_URL env wins when set.
     #[arg(long)]
     pub public_url: Option<String>,
@@ -77,6 +88,9 @@ pub struct UbConfig {
     pub rules: Option<String>,
     pub auth: Option<String>,
     pub admin_role: String,
+    pub service_mode: ServiceMode,
+    pub service_tenant: Option<String>,
+    pub tenant_admin_role: String,
     pub public_url: Option<String>,
     pub limit_global: (u32, u32),
     pub limit_auth: (u32, u32),
@@ -106,6 +120,42 @@ pub struct IndexDecl {
 
 fn simple_kind() -> String {
     "simple".into()
+}
+
+/// Service mode (phase B): who may provision tenants.
+/// Parsed once at boot (and by --validate); AppState carries the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceMode {
+    /// Admin-provisioned tenants (default); tenantless callers keep legacy paths.
+    Managed,
+    /// Managed + public self-registration (`POST /api/tenants/register`).
+    Open,
+    /// One pinned tenant (`--tenant`): hints forced, registry disabled.
+    Single,
+}
+
+impl ServiceMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_lowercase().as_str() {
+            "managed" => Ok(Self::Managed),
+            "open" => Ok(Self::Open),
+            "single" => Ok(Self::Single),
+            other => Err(format!("mode `{other}` unknown (choices: managed|open|single)")),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Open => "open",
+            Self::Single => "single",
+        }
+    }
+}
+
+/// Role names travel into TOML + user docs: keep them boring.
+pub fn valid_role_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 impl IndexDecl {
@@ -146,6 +196,9 @@ struct FileConfig {
     rules: Option<String>,
     auth: Option<String>,
     admin_role: Option<String>,
+    mode: Option<String>,
+    tenant: Option<String>,
+    tenant_admin_role: Option<String>,
     public_url: Option<String>,
     limit_global: Option<u32>,
     limit_global_burst: Option<u32>,
@@ -237,6 +290,36 @@ pub fn resolve(args: &Args) -> UbConfig {
         }
     }
 
+    // Service mode parsed once (fail-fast like the listen port — a typo'd
+    // mode must never boot as something else).
+    let service_mode = ServiceMode::parse(
+        &args.mode.clone().or(file.mode.clone()).unwrap_or_else(|| "managed".into()),
+    )
+    .unwrap_or_else(|e| panic!("[ub] {e}"));
+    let service_tenant = {
+        let tenant = args.tenant.clone().or(file.tenant);
+        if service_mode == ServiceMode::Single {
+            let t = tenant.unwrap_or_else(|| panic!("[ub] single mode requires --tenant <slug>"));
+            if !hakobackend_core::tenant::is_valid_tenant_slug(&t) {
+                panic!("[ub] --tenant `{t}` must match ^[a-z0-9][a-z0-9-]{{0,62}}$");
+            }
+            Some(t)
+        } else {
+            tenant
+        }
+    };
+    let tenant_admin_role = {
+        let r = args
+            .tenant_admin_role
+            .clone()
+            .or(file.tenant_admin_role)
+            .unwrap_or_else(|| "tenant-admin".into());
+        if !valid_role_name(&r) {
+            panic!("[ub] tenant_admin_role `{r}` must be [a-zA-Z0-9-_] (<=64)");
+        }
+        r
+    };
+
     UbConfig {
         host: args.host.clone().or(file.host).or(file.server.host).unwrap_or(host),
         port: args.port.or(file.port).or(file.server.port).unwrap_or(port),
@@ -262,6 +345,9 @@ pub fn resolve(args: &Args) -> UbConfig {
             .or(file.database.policy_file),
         auth: args.auth.clone().or(file.auth),
         admin_role: args.admin_role.clone().or(file.admin_role).unwrap_or_else(|| "admin".into()),
+        service_mode,
+        service_tenant,
+        tenant_admin_role,
         public_url: args.public_url.clone().or(file.public_url),
         limit_global: (
             args.limit_global.or(file.limit_global).unwrap_or(600),
@@ -315,13 +401,15 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
         None => {}
     }
     Ok(format!(
-        "ok: {}:{} driver={} data={} rules={} auth={}",
+        "ok: {}:{} driver={} data={} rules={} auth={} mode={}{}",
         cfg.host,
         cfg.port,
         cfg.driver,
         cfg.data,
         cfg.rules.as_deref().unwrap_or("-"),
         cfg.auth.as_deref().unwrap_or("off"),
+        cfg.service_mode.as_str(),
+        cfg.service_tenant.as_deref().map(|t| format!(" tenant={t}")).unwrap_or_default(),
     ))
 }
 
@@ -335,6 +423,12 @@ data = "./data/hako.ub"  # file path or DSN
 
 rules = "./policy.toml"  # hot-reload; leave empty = open dev mode
 auth = "off"             # off | local | chain:github,local | ./custom.toml
+
+# Service mode: managed (admin provisions tenants) | open (+ self-service
+# POST /api/tenants/register) | single (one pinned tenant, registry off).
+# mode = "managed"
+# tenant = "acme"              # required in single mode (pinned slug)
+# tenant_admin_role = "tenant-admin"  # scoped role for one tenant's admin
 
 # Public origin for OAuth callbacks (or UB_PUBLIC_URL env which wins when set).
 # public_url = "https://api.example.com"
@@ -366,6 +460,9 @@ mod tests {
             host: None,
             port: None,
             admin_role: None,
+            mode: None,
+            tenant: None,
+            tenant_admin_role: None,
             public_url: None,
             limit_global: None,
             limit_global_burst: None,
@@ -438,5 +535,26 @@ mod tests {
         assert!(cfg.indexes[1].validate().is_err());
         assert!(validate(&cfg).is_err());
         let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn mode_parse_dan_default() {
+        assert_eq!(ServiceMode::parse("managed").unwrap(), ServiceMode::Managed);
+        assert_eq!(ServiceMode::parse("OPEN").unwrap(), ServiceMode::Open);
+        assert_eq!(ServiceMode::parse(" single ").unwrap(), ServiceMode::Single);
+        assert!(ServiceMode::parse("saas").is_err());
+        let cfg = resolve(&args());
+        assert_eq!(cfg.service_mode, ServiceMode::Managed);
+        assert_eq!(cfg.tenant_admin_role, "tenant-admin");
+    }
+
+    #[test]
+    fn single_butuh_tenant_valid() {
+        let mut a = args();
+        a.mode = Some("single".into());
+        a.tenant = Some("acme".into());
+        let cfg = resolve(&a);
+        assert_eq!(cfg.service_tenant.as_deref(), Some("acme"));
+        assert!(valid_role_name("tenant-admin") && !valid_role_name("a b") && !valid_role_name(""));
     }
 }

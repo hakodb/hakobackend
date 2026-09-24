@@ -99,3 +99,16 @@ impl TenantPolicies {
         ))
     }
 }
+
+/// Starter policy for a self-registered tenant: the tenant-admin role
+/// runs the whole tenant, everything else is denied until the owner
+/// extends it via PUT. Written through `put` like any policy (validated).
+pub fn starter_policy(tenant_admin_role: &str) -> String {
+    format!(
+        "# Starter policy (open-mode registration): `{r}` administers this tenant.\n\
+         [defaults]\n\
+         read = \"role:{r}\"\n\
+         write = \"role:{r}\"\n",
+        r = tenant_admin_role
+    )
+}

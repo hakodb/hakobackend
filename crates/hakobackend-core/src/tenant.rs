@@ -45,21 +45,19 @@ pub fn split_tenant(stored: &str) -> (Option<&str>, &str) {
 
 /// Stored collection list → (stored, logical) pairs visible to this caller:
 /// exactly its own namespace (stripped), or everything when tenantless.
-/// Internal `__*` names never leak (except the tenanted ones just matched).
+/// Internal `__*` names never leak — neither globally nor as a tenant's
+/// logical names (tenant stores like `acme____sessions` stay invisible).
 pub fn visible_collections(all: Vec<String>, tenant: Option<&str>) -> Vec<(String, String)> {
     all.into_iter()
         .filter_map(|stored| {
             let (t, logical) = split_tenant(&stored);
+            if logical.starts_with("__") {
+                return None;
+            }
             let logical = logical.to_string();
             match (tenant, t) {
                 (Some(want), Some(got)) if want == got => Some((stored, logical)),
-                (None, None) => {
-                    if logical.starts_with("__") {
-                        None
-                    } else {
-                        Some((stored, logical))
-                    }
-                }
+                (None, None) => Some((stored, logical)),
                 _ => None,
             }
         })
@@ -106,5 +104,19 @@ mod tests {
         assert_eq!(a, vec!["users"]);
         let anon: Vec<_> = visible_collections(all, None).into_iter().map(|(_, l)| l).collect();
         assert_eq!(anon, vec!["users"]);
+    }
+
+    #[test]
+    fn visibility_hides_tenanted_internals() {
+        // Tenant-namespaced sessions (`acme____sessions`) must never
+        // surface as logical `__sessions` — for the owner or anyone else.
+        let all = vec!["acme__users".into(), "acme____sessions".into(), "__sessions".into()];
+        let a: Vec<_> = visible_collections(all.clone(), Some("acme"))
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(a, vec!["users"]);
+        let anon: Vec<_> = visible_collections(all, None).into_iter().map(|(_, l)| l).collect();
+        assert!(anon.is_empty());
     }
 }
