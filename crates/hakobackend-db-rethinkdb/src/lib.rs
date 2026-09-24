@@ -669,11 +669,13 @@ mod tests {
     }
 
     /// Shared conformance suite — needs a live server (same `#[ignore]`
-    /// convention as the hako addon).
+    /// convention as the hako addon). DSN via `RDB_DSN` env
+    /// (e.g. `rethinkdb://admin:secret@localhost/testdb`).
     #[tokio::test]
     #[ignore]
     async fn conformance_live() {
-        let db = RethinkDb::open("localhost/hakobackend_spike").await.unwrap();
+        let dsn = std::env::var("RDB_DSN").unwrap_or_else(|_| "localhost/hakobackend_spike".into());
+        let db = RethinkDb::open(&dsn).await.unwrap();
         hakobackend_core::conformance::run_conformance_suite(&db).await;
     }
 }
