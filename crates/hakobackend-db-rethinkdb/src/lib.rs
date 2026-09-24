@@ -242,10 +242,12 @@ impl Database for RethinkDb {
     }
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
+        // Sequence queries stream items one by one: exec_to_vec, never
+        // exec (exec takes only the first item and mangles the rest).
         let tables: Vec<String> = r
             .db(self.db.clone())
             .table_list()
-            .exec(&self.session)
+            .exec_to_vec(&self.session)
             .await
             .map_err(|_| AppError::Internal("db error".into()))?;
         Ok(tables
@@ -311,11 +313,13 @@ impl Database for RethinkDb {
         // Like sqlite: the table exists before we touch it.
         self.ensure_collection(collection).await?;
         let table = encode_table(collection);
-        let data = match self.get(collection, id).await? {
-            Some(prev) if merge => {
+        let prev = self.get(collection, id).await?;
+        let existed = prev.is_some();
+        let data = match prev {
+            Some(p) if merge => {
                 // Shallow top-level merge (contract §3); the server already
                 // pre-merges, so this extend is idempotent, not a second merge.
-                let mut base = prev.data;
+                let mut base = p.data;
                 base.extend(doc.data);
                 base
             }
@@ -323,16 +327,26 @@ impl Database for RethinkDb {
             None => doc.data,
         };
         let final_doc = Doc { id: id.to_string(), data };
-        let res: serde_json::Value = r
-            .db(self.db.clone())
-            .table(table.clone())
-            .insert(to_rethink(&final_doc))
-            .exec(&self.session)
-            .await
-            .map_err(|_| AppError::Internal("db error".into()))?;
-        // Upsert-via-replace would also work; the read above already
-        // decided, so a conflict here is a concurrent write — surface it
-        // instead of silently winning.
+        let body = to_rethink(&final_doc);
+        // Replace when present (insert would conflict), insert when absent.
+        let res: serde_json::Value = if existed {
+            r.db(self.db.clone())
+                .table(table.clone())
+                .get(id.to_string())
+                .replace(body)
+                .exec(&self.session)
+                .await
+                .map_err(|_| AppError::Internal("db error".into()))?
+        } else {
+            r.db(self.db.clone())
+                .table(table.clone())
+                .insert(body)
+                .exec(&self.session)
+                .await
+                .map_err(|_| AppError::Internal("db error".into()))?
+        };
+        // A conflict here is a concurrent write racing our read — surface
+        // it instead of silently winning.
         if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
             return Err(write_err("set", &res));
         }
@@ -457,12 +471,13 @@ impl Database for RethinkDb {
 
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError> {
         let table = encode_table(collection);
-        let server: Vec<String> = match r.db(self.db.clone()).table(table.clone()).index_list().exec(&self.session).await
-        {
-            Ok(v) => v,
-            Err(e) if missing_table(&e) => return Ok(vec![]),
-            Err(_) => return Err(AppError::Internal("db error".into())),
-        };
+        let server: Vec<String> =
+            match r.db(self.db.clone()).table(table.clone()).index_list().exec_to_vec(&self.session).await
+            {
+                Ok(v) => v,
+                Err(e) if missing_table(&e) => return Ok(vec![]),
+                Err(_) => return Err(AppError::Internal("db error".into())),
+            };
         // Intersect the registry with what the server actually has
         // (out-of-band drops vanish instead of lingering).
         let mut out = Vec::new();
