@@ -46,7 +46,9 @@ fn is_visible_table(t: &str) -> bool {
 }
 
 pub struct RethinkDb {
-    session: unreql::Session,
+    /// Reconnect recipe (never logged: carries the password).
+    opts: Options,
+    session: tokio::sync::Mutex<unreql::Session>,
     db: String,
     feeds: std::sync::Mutex<HashMap<String, tokio::sync::broadcast::Sender<Change>>>,
 }
@@ -198,7 +200,7 @@ impl RethinkDb {
         opts.user = dsn.user.clone().into();
         opts.password = dsn.password.clone().into();
         let session = r
-            .connect(opts)
+            .connect(opts.clone())
             .await
             .map_err(|_| AppError::Internal("rethinkdb connect failed".into()))?;
         let db = if dsn.db.is_empty() { "test".to_string() } else { dsn.db };
@@ -209,9 +211,70 @@ impl RethinkDb {
                 return Err(AppError::Internal("rethinkdb db_create failed".into()));
             }
         }
-        let this = Self { session, db, feeds: std::sync::Mutex::new(HashMap::new()) };
+        let this = Self {
+            opts: opts.clone(),
+            session: tokio::sync::Mutex::new(session),
+            db,
+            feeds: std::sync::Mutex::new(HashMap::new()),
+        };
         this.ensure_registry().await;
         Ok(this)
+    }
+}
+
+/// Transport failures (broken pipe, I/O) get one reconnect-and-retry;
+/// ReQL logic errors never retry (they would fail identically).
+fn is_conn_err(e: &unreql::Error) -> bool {
+    matches!(
+        e,
+        unreql::Error::Driver(unreql::Driver::ConnectionBroken)
+            | unreql::Error::Driver(unreql::Driver::Io(..))
+    )
+}
+
+impl RethinkDb {
+    /// One query connection from the shared session.
+    async fn conn(&self) -> Result<unreql::Connection, unreql::Error> {
+        self.session.lock().await.clone().connection()
+    }
+
+    /// Swap in a fresh session (transport died); returns a connection on it.
+    async fn reconnect(&self) -> Result<unreql::Connection, unreql::Error> {
+        let fresh = r.connect(self.opts.clone()).await?;
+        *self.session.lock().await = fresh;
+        self.session.lock().await.clone().connection()
+    }
+
+    /// Run one single-result query, reconnecting once on transport
+    /// failure. ReQL logic errors never retry (identical failure).
+    async fn exec_one<T>(&self, q: unreql::Command) -> Result<T, unreql::Error>
+    where
+        T: Unpin + serde::de::DeserializeOwned,
+    {
+        match q.clone().exec(self.conn().await?).await {
+            Err(e) if is_conn_err(&e) => q.exec(self.reconnect().await?).await,
+            other => other,
+        }
+    }
+
+    /// Same for sequence queries (exec_to_vec shape).
+    async fn exec_all<T>(&self, q: unreql::Command) -> Result<Vec<T>, unreql::Error>
+    where
+        T: Unpin + serde::de::DeserializeOwned,
+    {
+        match q.clone().exec_to_vec(self.conn().await?).await {
+            Err(e) if is_conn_err(&e) => q.exec_to_vec(self.reconnect().await?).await,
+            other => other,
+        }
+    }
+
+    /// Feeds get their OWN session: a dying changefeed must never poison
+    /// queries (proven live: a closed feed killed the shared session —
+    /// unreql marks feed-used sessions, so sharing was never viable).
+    async fn feed_session(&self) -> Result<unreql::Session, AppError> {
+        r.connect(self.opts.clone())
+            .await
+            .map_err(|_| AppError::Internal("rethinkdb feed connect failed".into()))
     }
 }
 
@@ -233,7 +296,7 @@ impl Database for RethinkDb {
     async fn ensure_collection(&self, path: &str) -> Result<(), AppError> {
         let table = encode_table(path);
         let res: Result<serde_json::Value, _> =
-            r.db(self.db.clone()).table_create(table.clone()).exec(&self.session).await;
+            self.exec_one(r.db(self.db.clone()).table_create(table.clone())).await;
         match res {
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("already exists") => Ok(()),
@@ -244,10 +307,8 @@ impl Database for RethinkDb {
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
         // Sequence queries stream items one by one: exec_to_vec, never
         // exec (exec takes only the first item and mangles the rest).
-        let tables: Vec<String> = r
-            .db(self.db.clone())
-            .table_list()
-            .exec_to_vec(&self.session)
+        let tables: Vec<String> = self
+            .exec_all(r.db(self.db.clone()).table_list())
             .await
             .map_err(|_| AppError::Internal("db error".into()))?;
         Ok(tables
@@ -259,7 +320,12 @@ impl Database for RethinkDb {
 
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
         let table = encode_table(collection);
-        match r.db(self.db.clone()).table(table.clone()).get(id.to_string()).exec::<_, Option<serde_json::Value>>(&self.session).await
+        let id = id.to_string();
+        match self
+            .exec_one::<Option<serde_json::Value>>(
+                r.db(self.db.clone()).table(table.clone()).get(id.clone()),
+            )
+            .await
         {
             Ok(v) => Ok(v.and_then(from_rethink)),
             Err(e) if missing_table(&e) => Ok(None),
@@ -270,12 +336,14 @@ impl Database for RethinkDb {
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         use hakobackend_core::conformance::{doc_matches, matches_cursor, sort_and_limit};
         let table = encode_table(collection);
-        let rows: Vec<serde_json::Value> =
-            match r.db(self.db.clone()).table(table.clone()).exec_to_vec(&self.session).await {
-                Ok(v) => v,
-                Err(e) if missing_table(&e) => return Ok(vec![]),
-                Err(_) => return Err(AppError::Internal("db error".into())),
-            };
+        let rows: Vec<serde_json::Value> = match self
+            .exec_all(r.db(self.db.clone()).table(table.clone()))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if missing_table(&e) => return Ok(vec![]),
+            Err(_) => return Err(AppError::Internal("db error".into())),
+        };
         let docs: Vec<Doc> = rows
             .into_iter()
             .filter_map(from_rethink)
@@ -289,11 +357,8 @@ impl Database for RethinkDb {
             doc.id = uuid_like();
         }
         let table = encode_table(collection);
-        let res: serde_json::Value = r
-            .db(self.db.clone())
-            .table(table.clone())
-            .insert(to_rethink(&doc))
-            .exec(&self.session)
+        let res: serde_json::Value = self
+            .exec_one(r.db(self.db.clone()).table(table.clone()).insert(to_rethink(&doc)))
             .await
             .map_err(|e| {
                 if missing_table(&e) {
@@ -330,18 +395,16 @@ impl Database for RethinkDb {
         let body = to_rethink(&final_doc);
         // Replace when present (insert would conflict), insert when absent.
         let res: serde_json::Value = if existed {
-            r.db(self.db.clone())
-                .table(table.clone())
-                .get(id.to_string())
-                .replace(body)
-                .exec(&self.session)
-                .await
-                .map_err(|_| AppError::Internal("db error".into()))?
+            self.exec_one(
+                r.db(self.db.clone())
+                    .table(table.clone())
+                    .get(id.to_string())
+                    .replace(body.clone()),
+            )
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?
         } else {
-            r.db(self.db.clone())
-                .table(table.clone())
-                .insert(body)
-                .exec(&self.session)
+            self.exec_one(r.db(self.db.clone()).table(table.clone()).insert(body.clone()))
                 .await
                 .map_err(|_| AppError::Internal("db error".into()))?
         };
@@ -359,12 +422,9 @@ impl Database for RethinkDb {
             return Ok(None);
         }
         let table = encode_table(collection);
-        let res: serde_json::Value = r
-            .db(self.db.clone())
-            .table(table.clone())
-            .get(id.to_string())
-            .delete(())
-            .exec(&self.session)
+        let id = id.to_string();
+        let res: serde_json::Value = self
+            .exec_one(r.db(self.db.clone()).table(table.clone()).get(id.clone()).delete(()))
             .await
             .map_err(|_| AppError::Internal("db error".into()))?;
         if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
@@ -378,15 +438,23 @@ impl Database for RethinkDb {
     }
 
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
+        use std::collections::hash_map::Entry;
         let table = encode_table(collection);
         let logical = collection.to_string();
-        let mut feeds = self.feeds.lock().unwrap();
-        if let Some(tx) = feeds.get(&table) {
+        if let Some(tx) = self.feeds.lock().unwrap().get(&table).cloned() {
             return Ok(tx.subscribe());
         }
+        // Dedicated session BEFORE taking the lock (feed death must never
+        // touch the query session, and no lock is held across await).
+        let session = self.feed_session().await?;
         let (tx, _rx) = tokio::sync::broadcast::channel::<Change>(256);
-        feeds.insert(table.clone(), tx.clone());
-        let session = self.session.clone();
+        match self.feeds.lock().unwrap().entry(table.clone()) {
+            Entry::Vacant(e) => {
+                e.insert(tx.clone());
+            }
+            // Raced with another subscriber: use theirs, drop ours.
+            Entry::Occupied(e) => return Ok(e.get().subscribe()),
+        }
         let db = self.db.clone();
         let feed_tx = tx.clone();
         tokio::spawn(async move {
@@ -449,11 +517,8 @@ impl Database for RethinkDb {
         let name =
             spec.name.clone().unwrap_or_else(|| hakobackend_core::conformance::auto_index_name(spec));
         // Bare index_create(name) indexes the same-named field (ReQL default).
-        let res: serde_json::Value = r
-            .db(self.db.clone())
-            .table(table.clone())
-            .index_create(name.clone())
-            .exec(&self.session)
+        let res: serde_json::Value = self
+            .exec_one(r.db(self.db.clone()).table(table.clone()).index_create(name.clone()))
             .await
             .map_err(|_| AppError::Internal("db error".into()))?;
         if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
@@ -471,9 +536,10 @@ impl Database for RethinkDb {
 
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError> {
         let table = encode_table(collection);
-        let server: Vec<String> =
-            match r.db(self.db.clone()).table(table.clone()).index_list().exec_to_vec(&self.session).await
-            {
+        let server: Vec<String> = match self
+            .exec_all(r.db(self.db.clone()).table(table.clone()).index_list())
+            .await
+        {
                 Ok(v) => v,
                 Err(e) if missing_table(&e) => return Ok(vec![]),
                 Err(_) => return Err(AppError::Internal("db error".into())),
@@ -491,8 +557,10 @@ impl Database for RethinkDb {
 
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError> {
         let table = encode_table(collection);
-        let res: Result<serde_json::Value, _> =
-            r.db(self.db.clone()).table(table.clone()).index_drop(name.to_string()).exec(&self.session).await;
+        let name = name.to_string();
+        let res: Result<serde_json::Value, _> = self
+            .exec_one(r.db(self.db.clone()).table(table.clone()).index_drop(name.clone()))
+            .await;
         match res {
             Ok(v) if v.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 => {
                 return Err(write_err("index_drop", &v))
@@ -500,7 +568,7 @@ impl Database for RethinkDb {
             Err(e) => return Err(op_err(e)),
             _ => {}
         }
-        self.registry_del(&table, name).await?;
+        self.registry_del(&table, &name).await?;
         Ok(())
     }
 }
@@ -528,28 +596,27 @@ impl RethinkDb {
         };
         let body = to_rethink(&doc);
         // Upsert: read-then-write (registry rows are operator-owned, low contention).
-        let existing: Option<serde_json::Value> = r
-            .db(self.db.clone())
-            .table(INDEX_REGISTRY)
-            .get(doc.id.clone())
-            .exec(&self.session)
+        let existing: Option<serde_json::Value> = self
+            .exec_one::<Option<serde_json::Value>>(
+                r.db(self.db.clone()).table(INDEX_REGISTRY.to_string()).get(doc.id.clone()),
+            )
             .await
             .unwrap_or(None);
         let res: serde_json::Value = if existing.is_some() {
-            r.db(self.db.clone())
-                .table(INDEX_REGISTRY)
-                .get(doc.id.clone())
-                .replace(body.clone())
-                .exec(&self.session)
-                .await
-                .map_err(|_| AppError::Internal("db error".into()))?
+            self.exec_one(
+                r.db(self.db.clone())
+                    .table(INDEX_REGISTRY.to_string())
+                    .get(doc.id.clone())
+                    .replace(body.clone()),
+            )
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?
         } else {
-            r.db(self.db.clone())
-                .table(INDEX_REGISTRY)
-                .insert(body.clone())
-                .exec(&self.session)
-                .await
-                .map_err(|_| AppError::Internal("db error".into()))?
+            self.exec_one(
+                r.db(self.db.clone()).table(INDEX_REGISTRY.to_string()).insert(body.clone()),
+            )
+            .await
+            .map_err(|_| AppError::Internal("db error".into()))?
         };
         if res.get("errors").and_then(|e| e.as_u64()).unwrap_or(0) > 0 {
             return Err(write_err("index registry", &res));
@@ -559,11 +626,10 @@ impl RethinkDb {
 
     async fn registry_get(&self, table: &str, name: &str) -> Result<Option<IndexInfo>, AppError> {
         let id = format!("{table}/{name}");
-        let v: Option<serde_json::Value> = r
-            .db(self.db.clone())
-            .table(INDEX_REGISTRY)
-            .get(id.clone())
-            .exec(&self.session)
+        let v: Option<serde_json::Value> = self
+            .exec_one::<Option<serde_json::Value>>(
+                r.db(self.db.clone()).table(INDEX_REGISTRY.to_string()).get(id.clone()),
+            )
             .await
             .unwrap_or(None);
         Ok(v.and_then(|v| {
@@ -584,12 +650,13 @@ impl RethinkDb {
 
     async fn registry_del(&self, table: &str, name: &str) -> Result<(), AppError> {
         let id = format!("{table}/{name}");
-        let _: serde_json::Value = r
-            .db(self.db.clone())
-            .table(INDEX_REGISTRY)
-            .get(id.clone())
-            .delete(())
-            .exec(&self.session)
+        let _: serde_json::Value = self
+            .exec_one(
+                r.db(self.db.clone())
+                    .table(INDEX_REGISTRY.to_string())
+                    .get(id.clone())
+                    .delete(()),
+            )
             .await
             .unwrap_or(serde_json::Value::Null);
         Ok(())
@@ -598,7 +665,7 @@ impl RethinkDb {
     /// Best-effort registry bootstrap (missing table = first index op).
     async fn ensure_registry(&self) {
         let res: Result<serde_json::Value, _> =
-            r.db(self.db.clone()).table_create(INDEX_REGISTRY).exec(&self.session).await;
+            self.exec_one(r.db(self.db.clone()).table_create(INDEX_REGISTRY)).await;
         if let Err(e) = res {
             if !e.to_string().contains("already exists") {
                 eprintln!("[rethinkdb] registry bootstrap failed: {e}");
