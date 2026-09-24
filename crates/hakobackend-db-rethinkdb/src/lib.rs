@@ -543,6 +543,18 @@ impl Database for RethinkDb {
             }
         }
         // Phase 2: apply in order over an overlay.
+        // Tables first (phase-1 reads tolerate absence; writes don't).
+        {
+            let mut tables: Vec<&str> = vec![];
+            for op in &ops {
+                if !tables.contains(&op.collection.as_str()) {
+                    tables.push(&op.collection);
+                }
+            }
+            for t in tables {
+                self.ensure_collection(t).await?;
+            }
+        }
         let mut overlay: HashMap<(String, String), Option<Doc>> = HashMap::new();
         // Inverse log for best-effort rollback.
         let mut done: Vec<RollbackStep> = Vec::new();
