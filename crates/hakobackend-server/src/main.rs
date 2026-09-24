@@ -42,6 +42,13 @@ use hakobackend_policy::{Identity, PolicyFile};
 use hakobackend_ratelimit::{Limiter, Quota};
 use tower_http::compression::predicate::Predicate;
 
+// Profiling showed allocator churn (malloc/free/memmove) as the top
+// user-space cost: jemalloc replaces the system allocator process-wide
+// (one line, no API change). SQLite/HakoDB internals keep their own
+// allocators; everything Rust-side benefits.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Clone)]
 struct AppState {
     /// DB router: collection -> driver. Today 1 driver for all collections;

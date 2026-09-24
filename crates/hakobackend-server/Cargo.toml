@@ -27,3 +27,4 @@ clap = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 tokio-stream = { workspace = true }
+tikv-jemallocator = { workspace = true }

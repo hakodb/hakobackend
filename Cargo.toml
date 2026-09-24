@@ -22,5 +22,6 @@ rand = "0.8"
 sha2 = { version = "0.10", features = ["oid"] }
 base64 = "0.22"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "mysql", "json", "tls-rustls"] }
+tikv-jemallocator = "0.6"
 unreql = "0.2"
 futures = "0.3"
