@@ -356,6 +356,9 @@ impl Database for RethinkDb {
         if doc.id.is_empty() {
             doc.id = uuid_like();
         }
+        // The conformance suite inserts into fresh collections without a
+        // prior ensure (like the other drivers): create on demand.
+        self.ensure_collection(collection).await?;
         let table = encode_table(collection);
         let res: serde_json::Value = self
             .exec_one(r.db(self.db.clone()).table(table.clone()).insert(to_rethink(&doc)))
