@@ -182,15 +182,33 @@ impl Coalescer {
                                 hakobackend_core::atomics::now_iso(),
                             ),
                         );
-                        dbh.set(
-                            &coll,
-                            &id,
-                            hakobackend_core::Doc { id: id.clone(), data: body },
-                            true,
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+                        let out = dbh
+                            .set(
+                                &coll,
+                                &id,
+                                hakobackend_core::Doc { id: id.clone(), data: body },
+                                true,
+                            )
+                            .await;
+                        // Bus parity with write_doc: one get for the full
+                        // doc (flushes are ≤1/window/doc — negligible vs
+                        // the writes saved). Partial bodies must never hit
+                        // subscribers (filter misclassification).
+                        if out.is_ok() {
+                            if let Ok(Some(doc)) = dbh.get(&coll, &id).await {
+                                crate::realtime::emit(
+                                    &coll,
+                                    hakobackend_core::Change {
+                                        collection: coll.clone(),
+                                        id: id.clone(),
+                                        kind: hakobackend_core::ChangeKind::Change,
+                                        old: None,
+                                        new: Some(doc),
+                                    },
+                                );
+                            }
+                        }
+                        out.map(|_| ()).map_err(|e| e.to_string())
                     }
                 })
                 .await;

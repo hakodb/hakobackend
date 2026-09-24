@@ -594,7 +594,21 @@ async fn tenant_users_post(
     // id-or-email like the JSON endpoint (register decides).
     let (id, email) = if f.login.contains('@') { (None, Some(f.login)) } else { (Some(f.login), None) };
     match local.register(id, email, &f.password, HashMap::new()).await {
-        Ok(_) => Redirect::to("/portal/tenant/users").into_response(),
+        Ok(doc) => {
+            let users = s.policy.get().await.identity.users_collection.clone();
+            let stored = hakobackend_core::tenant::resolve_collection(Some(&slug), &users);
+            super::realtime::emit(
+                &stored,
+                hakobackend_core::Change {
+                    collection: stored.clone(),
+                    id: doc.id.clone(),
+                    kind: hakobackend_core::ChangeKind::Change,
+                    old: None,
+                    new: Some(doc),
+                },
+            );
+            Redirect::to("/portal/tenant/users").into_response()
+        }
         Err(e) => fail_page(&s, &auth, StatusCode::BAD_REQUEST, "users", &e.to_string(), "/portal/tenant/users"),
     }
 }
@@ -615,7 +629,20 @@ async fn tenant_user_delete(
     let ident = s.policy.get().await.identity.clone();
     let tdb = tenant_db_for(&s, &slug).await;
     match tdb.delete(&ident.users_collection, &f.id).await {
-        Ok(_) => Redirect::to("/portal/tenant/users").into_response(),
+        Ok(_) => {
+            let stored = hakobackend_core::tenant::resolve_collection(Some(&slug), &ident.users_collection);
+            super::realtime::emit(
+                &stored,
+                hakobackend_core::Change {
+                    collection: stored.clone(),
+                    id: f.id.clone(),
+                    kind: hakobackend_core::ChangeKind::Remove,
+                    old: None,
+                    new: None,
+                },
+            );
+            Redirect::to("/portal/tenant/users").into_response()
+        }
         Err(e) => fail_page(&s, &auth, StatusCode::BAD_REQUEST, "users", &e.to_string(), "/portal/tenant/users"),
     }
 }
@@ -651,7 +678,20 @@ async fn tenant_user_roles(
         .collect();
     doc.data.insert(ident.role_field.clone(), serde_json::Value::Array(roles));
     match tdb.set(&ident.users_collection, &f.id, doc, false).await {
-        Ok(_) => Redirect::to("/portal/tenant/users").into_response(),
+        Ok(saved) => {
+            let stored = hakobackend_core::tenant::resolve_collection(Some(&slug), &ident.users_collection);
+            super::realtime::emit(
+                &stored,
+                hakobackend_core::Change {
+                    collection: stored.clone(),
+                    id: saved.id.clone(),
+                    kind: hakobackend_core::ChangeKind::Change,
+                    old: None,
+                    new: Some(saved),
+                },
+            );
+            Redirect::to("/portal/tenant/users").into_response()
+        }
         Err(e) => fail_page(&s, &auth, StatusCode::BAD_REQUEST, "users", &e.to_string(), "/portal/tenant/users"),
     }
 }

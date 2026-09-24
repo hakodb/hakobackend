@@ -32,7 +32,7 @@ use std::time::SystemTime;
 use hakobackend_auth_core::{AuthChain, AuthSpec, CustomAuth, open_chain};
 use hakobackend_auth_github::GithubOAuth;
 use hakobackend_auth_local::{ACCESS_COOKIE, DpopMode, DpopRequest, LocalAuth, REFRESH_COOKIE};
-use hakobackend_core::{AuthContext, AuthProvider, Database, Doc, Method, PathKind, QueryOptions, parse_collection_path};
+use hakobackend_core::{AuthContext, AuthProvider, Change, ChangeKind, Database, Doc, Method, PathKind, QueryOptions, parse_collection_path};
 use hakobackend_db_hako::HakoDb;
 use hakobackend_db_postgres::PgDb;
 use hakobackend_db_sqlite::SqliteDb;
@@ -897,10 +897,23 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
             .flush_all(|coll, id, body| {
                 let dbh = dbh.clone();
                 async move {
-                    dbh.set(&coll, &id, Doc { id: id.clone(), data: body }, true)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string())
+                    let out = dbh.set(&coll, &id, Doc { id: id.clone(), data: body }, true).await;
+                    // Bus parity with the live flusher (full doc, below).
+                    if let Ok(doc) = dbh.get(&coll, &id).await {
+                        if let Some(doc) = doc {
+                            realtime::emit(
+                                &coll,
+                                Change {
+                                    collection: coll.clone(),
+                                    id: id.clone(),
+                                    kind: ChangeKind::Change,
+                                    old: None,
+                                    new: Some(doc),
+                                },
+                            );
+                        }
+                    }
+                    out.map(|_| ()).map_err(|e| e.to_string())
                 }
             })
             .await;
@@ -1367,15 +1380,30 @@ async fn provision_tenant(
                     s.tenant_admin_role.clone(),
                 )]),
             );
-            tdb.set(&ident.users_collection, &owner.id, doc, false).await.map(|_| ()).map_err(|e| e.to_string())
+            tdb.set(&ident.users_collection, &owner.id, doc, false).await.map_err(|e| e.to_string())
         }
         Ok(None) => Err("owner doc vanished after register".into()),
         Err(e) => Err(e.to_string()),
     };
-    if let Err(e) = stamped {
-        rollback(&db, Some(owner.id.clone())).await;
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
-    }
+    let stamped_doc = match stamped {
+        Ok(d) => d,
+        Err(e) => {
+            rollback(&db, Some(owner.id.clone())).await;
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
+        }
+    };
+    // Gateway bus: the stamped owner doc is what subscribers must see.
+    let stored_users = hakobackend_core::tenant::resolve_collection(Some(&slug), &ident.users_collection);
+    realtime::emit(
+        &stored_users,
+        Change {
+            collection: stored_users.clone(),
+            id: stamped_doc.id.clone(),
+            kind: ChangeKind::Change,
+            old: None,
+            new: Some(stamped_doc),
+        },
+    );
     if let Err(e) = s.tenant_policies.put(&slug, &tenant_policy::starter_policy(&s.tenant_admin_role)).await
     {
         rollback(&db, Some(owner.id.clone())).await;
@@ -1631,7 +1659,20 @@ async fn create(
                 ),
             };
             match db.insert(&stored, incoming).await {
-                Ok(doc) => Json(serde_json::to_value(doc).unwrap()).into_response(),
+                Ok(doc) => {
+                    // Gateway bus (instant lane; poller reconciles foreign writes).
+                    realtime::emit(
+                        &stored,
+                        Change {
+                            collection: stored.clone(),
+                            id: doc.id.clone(),
+                            kind: ChangeKind::Change,
+                            old: None,
+                            new: Some(doc.clone()),
+                        },
+                    );
+                    Json(serde_json::to_value(doc).unwrap()).into_response()
+                }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
@@ -1718,7 +1759,22 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             };
             // Merge already applied above; store the final body as-is.
             match db.set(&stored, &id, Doc { id: id.clone(), data }, false).await {
-                Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+                Ok(doc) => {
+                    // Gateway bus: instant lane for subscribers (the shared
+                    // poller stays as reconciler for foreign writes).
+                    // Wire shape unchanged ({success:true}).
+                    realtime::emit(
+                        &stored,
+                        Change {
+                            collection: stored.clone(),
+                            id: id.clone(),
+                            kind: ChangeKind::Change,
+                            old: None,
+                            new: Some(doc),
+                        },
+                    );
+                    Json(serde_json::json!({ "success": true })).into_response()
+                }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
@@ -1753,7 +1809,20 @@ async fn remove(
             }
             let _ = db.ensure_collection(&stored).await;
             match db.delete(&stored, &id).await {
-                Ok(_) => Json(serde_json::json!({ "success": true })).into_response(),
+                Ok(_) => {
+                    // Gateway bus (subscriber snapshot supplies the old doc).
+                    realtime::emit(
+                        &stored,
+                        Change {
+                            collection: stored.clone(),
+                            id: id.clone(),
+                            kind: ChangeKind::Remove,
+                            old: None,
+                            new: None,
+                        },
+                    );
+                    Json(serde_json::json!({ "success": true })).into_response()
+                }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
         }
@@ -1938,8 +2007,9 @@ async fn run_ops(
         })
         .collect();
     // Reads resolve against the batch's own writes (driver overlay/tx reads).
+    // (Cloned: the emit walk below reuses the preprocessed bodies.)
     let outs = db
-        .run_transaction(tx_ops)
+        .run_transaction(tx_ops.clone())
         .await
         .map_err(|e| {
             (
@@ -1948,6 +2018,38 @@ async fn run_ops(
                 e.code(),
             )
         })?;
+    // Gateway bus: instant lane for subscribers. Puts carry the final
+    // preprocessed body, deletes only the id — subscriber snapshots
+    // supply the old docs, so no extra reads here.
+    for (g, t) in gated.iter().zip(tx_ops.iter()) {
+        match t.kind {
+            TxOpKind::Read => {}
+            TxOpKind::Delete => {
+                realtime::emit(
+                    &g.stored,
+                    Change {
+                        collection: g.stored.clone(),
+                        id: g.id.clone(),
+                        kind: ChangeKind::Remove,
+                        old: None,
+                        new: None,
+                    },
+                );
+            }
+            TxOpKind::Put { .. } => {
+                realtime::emit(
+                    &g.stored,
+                    Change {
+                        collection: g.stored.clone(),
+                        id: g.id.clone(),
+                        kind: ChangeKind::Change,
+                        old: None,
+                        new: t.doc.clone(),
+                    },
+                );
+            }
+        }
+    }
     // Phase 3: legacy result shapes — batch: every op → `{id, success}`;
     // transaction: `get` → doc-or-null, writes → `{success: true}`.
     Ok(gated
@@ -2231,6 +2333,8 @@ async fn auth_register(
     let hint = clean_hint(q.tenant).or_else(|| {
         body.get("tenant").and_then(|v| v.as_str()).and_then(|t| clean_hint(Some(t.to_string())))
     });
+    // Effective tenant for the users collection (pinned in single mode).
+    let tenant = s.pin_hint(hint.clone());
     let local = match issuance_local(&s, hint).await {
         Ok(l) => l,
         Err(e) => return e,
@@ -2248,7 +2352,22 @@ async fn auth_register(
         None => return err(StatusCode::BAD_REQUEST, "password required"),
     };
     match local.register(id, email, &password, body).await {
-        Ok(doc) => (StatusCode::CREATED, Json(serde_json::json!({ "id": doc.id }))).into_response(),
+        Ok(doc) => {
+            // Gateway bus: user creates are CRUD events too.
+            let users = s.policy.get().await.identity.users_collection.clone();
+            let stored = stored(tenant.as_deref(), &users);
+            realtime::emit(
+                &stored,
+                Change {
+                    collection: stored.clone(),
+                    id: doc.id.clone(),
+                    kind: ChangeKind::Change,
+                    old: None,
+                    new: Some(doc.clone()),
+                },
+            );
+            (StatusCode::CREATED, Json(serde_json::json!({ "id": doc.id }))).into_response()
+        }
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }

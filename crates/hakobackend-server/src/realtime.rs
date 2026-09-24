@@ -1,16 +1,30 @@
-//! realtime: WS + SSE fan-out over `Database::subscribe` (watch) or polling.
+//! realtime: WS + SSE fan-out over `Database::subscribe` (watch), polling,
+//! or the gateway write-path bus.
 //!
+//! Three lanes feed the same per-subscription snapshot pipeline:
+//! - BUS (fastest): every committed gateway write emits a `Change`
+//!   (legacy `triggerLocalChange` pattern — zero DB cost, microsecond
+//!   latency). External/foreign writes are invisible here by design.
+//! - DRIVER PUSH: `Database::subscribe` feeds (hako watch, rethinkdb
+//!   changefeeds), one per collection shared by all subscribers.
+//! - POLL (slowest, always on): one `list` per collection per tick shared
+//!   by all polling subscriptions; catches external writes and heals
+//!   anything the faster lanes missed.
+//!
+//! Lanes converge idempotently: a change already in the snapshot with
+//! identical content is not redelivered, and a poll tick that misses a
+//! just-committed doc verifies candidate-removes with a targeted `get`
+//! before emitting (a stale list can no longer resurrect-then-drop).
 //! The single source of truth for add/change/remove classification is the
 //! per-subscription SNAPSHOT + full option matching (filter + cursor) — the
-//! legacy `changeHandler` pattern. Driver watch is only a trigger; polling covers
-//! drivers without watch. Policy: `List` gate at subscribe, per-document `Get`
-//! at delivery (unknown document = rule with None resource).
+//! legacy `changeHandler` pattern. Policy: `List` gate at subscribe,
+//! per-document `Get` at delivery (unknown document = rule with None resource).
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use hakobackend_core::{AppError, AuthContext, ChangeKind, Database, Doc, Method, QueryOptions};
+use hakobackend_core::{AppError, AuthContext, Change, ChangeKind, Database, Doc, Method, QueryOptions};
 use hakobackend_policy::PolicyFile;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
@@ -20,6 +34,47 @@ use tokio_stream::StreamExt;
 /// Registry entry; the task prunes itself once the last receiver is gone.
 static POLLERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, tokio::sync::broadcast::Sender<Vec<Doc>>>>> =
     std::sync::OnceLock::new();
+
+/// Gateway write-path bus (legacy `triggerLocalChange` pattern): one
+/// broadcast channel per STORED collection. Write paths `emit` after a
+/// successful commit; subscriptions drain it into the same snapshot
+/// pipeline as watch/poll (idempotent — see `ingest_change`).
+/// No receiver = no work: `emit` is a map lookup when nobody listens.
+/// Dead senders are evicted on emit and replaced on next subscribe.
+static BUS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, tokio::sync::broadcast::Sender<Change>>>> =
+    std::sync::OnceLock::new();
+
+/// Publish a committed gateway write. Fire-and-forget: lagged receivers
+/// resync via poll instead of blocking writers.
+pub fn emit(collection: &str, change: Change) {
+    let Some(bus) = BUS.get() else { return };
+    let mut reg = bus.lock().unwrap();
+    match reg.get(collection) {
+        Some(tx) if tx.receiver_count() > 0 => {
+            let _ = tx.send(change);
+        }
+        Some(_) => {
+            reg.remove(collection);
+        }
+        None => {}
+    }
+}
+
+/// Subscribe to the bus lane for one stored collection.
+async fn bus_stream(collection: &str) -> tokio::sync::broadcast::Receiver<Change> {
+    let reg = BUS.get_or_init(Default::default);
+    {
+        let reg = reg.lock().unwrap();
+        if let Some(tx) = reg.get(collection) {
+            if tx.receiver_count() > 0 {
+                return tx.subscribe();
+            }
+        }
+    }
+    let (tx, rx0) = tokio::sync::broadcast::channel(256);
+    reg.lock().unwrap().insert(collection.to_string(), tx);
+    rx0
+}
 
 /// Subscribe to the shared poller for one collection, spawning it on first
 /// use. Each tick carries the FULL doc list (unfiltered — subscribers apply
@@ -277,12 +332,15 @@ async fn run_source(
         // One stream per collection in a StreamMap: true push (no polling
         // sleep, no added latency), keyed so a lagged collection resyncs
         // from a fresh list instead of drifting on a skipped change.
+        // The gateway bus rides alongside (`bus\0{coll}` keys): instant
+        // lane for our own commits, same ingest path as driver feeds.
         use tokio_stream::StreamMap;
         let mut map = StreamMap::new();
         for coll in &collections {
             if let Ok(rx) = db.subscribe(coll).await {
                 map.insert(coll.clone(), BroadcastStream::new(rx));
             }
+            map.insert(format!("bus\0{coll}"), BroadcastStream::new(bus_stream(coll).await));
         }
         if map.is_empty() {
             return;
@@ -292,7 +350,8 @@ async fn run_source(
         loop {
             match map.next().await {
                 // (collection, Ok(change)): normal path.
-                Some((coll, Ok(change))) => {
+                Some((key, Ok(change))) => {
+                    let coll = key.strip_prefix("bus\0").unwrap_or(&key).to_string();
                     let sent = ingest_change(
                         &policy,
                         auth.as_ref(),
@@ -323,17 +382,37 @@ async fn run_source(
     } else {
         // Shared pollers (one list per collection per tick) merged back
         // into per-subscription diffs: N watchers cost 1 list, not N.
+        // The gateway bus joins as instant lane (boxed: tick lists and
+        // bus changes are different stream types).
         use tokio_stream::StreamMap;
-        let mut gate = RateGate::new();
-        let mut map = StreamMap::new();
-        for coll in &collections {
-            map.insert(coll.clone(), BroadcastStream::new(shared_poll_stream(db.clone(), coll).await));
+        enum Lane {
+            Tick(Vec<Doc>),
+            TickLagged,
+            Bus(Change),
+            BusLagged,
         }
+        type Boxed = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Lane> + Send>>;
+        let mut gate = RateGate::new();
+        let mut map: StreamMap<String, Boxed> = StreamMap::new();
+        for coll in &collections {
+            let ticks = BroadcastStream::new(shared_poll_stream(db.clone(), coll).await).map(|r| match r {
+                Ok(docs) => Lane::Tick(docs),
+                Err(_) => Lane::TickLagged,
+            });
+            map.insert(coll.clone(), Box::pin(ticks) as Boxed);
+            let bus = BroadcastStream::new(bus_stream(coll).await).map(|r| match r {
+                Ok(change) => Lane::Bus(change),
+                Err(_) => Lane::BusLagged,
+            });
+            map.insert(format!("bus\0{coll}"), Box::pin(bus) as Boxed);
+        }
+        let snap_q = snapshot_options(&options);
         loop {
             match map.next().await {
-                Some((coll, Ok(docs))) => {
+                Some((key, Lane::Tick(docs))) => {
+                    let coll = key.as_str();
                     let sent =
-                        apply_diff(&policy, auth.as_ref(), &options, &mut snapshot, &logical_of, {
+                        apply_diff(&db, &policy, auth.as_ref(), &options, &mut snapshot, &logical_of, {
                             let mut fresh: HashMap<String, Doc> = HashMap::new();
                             for doc in docs {
                                 fresh.insert(format!("{coll}\0{}", doc.id), doc);
@@ -349,7 +428,29 @@ async fn run_source(
                 }
                 // Lagged tick: skipped on purpose — the next tick carries
                 // the full state, so the diff below self-heals.
-                Some((_, Err(_))) => {}
+                Some((_, Lane::TickLagged)) => {}
+                // Bus lane: instant gateway commits through the same ingest
+                // path as driver feeds (idempotent — see ingest_change).
+                Some((key, Lane::Bus(change))) => {
+                    let coll = key.strip_prefix("bus\0").unwrap_or(&key).to_string();
+                    let sent = ingest_change(
+                        &policy,
+                        auth.as_ref(),
+                        &options,
+                        &mut snapshot,
+                        &coll,
+                        logical_name(lf, &coll),
+                        change,
+                        &tx,
+                    )
+                    .await;
+                    if sent && gate.observe(1) {
+                        resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
+                    }
+                }
+                // Lagged bus: a poll tick is at most 2 s away and carries
+                // full state — nothing to do (same reasoning as TickLagged).
+                Some((_, Lane::BusLagged)) => {}
                 None => return,
             }
             if tx.is_closed() {
@@ -362,8 +463,13 @@ async fn run_source(
 /// Diff a fresh full-state list against the subscription snapshot,
 /// delivering Add/Change/Remove per the subscription's own filters.
 /// Snapshot keys are stored names; policy sees logical names.
+/// Candidate-removes are verified with a targeted `get`: a tick that
+/// went stale under a concurrent commit converges silently instead of
+/// emitting a spurious Remove (and a failed `get` keeps the entry —
+/// transient driver errors no longer wipe snapshots).
 /// Returns the number of delivered events (for the flood guard).
 async fn apply_diff(
+    db: &Arc<dyn Database>,
     policy: &PolicyFile,
     auth: Option<&AuthContext>,
     options: &QueryOptions,
@@ -384,17 +490,39 @@ async fn apply_diff(
             }
         }
     }
-    for (key, old) in snapshot.iter() {
-        if !fresh.contains_key(key) {
-            let coll = key.split('\0').next().unwrap_or("");
-            if matches_full(old, options) {
-                if deliver_in(policy, auth, logical_name(logical_of, coll), Some(old), None, true, false, tx).await {
-                    sent += 1;
-                }
+    // Candidate removes first (owned copy: verification mutates below).
+    let missing: Vec<(String, Doc)> = snapshot
+        .iter()
+        .filter(|(k, _)| !fresh.contains_key(*k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (key, old) in &missing {
+        let coll = key.split('\0').next().unwrap_or("");
+        let id = key.split('\0').nth(1).unwrap_or("");
+        // Verify before removing: a stale tick must not drop a doc
+        // committed concurrently (bus already delivered it).
+        match db.get(coll, id).await {
+            Ok(Some(current)) => {
+                // Converge silently — content decides on the next diff.
+                snapshot.insert(key.clone(), current);
+                continue;
+            }
+            Ok(None) => {}
+            // Transient failure: keep the entry (next tick heals).
+            Err(_) => continue,
+        }
+        if matches_full(old, options) {
+            if deliver_in(policy, auth, logical_name(logical_of, coll), Some(old), None, true, false, tx).await {
+                sent += 1;
             }
         }
+        snapshot.remove(key);
     }
-    *snapshot = fresh;
+    // Fresh wins for everything present (converged keys above are absent
+    // from fresh by construction, so they survive).
+    for (key, doc) in fresh {
+        snapshot.insert(key, doc);
+    }
     sent
 }
 
@@ -428,6 +556,14 @@ async fn ingest_change(
                 let old = snapshot.get(&key);
                 let old_match = old.map(|d| matches_full(d, options)).unwrap_or(false);
                 let new_match = matches_full(&doc, options);
+                // Lane convergence: bus + poller/feed can carry the same
+                // commit. Identical content + identical match state means
+                // redelivery would repeat the same transition — skip.
+                // (Policy hot-reload between lanes is the known edge: the
+                // next real change re-evaluates under the new policy.)
+                if old.map(|d| &d.data) == Some(&doc.data) && old_match == new_match {
+                    return false;
+                }
                 let sent =
                     deliver_in(policy, auth, policy_coll, old, Some(&doc), old_match, new_match, tx).await;
                 snapshot.insert(key, doc);
@@ -590,5 +726,92 @@ mod tests {
         qc.start_after = Some(serde_json::json!(20));
         assert!(!matches_full(&doc("a", 20), &qc));
         assert!(matches_full(&doc("c", 30), &qc));
+    }
+
+    /// Bus lane: a gateway emit reaches the subscriber instantly (well
+    /// under the 2 s poll tick), classified from the subscriber snapshot.
+    #[tokio::test]
+    async fn bus_instant_lane() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_bus_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let mut sub = subscribe(db, policy, None, spec).await.unwrap();
+        emit(
+            "ev",
+            Change { collection: "ev".into(), id: "a".into(), kind: ChangeKind::Change, old: None, new: Some(doc("a", 1)) },
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.rx.recv())
+            .await
+            .expect("bus delivers instantly")
+            .unwrap();
+        assert_eq!(ev.kind, ChangeKind::Add);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lanes converge without duplicates: bus-delivered state is not
+    /// redelivered by the following poll tick.
+    #[tokio::test]
+    async fn bus_poller_converge_no_dup() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_nodup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let mut sub = subscribe(db.clone(), policy, None, spec).await.unwrap();
+        // Commit through the driver AND emit (what write_doc does).
+        db.set("ev", "a", Doc { id: "a".into(), data: [("age".to_string(), serde_json::json!(1))].into_iter().collect() }, false)
+            .await
+            .unwrap();
+        emit(
+            "ev",
+            Change { collection: "ev".into(), id: "a".into(), kind: ChangeKind::Change, old: None, new: Some(doc("a", 1)) },
+        );
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(1), sub.rx.recv())
+            .await
+            .expect("bus delivers")
+            .unwrap();
+        assert_eq!(ev.kind, ChangeKind::Add);
+        // Next poll tick (~2 s) must stay silent: same content converged.
+        let silent = tokio::time::timeout(std::time::Duration::from_millis(2600), sub.rx.recv()).await;
+        assert!(silent.is_err(), "poller must not redeliver converged state");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stale-tick protection: a candidate-remove verified present by
+    /// `get` converges silently instead of emitting a spurious Remove.
+    #[tokio::test]
+    async fn apply_diff_verifies_removes() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_verify_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let options = QueryOptions::default();
+        let logical_of: HashMap<String, String> = [("ev".to_string(), "ev".to_string())].into_iter().collect();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false).await.unwrap();
+        // Stale tick: list missed the just-committed doc.
+        let mut snapshot = HashMap::new();
+        snapshot.insert("ev\0a".to_string(), doc("a", 1));
+        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, HashMap::new(), &tx).await;
+        assert_eq!(sent, 0, "verified-present must not emit Remove");
+        assert!(snapshot.contains_key("ev\0a"), "snapshot keeps converged doc");
+        // Genuine delete: get finds nothing → Remove delivered.
+        db.delete("ev", "a").await.unwrap();
+        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, HashMap::new(), &tx).await;
+        assert_eq!(sent, 1);
+        let ev = rx.try_recv().unwrap();
+        assert_eq!(ev.kind, ChangeKind::Remove);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

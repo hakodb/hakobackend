@@ -98,6 +98,23 @@ No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_C
 
 ## 7. Realtime (WS + SSE)
 
+Three lanes feed the same per-subscription snapshot pipeline (first
+event wins, lanes converge idempotently — no duplicates):
+
+- **Bus (fastest):** every committed gateway write emits after commit
+  (legacy `triggerLocalChange` pattern — zero DB cost). External or
+  foreign writes are invisible here by design. Covers single writes,
+  batch/transaction ops, user creates/role changes (auth + portal),
+  and coalescer flushes (full doc, never partial bodies).
+- **Driver push:** hako watch / rethinkdb changefeeds, one per
+  collection shared by all watchers; lagged receivers resync.
+- **Poll (always on):** one `list` per collection per 2 s tick shared by
+  all polling watchers; catches external writes and heals anything the
+  faster lanes missed. Candidate-removes are verified with a targeted
+  `get` (a stale tick can no longer resurrect-then-drop), and a failed
+  `get` keeps the entry (transient driver errors no longer wipe
+  snapshots).
+
 - `GET /ws` (upgrade): `subscribe{key, collection, options?, group?, token?}`,
   `unsubscribe{key}`, `ping`, `auth{token}` messages; `ready{key}`,
   `change{key, kind: add|change|remove, doc}`, `error{key?, message}`, `pong` replies.
