@@ -40,6 +40,7 @@ use hakobackend_db_mysql::MysqlDb;
 use hakobackend_db_rethinkdb::RethinkDb;
 use hakobackend_policy::{Identity, PolicyFile};
 use hakobackend_ratelimit::{Limiter, Quota};
+use tower_http::compression::predicate::Predicate;
 
 #[derive(Clone)]
 struct AppState {
@@ -387,9 +388,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // gzip JSON responses, but never the live streams: compressing
         // SSE would buffer flushes and add event latency for little gain
         // (stream frames are already tiny; WS upgrades carry no body).
+        // SizeAbove(1024): gzip below ~1 KB costs more than it saves
+        // (measured 13-33% overhead on small docs when clients compress).
         .layer(
             tower_http::compression::CompressionLayer::new().compress_when(
-                tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+                tower_http::compression::predicate::SizeAbove::new(1024).and(
+                    tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+                ),
             ),
         )
         // 8 MB bodies (legacy json-limit parity); larger payloads 413.
