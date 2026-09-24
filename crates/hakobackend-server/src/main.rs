@@ -11,6 +11,7 @@
 mod coalesce;
 mod config;
 mod realtime;
+mod tenant_auth;
 mod tenant_policy;
 
 use axum::{
@@ -64,6 +65,8 @@ struct AppState {
     coalesce_on: bool,
     /// Per-tenant policy docs (`__tenant_policies`), cached with TTL.
     tenant_policies: Arc<tenant_policy::TenantPolicies>,
+    /// Per-tenant auth bundles (chains built from `__auth_profiles`).
+    tenant_auths: Arc<tenant_auth::TenantAuths>,
 }
 
 impl AppState {
@@ -220,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_handle: Arc<tokio::sync::RwLock<Arc<dyn Database>>> =
         Arc::new(tokio::sync::RwLock::new(db));
+    let tenant_identity = policy.identity_snapshot();
     let state = AppState {
         db: db_handle.clone(),
         policy,
@@ -231,7 +235,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli,
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
-        tenant_policies: Arc::new(tenant_policy::TenantPolicies::new(db_handle)),
+        tenant_policies: Arc::new(tenant_policy::TenantPolicies::new(db_handle.clone())),
+        tenant_auths: Arc::new(tenant_auth::TenantAuths::new(db_handle, tenant_identity)),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -253,6 +258,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/collectionGroup/{name}", get(collection_group))
         .route("/api/aggregate/{*path}", post(aggregate))
         .route("/api/tenants", post(tenant_create).get(tenant_list))
+        .route("/api/auth-profiles", get(auth_profile_list))
+        .route("/api/auth-profiles/{id}", axum::routing::put(auth_profile_put))
         .route("/api/tenants/{slug}/policy", axum::routing::put(tenant_policy_put).get(tenant_policy_get))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
@@ -462,6 +469,57 @@ fn dpop_action(mode: DpopMode, is_local_token: bool, has_proof: bool) -> DpopAct
     }
 }
 
+/// Resolve one token, tenant-aware: with a hint, verify against that
+/// tenant's bundle exclusively and bind the result to the hint —
+/// cross-tenant replay dies here. Without a hint, legacy global resolve.
+async fn resolve_token_for_tenant(
+    s: &AppState,
+    hint: Option<&str>,
+    token: &str,
+) -> Option<AuthContext> {
+    let hint = hint?;
+    let bundle = s.tenant_auths.get(hint).await?;
+    // Verify against the tenant chain.
+    let mut claims = None;
+    for p in &bundle.chain.providers {
+        if let Ok(c) = p.verify(token).await {
+            claims = Some(c);
+            break;
+        }
+    }
+    let claims = claims?;
+    let db = s.db.read().await.clone();
+    // Bind: local JWTs must carry this tenant; external identities must
+    // exist in the tenant user store (uid namespaced per provider).
+    match claims.provider {
+        "local" => {
+            if claims.tenant.as_deref() != Some(hint) {
+                return None;
+            }
+            bundle.chain.resolve(&bundle_identity(s), Some(&*db), token).await
+        }
+        _ => {
+            let tdb = hakobackend_core::tenant_db::TenantDb::new(db.clone(), hint);
+            let uid = format!("{}:{}", claims.provider, claims.uid);
+            let ident = bundle_identity(s);
+            let hit = tdb.get(&ident.users_collection, &uid).await.ok()??;
+            let mut ctx = bundle.chain.resolve(&ident, Some(&tdb), token).await?;
+            // Belt and suspenders: the chain resolved, but confirm the
+            // membership record is really this tenant's (namespace confusion).
+            if hit.id != uid {
+                return None;
+            }
+            ctx.tenant = Some(hint.into());
+            Some(ctx)
+        }
+    }
+}
+
+/// Identity snapshot for tenant chains (global policy identity for v1).
+fn bundle_identity(s: &AppState) -> hakobackend_policy::Identity {
+    s.policy.identity_snapshot()
+}
+
 /// Resolve one token → AuthContext (used by middleware, WS, SSE).
 async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
     let policy = s.policy.get().await;
@@ -508,12 +566,33 @@ async fn enforce_dpop(
 /// chain resolve → DPoP enforcement (local tokens) → `Extension<Option<AuthContext>>`.
 /// No token / DPoP failure = anonymous (policy rules decide, not middleware).
 async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    // Tenant hint (header/query) selects the auth bundle BEFORE verification.
+    let hint = req
+        .headers()
+        .get("x-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            req.uri().query().and_then(|q| {
+                q.split('&').find_map(|pair| {
+                    let (k, v) = pair.split_once('=')?;
+                    (k == "tenant").then(|| v.to_string())
+                })
+            })
+        })
+        .map(|h| h.trim().to_string())
+        .filter(|h| hakobackend_core::tenant::is_valid_tenant_slug(h));
     let from_cookie = read_cookie(req.headers(), ACCESS_COOKIE);
     let token = bearer(req.headers()).or_else(|| from_cookie.clone());
     let method = req.method().to_string();
     let uri = base_uri(s.tls, req.headers(), req.uri().path());
     let ctx = match &token {
-        Some(t) => resolve_token(&s, t).await,
+        // Tenant hint (if any) selects the bundle exclusively; without one
+        // the legacy global chain resolves.
+        Some(t) => match hint.as_deref() {
+            Some(h) => resolve_token_for_tenant(&s, Some(h), t).await,
+            None => resolve_token(&s, t).await,
+        },
         None => None,
     };
     let mut ctx = enforce_dpop(&s, req.headers(), &method, &uri, token, ctx).await;
@@ -771,7 +850,10 @@ async fn tenant_policy_put(
         None => return err(StatusCode::BAD_REQUEST, "body requires {policy_toml}"),
     };
     match s.tenant_policies.put(&slug, &toml).await {
-        Ok(version) => Json(serde_json::json!({ "success": true, "version": version })).into_response(),
+        Ok(version) => {
+            s.tenant_auths.invalidate(&slug);
+            Json(serde_json::json!({ "success": true, "version": version })).into_response()
+        }
         Err(e) => err(StatusCode::BAD_REQUEST, e),
     }
 }
@@ -787,6 +869,86 @@ async fn tenant_policy_get(
     match s.tenant_policies.get_raw(&slug).await {
         Some((version, toml)) => Json(serde_json::json!({ "version": version, "policy_toml": toml })).into_response(),
         None => err(StatusCode::NOT_FOUND, "no tenant policy (global applies)"),
+    }
+}
+
+/// Auth profiles (`__auth_profiles/{id}`): named, shareable auth bundles.
+/// `{owner_tenant: string|null, shared: bool, spec: string, config: {...}}`.
+/// Global admins only in v1 (owner self-service arrives with the SaaS phase).
+async fn auth_profile_put(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    if id.trim().is_empty() || id.len() > 128 {
+        return err(StatusCode::BAD_REQUEST, "invalid profile id");
+    }
+    let spec = match body.get("spec").and_then(|v| v.as_str()) {
+        Some(v) => v.to_string(),
+        None => return err(StatusCode::BAD_REQUEST, "body requires {spec}"),
+    };
+    // Validate the spec grammar now (fail-closed, not at first use).
+    match hakobackend_auth_core::AuthSpec::parse(&spec) {
+        hakobackend_auth_core::AuthSpec::File(_) => {
+            return err(StatusCode::BAD_REQUEST, "file specs stay global-only")
+        }
+        _ => {}
+    }
+    let db = s.db.read().await.clone();
+    let mut data = HashMap::new();
+    data.insert("owner_tenant".into(), body.get("owner_tenant").cloned().unwrap_or(serde_json::Value::Null));
+    data.insert("shared".into(), body.get("shared").cloned().unwrap_or(serde_json::json!(false)));
+    data.insert("spec".into(), serde_json::Value::String(spec));
+    data.insert("config".into(), body.get("config").cloned().unwrap_or(serde_json::json!({})));
+    match db
+        .set(
+            tenant_auth::AUTH_PROFILES_COLLECTION,
+            &id,
+            Doc { id: id.clone(), data },
+            false,
+        )
+        .await
+    {
+        Ok(_) => {
+            // Profiles fan out to unknown tenant sets: clear all bundles.
+            s.tenant_auths.invalidate_all();
+            Json(serde_json::json!({ "success": true, "id": id })).into_response()
+        }
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+async fn auth_profile_list(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    // Secrets never leave: redact config values, show only value SHAPE.
+    match s.db.read().await.list(tenant_auth::AUTH_PROFILES_COLLECTION, &QueryOptions::default()).await {
+        Ok(docs) => {
+            let out: Vec<_> = docs
+                .into_iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "id": d.id,
+                        "owner_tenant": d.data.get("owner_tenant").cloned().unwrap_or(serde_json::Value::Null),
+                        "shared": d.data.get("shared").cloned().unwrap_or(serde_json::json!(false)),
+                        "spec": d.data.get("spec").cloned().unwrap_or(serde_json::json!("")),
+                        "config_keys": d.data.get("config").and_then(|c| c.as_object()).map(|m| {
+                            m.keys().cloned().collect::<Vec<_>>()
+                        }).unwrap_or_default(),
+                    })
+                })
+                .collect();
+            Json(serde_json::to_value(out).unwrap()).into_response()
+        }
+            Err(_) => err_internal(),
     }
 }
 
@@ -809,14 +971,24 @@ async fn tenant_create(
         return err(StatusCode::BAD_REQUEST, "slug must match ^[a-z0-9][a-z0-9-]{0,62}$");
     }
     let db = s.db.read().await.clone();
+    // Optional link to an auth profile (verified at use time, not here —
+    // dangling refs simply fall back to the global chain).
+    let mut data = HashMap::new();
+    if let Some(p) = body.get("auth_profile").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+        data.insert("auth_profile".to_string(), serde_json::Value::String(p.into()));
+    }
     match db
         .insert(
             hakobackend_core::tenant::TENANTS_COLLECTION,
-            Doc { id: slug.clone(), data: Default::default() },
+            Doc { id: slug.clone(), data },
         )
         .await
     {
-        Ok(_) => Json(serde_json::json!({ "success": true, "slug": slug })).into_response(),
+        Ok(_) => {
+            // New tenant: nothing cached yet, but be explicit.
+            s.tenant_auths.invalidate(&slug);
+            Json(serde_json::json!({ "success": true, "slug": slug })).into_response()
+        }
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
@@ -1651,8 +1823,41 @@ fn str_field(body: &HashMap<String, serde_json::Value>, keys: &[&str]) -> Option
     keys.iter().find_map(|k| body.get(*k)).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
-async fn auth_register(State(s): State<AppState>, Json(body): Json<serde_json::Value>) -> impl IntoResponse {
-    let local = match local_or_400(&s).await {
+/// Optional tenant selector for issuance endpoints (`?tenant=` or body field
+/// — header `X-Tenant` is read by the caller where headers exist).
+/// An explicit hint selects the tenant bundle EXCLUSIVELY: unknown tenant
+/// or no local profile → 400, never a silent global fallback (a typo'd
+/// tenant must not mint a global user). No hint → global chain as before.
+#[derive(serde::Deserialize)]
+struct TenantQuery {
+    tenant: Option<String>,
+}
+
+fn clean_hint(raw: Option<String>) -> Option<String> {
+    raw.map(|h| h.trim().to_string())
+        .filter(|h| hakobackend_core::tenant::is_valid_tenant_slug(h))
+}
+
+async fn issuance_local(s: &AppState, hint: Option<String>) -> Result<Arc<LocalAuth>, Response> {
+    match clean_hint(hint) {
+        Some(h) => match s.tenant_auths.get(&h).await.and_then(|b| b.local.clone()) {
+            Some(l) => Ok(l),
+            None => Err(err(StatusCode::BAD_REQUEST, "unknown tenant or no local auth configured")),
+        },
+        None => local_or_400(s).await,
+    }
+}
+
+async fn auth_register(
+    State(s): State<AppState>,
+    Query(q): Query<TenantQuery>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    // Body `tenant` accepted as convenience; query wins when both present.
+    let hint = clean_hint(q.tenant).or_else(|| {
+        body.get("tenant").and_then(|v| v.as_str()).and_then(|t| clean_hint(Some(t.to_string())))
+    });
+    let local = match issuance_local(&s, hint).await {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -1662,6 +1867,8 @@ async fn auth_register(State(s): State<AppState>, Json(body): Json<serde_json::V
     };
     let id = body.remove("id").and_then(|v| v.as_str().map(str::to_string));
     let email = body.remove("email").and_then(|v| v.as_str().map(str::to_string));
+    // Routing only — the binding lives in the JWT claim, not the doc.
+    body.remove("tenant");
     let password = match body.remove("password").and_then(|v| v.as_str().map(str::to_string)) {
         Some(p) => p,
         None => return err(StatusCode::BAD_REQUEST, "password required"),
@@ -1683,9 +1890,20 @@ fn issuance_parts(s: &AppState, headers: &HeaderMap, path: &str) -> (Option<Stri
 async fn auth_login(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<TenantQuery>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let local = match local_or_400(&s).await {
+    // Header wins (proxies strip query strings from logs); body as fallback.
+    let hint = headers
+        .get("x-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .and_then(|t| clean_hint(Some(t)))
+        .or_else(|| clean_hint(q.tenant))
+        .or_else(|| {
+            body.get("tenant").and_then(|v| v.as_str()).and_then(|t| clean_hint(Some(t.to_string())))
+        });
+    let local = match issuance_local(&s, hint).await {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -1713,8 +1931,20 @@ async fn auth_login(
     }
 }
 
-async fn auth_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let local = match local_or_400(&s).await {
+async fn auth_refresh(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantQuery>,
+) -> impl IntoResponse {
+    // Refresh re-verifies inside the issuing tenant's bundle: a tenant
+    // refresh token is meaningless to the global chain and vice versa.
+    let hint = headers
+        .get("x-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .and_then(|t| clean_hint(Some(t)))
+        .or_else(|| clean_hint(q.tenant));
+    let local = match issuance_local(&s, hint).await {
         Ok(l) => l,
         Err(e) => return e,
     };
@@ -1734,10 +1964,27 @@ async fn auth_refresh(State(s): State<AppState>, headers: HeaderMap) -> impl Int
     }
 }
 
-async fn auth_logout(State(s): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Some(local) = s.local.read().await.clone() {
-        if let Some(t) = read_cookie(&headers, REFRESH_COOKIE) {
-            let _ = local.logout(&t).await;
+async fn auth_logout(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<TenantQuery>,
+) -> impl IntoResponse {
+    // Revoke in the issuing scope: tenant hint → tenant bundle, else global.
+    // Best-effort either way; clearing cookies is the real logout.
+    if let Some(t) = read_cookie(&headers, REFRESH_COOKIE) {
+        match clean_hint(q.tenant) {
+            Some(h) => {
+                if let Some(b) = s.tenant_auths.get(&h).await {
+                    if let Some(local) = &b.local {
+                        let _ = local.logout(&t).await;
+                    }
+                }
+            }
+            None => {
+                if let Some(local) = s.local.read().await.clone() {
+                    let _ = local.logout(&t).await;
+                }
+            }
         }
     }
     (StatusCode::OK, clear_cookies(), Json(serde_json::json!({ "success": true }))).into_response()
@@ -1778,15 +2025,26 @@ async fn ws_handler(
                 None
             }
         });
+    // Same hint sources as HTTP (header/query); selects the tenant bundle.
+    let hint = headers
+        .get("x-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| q.get("tenant").cloned())
+        .map(|h| h.trim().to_string())
+        .filter(|h| hakobackend_core::tenant::is_valid_tenant_slug(h));
     let uri = base_uri(s.tls, &headers, "/ws");
     let mut auth = None;
     if let Some(t) = init.clone() {
-        auth = resolve_token(&s, &t).await;
+        auth = match hint.as_deref() {
+            Some(h) => resolve_token_for_tenant(&s, Some(h), &t).await,
+            None => resolve_token(&s, &t).await,
+        };
     }
     // DPoP-bound tokens must prove at upgrade (per-message proofs don't
     // exist on WS); failure degrades to anonymous like HTTP.
     auth = enforce_dpop(&s, &headers, "GET", &uri, init, auth).await;
-    ws.on_upgrade(move |socket| ws_loop(s, socket, auth))
+    ws.on_upgrade(move |socket| ws_loop(s, socket, auth, hint))
 }
 
 async fn ws_send(socket: &mut ws::WebSocket, value: serde_json::Value) -> bool {
@@ -1800,7 +2058,7 @@ fn ws_err(key: Option<&str>, message: &str) -> serde_json::Value {
     }
 }
 
-async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthContext>) {
+async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthContext>, hint: Option<String>) {
     let mut subs: HashMap<String, realtime::Subscription> = HashMap::new();
     loop {
         // Single task: socket messages + drain all subscriptions (no dynamic select!).
@@ -1836,7 +2094,12 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                 }
                 Some("auth") => {
                     let token = v.get("token").and_then(|t| t.as_str()).unwrap_or("");
-                    let mut next = resolve_token(&s, token).await;
+                    // Connection hint applies: a tenant-hinted socket resolves
+                    // exclusively against that tenant's bundle.
+                    let mut next = match hint.as_deref() {
+                        Some(h) => resolve_token_for_tenant(&s, Some(h), token).await,
+                        None => resolve_token(&s, token).await,
+                    };
                     // No headers mid-socket: a DPoP-bound token can't prove
                     // here, so Require/MustVerify degrades it to anonymous.
                     if let Some(local) = s.local.read().await.clone() {
@@ -1880,8 +2143,12 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                     };
                     // Per-subscribe token (legacy authData pattern) overrides connection auth.
                     // Same DPoP rule as the `auth` message: no proof possible here.
+                    // Connection hint applies to the resolve as well.
                     let mut sub_auth = match v.get("token").and_then(|t| t.as_str()) {
-                        Some(t) => resolve_token(&s, t).await,
+                        Some(t) => match hint.as_deref() {
+                            Some(h) => resolve_token_for_tenant(&s, Some(h), t).await,
+                            None => resolve_token(&s, t).await,
+                        },
                         None => auth.clone(),
                     };
                     if v.get("token").is_some() {
@@ -1979,9 +2246,20 @@ async fn sse_handler(
                 None
             }
         });
+    // Same hint sources as HTTP/WS (?tenant= included, already parsed above).
+    let hint = headers
+        .get("x-tenant")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| q.get("tenant").cloned())
+        .map(|h| h.trim().to_string())
+        .filter(|h| hakobackend_core::tenant::is_valid_tenant_slug(h));
     let uri = base_uri(s.tls, &headers, &format!("/api/stream/{path}"));
     let auth = match token.clone() {
-        Some(t) => resolve_token(&s, &t).await,
+        Some(t) => match hint.as_deref() {
+            Some(h) => resolve_token_for_tenant(&s, Some(h), &t).await,
+            None => resolve_token(&s, &t).await,
+        },
         None => None,
     };
     // SSE is a GET: the DPoP proof (if any) rides the handshake headers.
@@ -2022,10 +2300,27 @@ async fn sse_handler(
 
 // --- GitHub OAuth, BFF pattern: browser redirect, tokens never reach the browser ---
 
-async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
-    match s.github.read().await.clone() {
-        None => err(StatusCode::BAD_REQUEST, "github oauth is not configured"),
-        Some(g) => match g.login_url().await {
+async fn github_login(
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    // Optional ?tenant=: per-tenant OAuth creds when the tenant links a
+    // github profile; otherwise the global flow.
+    let hint = q
+        .get("tenant")
+        .map(|h| h.trim().to_string())
+        .filter(|h| hakobackend_core::tenant::is_valid_tenant_slug(h));
+    let g = match hint.as_deref() {
+        Some(h) => match s.tenant_auths.get(h).await.and_then(|b| b.github.clone()) {
+            Some(g) => g,
+            None => return err(StatusCode::BAD_REQUEST, "tenant has no github profile"),
+        },
+        None => match s.github.read().await.clone() {
+            Some(g) => g,
+            None => return err(StatusCode::BAD_REQUEST, "github oauth is not configured"),
+        },
+    };
+    match g.login_url_for(hint.as_deref()).await {
             Ok((url, nonce)) => {
                 // Browser-binding nonce for the callback (login-CSRF guard).
                 let mut h = HeaderMap::new();
@@ -2038,8 +2333,7 @@ async fn github_login(State(s): State<AppState>) -> impl IntoResponse {
                 (StatusCode::FOUND, h, Redirect::to(&url)).into_response()
             }
             Err(_) => err_internal(),
-        },
-    }
+        }
 }
 
 async fn github_callback(
@@ -2047,13 +2341,38 @@ async fn github_callback(
     headers: HeaderMap,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let (g, local) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
-        (Some(g), Some(l)) => (g, l),
-        _ => return err(StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain"),
-    };
     let (code, state) = match (q.get("code").cloned(), q.get("state").cloned()) {
         (Some(c), Some(st)) => (c, st),
         _ => return err(StatusCode::BAD_REQUEST, "code + state required"),
+    };
+    // Tenant rides inside `state` (`{tenant}:{rand}`) for per-tenant logins;
+    // routeback selects that tenant's bundle, else the global flow.
+    // (`_tenant_hint` documents the routing; the bundle object carries it.)
+    let (_tenant_hint, g, local) = match state.split_once(':') {
+        Some((t, _))
+            if hakobackend_core::tenant::is_valid_tenant_slug(t) =>
+        {
+            let b = match s.tenant_auths.get(t).await {
+                Some(b) => b,
+                None => return err(StatusCode::UNAUTHORIZED, "github verification failed"),
+            };
+            let g = match b.github.clone() {
+                Some(g) => g,
+                None => return err(StatusCode::UNAUTHORIZED, "github verification failed"),
+            };
+            let l = match b.local.clone() {
+                Some(l) => l,
+                None => return err(StatusCode::UNAUTHORIZED, "github verification failed"),
+            };
+            (Some(t.to_string()), g, l)
+        }
+        _ => {
+            let (g, l) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
+                (Some(g), Some(l)) => (g, l),
+                _ => return err(StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain"),
+            };
+            (None, g, l)
+        }
     };
     // Obfuscate all failures (bad code, stale state, github down).
     let nonce = read_cookie(&headers, "__Host-gh_nonce");
@@ -2329,6 +2648,106 @@ mod tests {
         assert_eq!(tp.get_raw("acme").await.unwrap().0, 1);
         // Second write bumps the version.
         assert_eq!(tp.put("acme", toml).await.unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-tenant auth bundles: profile docs build live chains; local runs
+    /// namespaced (users land in `{tenant}__users`); JWTs carry the tenant;
+    /// unshared profiles are invisible to other tenants.
+    #[tokio::test]
+    async fn tenant_auth_bundle_local_namespaced() {
+        use hakobackend_db_sqlite::SqliteDb;
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        let dir = std::env::temp_dir().join(format!("hakobackend_tauth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let dbh = Arc::new(tokio::sync::RwLock::new(raw.clone()));
+        let ident = hakobackend_policy::Identity::default();
+        let doc = |pairs: &[(&str, serde_json::Value)]| hakobackend_core::Doc {
+            id: String::new(),
+            data: pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        };
+        // Tenant + org-global shared profile (spec local).
+        raw.set(
+            hakobackend_core::tenant::TENANTS_COLLECTION,
+            "acme",
+            {
+                let mut d = doc(&[]);
+                d.id = "acme".into();
+                d.data.insert("auth_profile".into(), serde_json::json!("p1"));
+                d
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        raw.set(
+            tenant_auth::AUTH_PROFILES_COLLECTION,
+            "p1",
+            {
+                let mut d = doc(&[]);
+                d.id = "p1".into();
+                d.data.insert("owner_tenant".into(), serde_json::Value::Null);
+                d.data.insert("shared".into(), serde_json::json!(true));
+                d.data.insert("spec".into(), serde_json::json!("local"));
+                d.data.insert("config".into(), serde_json::json!({}));
+                d
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+        let auths = tenant_auth::TenantAuths::new(dbh, ident);
+        let bundle = auths.get("acme").await.expect("bundle builds");
+        assert!(bundle.local.is_some());
+
+        // Register through the bundle: user lands namespaced.
+        let local = bundle.local.as_ref().unwrap();
+        let mut profile = HashMap::new();
+        profile.insert("tenant".into(), serde_json::json!("acme"));
+        // NB: forced tenant wins even without the doc field; set both.
+        local.register(Some("u1".into()), None, "password123", profile).await.unwrap();
+        assert!(raw.get("acme__users", "u1").await.unwrap().is_some());
+        assert!(raw.get("users", "u1").await.unwrap().is_none());
+
+        // Login mints a tenant-bound JWT; verify surfaces the claim.
+        let (ctx, _tokens) = local.login("u1", "password123", None).await.unwrap();
+        assert_eq!(ctx.tenant.as_deref(), Some("acme"));
+
+        // Unshared foreign profile is invisible (falls back to global).
+        raw.set(
+            tenant_auth::AUTH_PROFILES_COLLECTION,
+            "p2",
+            {
+                let mut d = doc(&[]);
+                d.id = "p2".into();
+                d.data.insert("owner_tenant".into(), serde_json::json!("acme"));
+                d.data.insert("shared".into(), serde_json::json!(false));
+                d.data.insert("spec".into(), serde_json::json!("local"));
+                d.data.insert("config".into(), serde_json::json!({}));
+                d
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        raw.set(
+            hakobackend_core::tenant::TENANTS_COLLECTION,
+            "beta",
+            {
+                let mut d = doc(&[]);
+                d.id = "beta".into();
+                d.data.insert("auth_profile".into(), serde_json::json!("p2"));
+                d
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(auths.get("beta").await.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

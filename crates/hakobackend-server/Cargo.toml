@@ -10,6 +10,8 @@ hakobackend-policy = { path = "../hakobackend-policy" }
 hakobackend-auth-core = { path = "../hakobackend-auth-core" }
 hakobackend-auth-local = { path = "../hakobackend-auth-local" }
 hakobackend-auth-github = { path = "../hakobackend-auth-github" }
+hakobackend-auth-firebase = { path = "../hakobackend-auth-firebase" }
+hakobackend-auth-oidc = { path = "../hakobackend-auth-oidc" }
 hakobackend-db-postgres = { path = "../hakobackend-db-postgres" }
 hakobackend-db-sqlite = { path = "../hakobackend-db-sqlite" }
 hakobackend-db-mysql = { path = "../hakobackend-db-mysql" }

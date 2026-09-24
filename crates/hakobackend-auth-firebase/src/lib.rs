@@ -95,6 +95,7 @@ impl AuthProvider for FirebaseVerifier {
             uid: sub,
             email,
             extra: data.claims,
+            tenant: None,
         })
     }
 }

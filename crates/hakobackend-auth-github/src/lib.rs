@@ -73,6 +73,7 @@ impl AuthProvider for GithubVerifier {
             uid: id.to_string(),
             email: user.get("email").and_then(|v| v.as_str()).map(str::to_string),
             extra: user,
+            tenant: None,
         };
         self.cache.write().await.insert(token.to_string(), (claims.clone(), Instant::now()));
         Ok(claims)
@@ -157,11 +158,22 @@ impl GithubOAuth {
     }
 
     /// Redirect URL to github.com + store pending state/PKCE (single-use, 10 min).
-    /// Returns (url, browser_nonce): the caller must set the nonce as an
+    /// Returns (url, nonce): the caller must set the nonce as an
     /// HttpOnly cookie — the callback requires it back, binding the flow to
     /// the browser that started it (login-CSRF protection).
     pub async fn login_url(&self) -> Result<(String, String), AppError> {
-        let state = rand_hex(16);
+        self.login_url_for(None).await
+    }
+
+    /// Per-tenant login: the tenant rides inside `state` (`{tenant}:{rand}`)
+    /// so the global callback can route back to this bundle. Random hex
+    /// never contains `:`, so the split is unambiguous; legacy states
+    /// without a colon take the global path.
+    pub async fn login_url_for(&self, tenant: Option<&str>) -> Result<(String, String), AppError> {
+        let state = match tenant {
+            Some(t) => format!("{t}:{}", rand_hex(16)),
+            None => rand_hex(16),
+        };
         let verifier = rand_hex(64);
         let nonce = rand_hex(16);
         let doc = hakobackend_core::Doc {

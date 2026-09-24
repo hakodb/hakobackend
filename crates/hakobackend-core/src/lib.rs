@@ -5,9 +5,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub mod atomics;
 pub mod tenant;
+pub mod tenant_db;
 pub mod ttl;
 
 // --- Document: id + flexible fields (schemaless, like Firestore) ---
@@ -226,6 +228,9 @@ pub struct Claims {
     pub uid: String,
     pub email: Option<String>,
     pub extra: HashMap<String, serde_json::Value>,
+    /// Tenant bound at issuance (local JWTs). External providers leave it
+    /// empty; the server binds them via the tenant user store instead.
+    pub tenant: Option<String>,
 }
 
 impl Claims {
@@ -380,6 +385,60 @@ pub trait Database: Send + Sync {
             }
         }
         Ok((visited, deleted))
+    }
+}
+
+/// Shared handles (`Arc`) forward to the driver: decorators and caches hold
+/// one handle type everywhere (`TenantDb::new(db_arc)` just works).
+#[async_trait::async_trait]
+impl<D: Database + Send + Sync> Database for Arc<D> {
+    fn capabilities(&self) -> Capabilities {
+        self.as_ref().capabilities()
+    }
+    async fn ensure_collection(&self, path: &str) -> Result<(), AppError> {
+        self.as_ref().ensure_collection(path).await
+    }
+    async fn list_collections(&self) -> Result<Vec<String>, AppError> {
+        self.as_ref().list_collections().await
+    }
+    async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        self.as_ref().get(collection, id).await
+    }
+    async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
+        self.as_ref().list(collection, q).await
+    }
+    async fn insert(&self, collection: &str, doc: Doc) -> Result<Doc, AppError> {
+        self.as_ref().insert(collection, doc).await
+    }
+    async fn set(&self, collection: &str, id: &str, doc: Doc, merge: bool) -> Result<Doc, AppError> {
+        self.as_ref().set(collection, id, doc, merge).await
+    }
+    async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        self.as_ref().delete(collection, id).await
+    }
+    async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
+        self.as_ref().count(collection, q).await
+    }
+    async fn subscribe(
+        &self,
+        collection: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
+        self.as_ref().subscribe(collection).await
+    }
+    async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError> {
+        self.as_ref().create_index(collection, spec).await
+    }
+    async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError> {
+        self.as_ref().list_indexes(collection).await
+    }
+    async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError> {
+        self.as_ref().drop_index(collection, name).await
+    }
+    async fn run_transaction(&self, ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
+        self.as_ref().run_transaction(ops).await
+    }
+    async fn sweep_expired(&self, per_collection_cap: usize) -> Result<(usize, usize), AppError> {
+        self.as_ref().sweep_expired(per_collection_cap).await
     }
 }
 

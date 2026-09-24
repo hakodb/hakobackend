@@ -142,6 +142,7 @@ impl AuthProvider for OidcVerifier {
             uid: sub,
             email,
             extra: data.claims,
+            tenant: None,
         })
     }
 }

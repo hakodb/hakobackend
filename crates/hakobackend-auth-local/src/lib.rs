@@ -32,6 +32,7 @@ const PASSWORD_FIELD: &str = "password_hash";
 const ISSUER: &str = "universalbackend";
 const AUDIENCE: &str = "ub";
 
+#[derive(Debug, Clone)]
 pub struct LocalConfig {
     pub jwt_secret: Vec<u8>,
     pub access_ttl_secs: u64,
@@ -69,6 +70,9 @@ pub struct LocalAuth {
     identity: Identity,
     dpop_mode: std::sync::Mutex<DpopMode>,
     dpop_replay: std::sync::Mutex<dpop::ReplayCache>,
+    /// Tenant this provider serves (per-tenant instances). Bound into JWTs
+    /// and forced into contexts; None = global provider.
+    forced_tenant: Option<String>,
 }
 
 impl LocalAuth {
@@ -82,7 +86,21 @@ impl LocalAuth {
             identity,
             dpop_mode: std::sync::Mutex::new(DpopMode::from_env()),
             dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+            forced_tenant: None,
         }))
+    }
+
+    /// Scope this provider to one tenant: user store lookups, minted JWTs,
+    /// and contexts all carry it. Consumes nothing else — same handle shape.
+    pub fn with_tenant(self: &Arc<Self>, tenant: &str) -> Arc<Self> {
+        Arc::new(Self {
+            cfg: self.cfg.clone(),
+            db: self.db.clone(),
+            identity: self.identity.clone(),
+            dpop_mode: std::sync::Mutex::new(self.dpop_mode()),
+            dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+            forced_tenant: Some(tenant.into()),
+        })
     }
 
     /// Effective DPoP mode (env `UB_LOCAL_DPOP`, overridable via `dpop` in custom.toml).
@@ -156,12 +174,14 @@ impl LocalAuth {
     fn ctx_of(&self, uid: &str, doc: &Doc) -> AuthContext {
         // Tenant comes from the admin-managed user doc (never from login
         // input); invalid slugs are dropped so they can never namespace.
-        let tenant = doc
-            .data
-            .get("tenant")
-            .and_then(|v| v.as_str())
-            .filter(|t| hakobackend_core::tenant::is_valid_tenant_slug(t))
-            .map(str::to_string);
+        // A forced provider tenant wins over the doc field.
+        let tenant = self.forced_tenant.clone().or_else(|| {
+            doc.data
+                .get("tenant")
+                .and_then(|v| v.as_str())
+                .filter(|t| hakobackend_core::tenant::is_valid_tenant_slug(t))
+                .map(str::to_string)
+        });
         AuthContext {
             uid: uid.into(),
             roles: self.identity.roles_of(doc),
@@ -342,11 +362,11 @@ impl LocalAuth {
         let access = AccessClaims {
             sub: uid.into(),
             email,
-            iss: ISSUER.into(),
-            aud: AUDIENCE.into(),
+            iss: ISSUER.into(),            aud: AUDIENCE.into(),
             exp: now + self.cfg.access_ttl_secs,
             iat: now,
             cnf: cnf.map(|jkt| Cnf { jkt }),
+            tenant: self.forced_tenant.clone(),
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -421,6 +441,9 @@ struct AccessClaims {
     iat: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cnf: Option<Cnf>,
+    /// Tenant bound at issuance (per-tenant providers). Absent = global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -444,6 +467,7 @@ impl AuthProvider for LocalAuth {
             uid: data.claims.sub,
             email: data.claims.email,
             extra: HashMap::new(),
+            tenant: data.claims.tenant,
         })
     }
 }
@@ -641,6 +665,7 @@ mod tests {
             identity: Identity::default(),
             dpop_mode: std::sync::Mutex::new(DpopMode::Off),
             dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+            forced_tenant: None,
         })
     }
 

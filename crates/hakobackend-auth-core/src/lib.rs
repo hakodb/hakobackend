@@ -129,7 +129,15 @@ impl AuthChain {
             .map(|v| format!("{}:{v}", claims.provider))
             .unwrap_or_else(|| claims.namespaced());
         if let Some(db) = db {
-            if let Ok(Some(doc)) = db.get(&identity.users_collection, &uid).await {
+            let mut hit = db.get(&identity.users_collection, &uid).await.ok().flatten();
+            if hit.is_none() && claims.provider == "local" {
+                // Local registers store RAW ids (`root`, not `local:root`) while
+                // oauth provision stores namespaced docs. Fall back to the raw
+                // claim id — scoped to provider `local` only, so a github uid
+                // can never inherit roles from an unrelated local doc.
+                hit = db.get(&identity.users_collection, &claims.uid).await.ok().flatten();
+            }
+            if let Some(doc) = hit {
                 roles.extend(identity.roles_of(&doc));
             }
         }
@@ -142,7 +150,7 @@ impl AuthChain {
         if let Some(e) = email {
             extra.insert("email".to_string(), serde_json::Value::String(e));
         }
-        AuthContext { uid, roles, tenant: None, extra }
+        AuthContext { uid, roles, tenant: claims.tenant.clone(), extra }
     }
 }
 
@@ -226,6 +234,7 @@ mod tests {
                 uid: self.uid.into(),
                 email: None,
                 extra: [("groups".to_string(), json!(self.groups))].into_iter().collect(),
+                tenant: None,
             })
         }
     }
@@ -364,6 +373,7 @@ mod tests {
             uid: "x".into(),
             email: None,
             extra: [("groups".to_string(), json!(["dev", "ops"]))].into_iter().collect(),
+            tenant: None,
         };
         assert_eq!(c.roles_from_claims(&claims), vec!["pengurus"]);
     }
