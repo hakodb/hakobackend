@@ -193,7 +193,12 @@ impl PolicyFile {
 
     pub fn load(path: &str) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
+        Self::load_str(&raw).map_err(|e| format!("parse {path}: {e}"))
+    }
+
+    /// Parse from a string (tenant policies stored in the DB, not files).
+    pub fn load_str(raw: &str) -> Result<Self, String> {
+        toml::from_str(raw).map_err(|e| e.to_string())
     }
 
     /// Collection resolution: exact (`posts/abc/revisions`) → root

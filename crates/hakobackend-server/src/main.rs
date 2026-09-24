@@ -11,6 +11,7 @@
 mod coalesce;
 mod config;
 mod realtime;
+mod tenant_policy;
 
 use axum::{
     Json, Router,
@@ -61,6 +62,20 @@ struct AppState {
     coalescer: Arc<coalesce::Coalescer>,
     /// Whether the coalescer accepts merges (snapshot of the flag at boot).
     coalesce_on: bool,
+    /// Per-tenant policy docs (`__tenant_policies`), cached with TTL.
+    tenant_policies: Arc<tenant_policy::TenantPolicies>,
+}
+
+impl AppState {
+    /// Policy for this caller: the tenant's own doc when present, else global.
+    pub async fn policy_for(&self, auth: Option<&AuthContext>) -> Arc<PolicyFile> {
+        if let Some(t) = caller_tenant(auth) {
+            if let Some(p) = self.tenant_policies.get(&t).await {
+                return p;
+            }
+        }
+        self.policy.get().await
+    }
 }
 
 /// Two token buckets: loose global + strict auth. Cheap clone (Arc inside).
@@ -203,8 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[ub] TLS active (HSTS + https scheme)");
     }
 
+    let db_handle: Arc<tokio::sync::RwLock<Arc<dyn Database>>> =
+        Arc::new(tokio::sync::RwLock::new(db));
     let state = AppState {
-        db: Arc::new(tokio::sync::RwLock::new(db)),
+        db: db_handle.clone(),
         policy,
         auth: Arc::new(tokio::sync::RwLock::new(Arc::new(chain))),
         local: Arc::new(tokio::sync::RwLock::new(local)),        github: Arc::new(tokio::sync::RwLock::new(github)),
@@ -214,6 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli,
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
+        tenant_policies: Arc::new(tenant_policy::TenantPolicies::new(db_handle)),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -235,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/collectionGroup/{name}", get(collection_group))
         .route("/api/aggregate/{*path}", post(aggregate))
         .route("/api/tenants", post(tenant_create).get(tenant_list))
+        .route("/api/tenants/{slug}/policy", axum::routing::put(tenant_policy_put).get(tenant_policy_get))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler))
@@ -721,7 +740,7 @@ async fn create_collection(
     if denied_internal(&name).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     if !policy.allow(auth.as_ref(), &name, Method::Create, None) {
         return forbidden();
     }
@@ -729,6 +748,45 @@ async fn create_collection(
     match s.db.read().await.ensure_collection(&stored(tenant.as_deref(), &name)).await {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
                 Err(_) => err_internal(),
+    }
+}
+
+/// Tenant policy docs (`__tenant_policies/{slug}`): validated TOML +
+/// version bump. Global admins only (tenant-admin self-service arrives
+/// with the SaaS phase).
+async fn tenant_policy_put(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(slug): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    if !hakobackend_core::tenant::is_valid_tenant_slug(&slug) {
+        return err(StatusCode::BAD_REQUEST, "invalid tenant slug");
+    }
+    let toml = match body.get("policy_toml").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => return err(StatusCode::BAD_REQUEST, "body requires {policy_toml}"),
+    };
+    match s.tenant_policies.put(&slug, &toml).await {
+        Ok(version) => Json(serde_json::json!({ "success": true, "version": version })).into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn tenant_policy_get(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(slug): Path<String>,
+) -> impl IntoResponse {
+    if !auth.as_ref().is_some_and(|a| a.roles.iter().any(|r| r == &s.admin_role)) {
+        return forbidden();
+    }
+    match s.tenant_policies.get_raw(&slug).await {
+        Some((version, toml)) => Json(serde_json::json!({ "version": version, "policy_toml": toml })).into_response(),
+        None => err(StatusCode::NOT_FOUND, "no tenant policy (global applies)"),
     }
 }
 
@@ -798,7 +856,7 @@ async fn get_or_list(
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     let db = s.db.read().await.clone();
     let tenant = caller_tenant(auth.as_ref());
     match parse_collection_path(&path) {
@@ -927,7 +985,7 @@ async fn index_create_inner(
         Ok(spec) => spec,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
         return forbidden();
     }
@@ -956,7 +1014,7 @@ async fn index_list(
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
@@ -979,7 +1037,7 @@ async fn index_drop(
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
         return forbidden();
     }
@@ -1015,7 +1073,7 @@ async fn create(
             if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
-            let policy = s.policy.get().await;
+            let policy = s.policy_for(auth.as_ref()).await;
             let tenant = caller_tenant(auth.as_ref());
             let incoming = incoming_doc("", body);
             if !policy.allow(auth.as_ref(), &collection, Method::Create, Some(&incoming)) {
@@ -1072,7 +1130,7 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.policy.get().await;
+            let policy = s.policy_for(auth.as_ref()).await;
             let db = s.db.read().await.clone();
             let tenant = caller_tenant(auth.as_ref());
             let stored = stored(tenant.as_deref(), &collection);
@@ -1144,7 +1202,7 @@ async fn remove(
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.policy.get().await;
+            let policy = s.policy_for(auth.as_ref()).await;
             let db = s.db.read().await.clone();
             let tenant = caller_tenant(auth.as_ref());
             let stored = stored(tenant.as_deref(), &collection);
@@ -1377,7 +1435,7 @@ async fn batch(
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
     let db = s.db.read().await.clone();
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     match run_ops(&db, &policy, auth.as_ref(), ops, false).await {
         Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
         Err((StatusCode::INTERNAL_SERVER_ERROR, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
@@ -1395,7 +1453,7 @@ async fn transaction(
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
     let db = s.db.read().await.clone();
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     match run_ops(&db, &policy, auth.as_ref(), ops, true).await {
         Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
         Err((status, msg, code)) => err_code(status, msg, code),
@@ -1422,7 +1480,7 @@ async fn collection_group(
     if let Some(r) = valid_names(&name, None) {
         return r;
     }
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     let db = s.db.read().await.clone();
     let tenant = caller_tenant(auth.as_ref());
     let collections = match db.list_collections().await {
@@ -1500,7 +1558,7 @@ async fn aggregate(
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
@@ -1839,7 +1897,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                         }
                     }
                     let db = s.db.read().await.clone();
-                    let policy = s.policy.get().await;
+                    let policy = s.policy_for(sub_auth.as_ref()).await;
                     match realtime::subscribe(db, policy, sub_auth, spec).await {
                         Ok(sub) => {
                             // Per-connection snapshot budget (anti memory-bomb).
@@ -1934,7 +1992,7 @@ async fn sse_handler(
     };
     let group = matches!(q.get("group").map(|g| g.as_str()), Some("1") | Some("true"));
     let db = s.db.read().await.clone();
-    let policy = s.policy.get().await;
+    let policy = s.policy_for(auth.as_ref()).await;
     let sub = match realtime::subscribe(db, policy, auth, realtime::SubSpec { collection, options, group }).await {
         Ok(sub) => sub,
         Err(e) if matches!(e, hakobackend_core::AppError::PermissionDenied) => return forbidden(),
@@ -2077,7 +2135,7 @@ mod tests {
         assert_eq!(base_uri(true, &HeaderMap::new(), "/x"), "https://unknown/x");
     }
 
-    #[test]
+        #[test]
     fn op_method_mapping() {        use Method::*;
         assert_eq!(op_method("get", false, false), Get);
         assert_eq!(op_method("delete", true, true), Delete);
@@ -2242,6 +2300,35 @@ mod tests {
         )
         .await;
         assert!(evil.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tenant policy docs: validated TOML in, version bump out; broken TOML
+    /// rejected without touching the stored copy.
+    #[tokio::test]
+    async fn tenant_policy_put_get() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_tpol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let tp = tenant_policy::TenantPolicies::new(Arc::new(tokio::sync::RwLock::new(db)));
+        assert!(tp.get("acme").await.is_none());
+
+        let toml = "[defaults]\nread = \"deny\"\nwrite = \"deny\"\n";
+        let v1 = tp.put("acme", toml).await.unwrap();
+        assert_eq!(v1, 1);
+        let p = tp.get("acme").await.unwrap();
+        assert!(!p.allow(None, "users", Method::Get, None));
+        let (v, raw) = tp.get_raw("acme").await.unwrap();
+        assert_eq!((v, raw.as_str()), (1, toml));
+
+        // Broken TOML rejected, stored copy untouched.
+        assert!(tp.put("acme", "not = [valid").await.is_err());
+        assert_eq!(tp.get_raw("acme").await.unwrap().0, 1);
+        // Second write bumps the version.
+        assert_eq!(tp.put("acme", toml).await.unwrap(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

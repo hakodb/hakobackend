@@ -17,6 +17,8 @@ must produce exactly the same behavior.
 | `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
 | `POST /api/tenants {slug}` | admin role | `insert` into `__tenants` (conflict = taken) | 200 / 400 / 403 |
 | `GET /api/tenants` | admin role | list `__tenants` ids | 200 / 403 |
+| `PUT /api/tenants/{slug}/policy {policy_toml}` | admin role | validate + version bump in `__tenant_policies` | 200 / 400 / 403 |
+| `GET /api/tenants/{slug}/policy` | admin role | raw doc | 200 / 403 / 404 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
@@ -136,6 +138,10 @@ docs) — never from client input; no tenant = legacy unprefixed namespace.
 - Policy is evaluated on LOGICAL names: one file serves all tenants.
   Applies uniformly to CRUD, batch/transaction, indexes, aggregates,
   collection groups, and WS/SSE subscriptions.
+- A tenant with a doc in `__tenant_policies/{slug}` uses it INSTEAD of the
+  global file (replace, never merge); without one the global applies.
+  Docs carry `{policy_toml, version}`; broken TOML is rejected on write
+  and keeps the last good copy on read. Refresh ≤5 s everywhere.
 - Internal `__*` collections (incl. `__tenants`) are never addressable
   over HTTP, even under an open policy.
 - Scaling note: collections multiply by tenant count (lazy-created, no
