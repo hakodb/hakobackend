@@ -10,6 +10,8 @@ Successor to `rethink-firestore/backend` — wire-protocol compatible so existin
 - Auth provider contract: [`AUTH_CONTRACT.md`](AUTH_CONTRACT.md) (+ `custom.example.toml`)
 - HTTP translation contract: [`HTTP_CONTRACT.md`](HTTP_CONTRACT.md)
 - Standard security rules: [`SECURITY_RULES.md`](SECURITY_RULES.md) (+ `policy.standard.toml`)
+- Performance numbers + spawn topology: [`PERFORMANCE_NOTE.md`](PERFORMANCE_NOTE.md)
+- Tenant isolation study (prefix vs per-database): [`TENANT_ISOLATION_NOTE.md`](TENANT_ISOLATION_NOTE.md)
 - Sample config: [`config/hakobackend.example.toml`](config/hakobackend.example.toml)
 
 ## Layout
