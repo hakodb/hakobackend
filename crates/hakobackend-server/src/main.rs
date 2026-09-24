@@ -1762,9 +1762,10 @@ async fn remove(
 // One op = `{type, collection, id?, data?, options?}`. Gates run per op
 // (method mapped like legacy, collection created only after the gate),
 // then the whole write set applies in ONE driver transaction: all or none.
-// `add` forces merge (create path); `set` honors `options.merge`;
-// `update` errors when absent; unknown types map by existence (transaction
-// only — batch treats them as creates, like legacy).
+// `add` forces merge (upsert path); `set` honors `options.merge`
+// (merge on a missing doc creates — Firestore parity); `update` errors
+// when absent; unknown types are rejected in batch, mapped by existence
+// in transaction (legacy compat).
 
 #[derive(Debug, serde::Deserialize)]
 struct BatchOpBody {
@@ -2980,6 +2981,75 @@ mod tests {
         );
         assert!(a.data.get("createdAt").and_then(|v| v.as_str()).is_some());
         assert!(a.data.get("updatedAt").and_then(|v| v.as_str()).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn merge_op(t: &str, id: &str, data: serde_json::Value) -> BatchOpBody {
+        BatchOpBody {
+            op_type: t.into(),
+            collection: "m".into(),
+            id: Some(id.into()),
+            data: Some(data),
+            options: Some(BatchOpOptions { merge: true }),
+        }
+    }
+
+    /// merge=true evaluation, locked: `set`+merge creates when missing and
+    /// merges when present; plain `set` replaces; `update`/`add` keep
+    /// their must-exist/upsert shapes; tx unknown types map by existence.
+    #[tokio::test]
+    async fn merge_semantics_sqlite() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_merge_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+
+        // set+merge on a missing doc creates (Firestore parity).
+        run_ops(&db, &policy, None, None, vec![merge_op("set", "a", serde_json::json!({"x": 1}))], false)
+            .await
+            .unwrap();
+        let a = db.get("m", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("x"), Some(&serde_json::json!(1)));
+
+        // set+merge on a present doc merges (old keys survive).
+        run_ops(&db, &policy, None, None, vec![merge_op("set", "a", serde_json::json!({"y": 2}))], false)
+            .await
+            .unwrap();
+        let a = db.get("m", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("x"), Some(&serde_json::json!(1)));
+        assert_eq!(a.data.get("y"), Some(&serde_json::json!(2)));
+
+        // Plain set on a present doc replaces (old keys gone).
+        run_ops(&db, &policy, None, None, vec![batch_op("set", "m", "a", serde_json::json!({"z": 3}))], false)
+            .await
+            .unwrap();
+        let a = db.get("m", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("z"), Some(&serde_json::json!(3)));
+        assert!(!a.data.contains_key("x"));
+
+        // update on a missing doc aborts the whole batch.
+        let bad = run_ops(&db, &policy, None, None, vec![batch_op("update", "m", "ghost", serde_json::json!({"q": 1}))], false).await;
+        assert!(bad.is_err());
+        assert!(db.get("m", "ghost").await.unwrap().is_none());
+
+        // add upserts: merge over present, create when missing.
+        run_ops(&db, &policy, None, None, vec![batch_op("add", "m", "a", serde_json::json!({"w": 9}))], false)
+            .await
+            .unwrap();
+        let a = db.get("m", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("z"), Some(&serde_json::json!(3)));
+        assert_eq!(a.data.get("w"), Some(&serde_json::json!(9)));
+
+        // Transaction unknown types map by existence (merge when present).
+        run_ops(&db, &policy, None, None, vec![batch_op("frobnicate", "m", "a", serde_json::json!({"u": 7}))], true)
+            .await
+            .unwrap();
+        let a = db.get("m", "a").await.unwrap().unwrap();
+        assert_eq!(a.data.get("u"), Some(&serde_json::json!(7)));
+        assert_eq!(a.data.get("w"), Some(&serde_json::json!(9)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

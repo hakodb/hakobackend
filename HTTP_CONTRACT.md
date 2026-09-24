@@ -213,3 +213,5 @@ interpolated value is escaped; credential POSTs (`/portal/login`,
   100 ms window; one stored write per window, GETs overlay pending
   bodies. Atomic PATCHes bypass. Acks happen at merge time; flush
   failures log + retry (10×), SIGKILL can lose one window.
+  Full evaluation (exactness argument, measurements, limits):
+  `COALESCING_NOTE.md`.

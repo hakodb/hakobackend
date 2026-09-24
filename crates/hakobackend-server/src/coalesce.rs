@@ -75,20 +75,21 @@ impl Coalescer {
         })
     }
 
-    /// Flush entries older than the window through `write`. Drops entries
-    /// that fail persistently (logged). Returns flushed count.
+    /// Flush entries older than the window through `write`. Failed entries
+    /// requeue (up to MAX_FLUSH_FAILS, ~100 ms apart); exhausted ones drop
+    /// with a log line. Returns flushed count.
     pub async fn flush_due<F, Fut>(&self, write: F) -> usize
     where
         F: Fn(String, String, HashMap<String, serde_json::Value>) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
-        let due: Vec<(String, String, HashMap<String, serde_json::Value>)> = {
+        let due: Vec<(String, String, HashMap<String, serde_json::Value>, u32)> = {
             let mut pending = self.pending.lock().unwrap();
             let now = Instant::now();
             let mut due = Vec::new();
             pending.retain(|key, p| {
                 if now.duration_since(p.first_at) >= COALESCE_WINDOW {
-                    due.push((key.0.clone(), key.1.clone(), std::mem::take(&mut p.body)));
+                    due.push((key.0.clone(), key.1.clone(), std::mem::take(&mut p.body), p.fails));
                     false
                 } else {
                     true
@@ -97,7 +98,7 @@ impl Coalescer {
             due
         };
         let mut flushed = 0;
-        for (coll, id, body) in due {
+        for (coll, id, body, fails) in due {
             if body.is_empty() {
                 continue;
             }
@@ -107,17 +108,27 @@ impl Coalescer {
                 Err(e) => {
                     eprintln!("[coalesce] flush {}/{} failed ({e}); requeued", key.0, key.1);
                     let mut pending = self.pending.lock().unwrap();
-                    if let Some(p) = pending.get_mut(&key) {
-                        p.fails += 1;
-                        if p.fails <= MAX_FLUSH_FAILS {
-                            // Merge back what we took (newer merges win on clash).
+                    match pending.get_mut(&key) {
+                        // Concurrent merges arrived while flushing: fold the
+                        // failed body underneath (newer merges win on clash).
+                        Some(p) => {
+                            p.fails += 1;
                             let mut back = body;
                             back.extend(std::mem::take(&mut p.body));
                             p.body = back;
-                            continue;
+                        }
+                        // No concurrent write: requeue while budget remains
+                        // (first_at reset so retries pace ~one window apart).
+                        None if fails < MAX_FLUSH_FAILS => {
+                            pending.insert(
+                                key,
+                                Pending { body, first_at: Instant::now(), fails: fails + 1 },
+                            );
+                        }
+                        None => {
+                            eprintln!("[coalesce] dropping {}/{} after {MAX_FLUSH_FAILS} failures", key.0, key.1);
                         }
                     }
-                    eprintln!("[coalesce] dropping {}/{} after {MAX_FLUSH_FAILS} failures", key.0, key.1);
                 }
             }
         }
@@ -228,6 +239,36 @@ mod tests {
             .await;
         assert_eq!(n, 0, "window not elapsed yet");
         tokio::time::sleep(COALESCE_WINDOW + Duration::from_millis(20)).await;
+        let n = c
+            .flush_due(|coll, id, body| {
+                let s2 = s2.clone();
+                async move {
+                    s2.lock().unwrap().push((coll, id, body));
+                    Ok(())
+                }
+            })
+            .await;
+        assert_eq!(n, 1);
+        let got = seen.lock().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].2.get("x"), Some(&serde_json::json!(2)));
+    }
+
+    /// Failed flushes requeue (the old code dropped on first failure):
+    /// a transient error retries and still delivers exactly once.
+    #[tokio::test]
+    async fn failed_flush_requeues_then_delivers() {
+        let c = Coalescer::default();
+        assert!(c.merge("w", "a", map(&[("x", 1)])));
+        tokio::time::sleep(COALESCE_WINDOW + Duration::from_millis(20)).await;
+        // First flush fails: nothing delivered, entry requeued.
+        let n = c.flush_due(|_, _, _| async { Err::<(), String>("boom".into()) }).await;
+        assert_eq!(n, 0);
+        // A concurrent merge lands while the entry waits; newer wins.
+        assert!(c.merge("w", "a", map(&[("x", 2)])));
+        tokio::time::sleep(COALESCE_WINDOW + Duration::from_millis(20)).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s2 = seen.clone();
         let n = c
             .flush_due(|coll, id, body| {
                 let s2 = s2.clone();
