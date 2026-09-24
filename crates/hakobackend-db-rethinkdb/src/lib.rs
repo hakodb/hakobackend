@@ -677,5 +677,6 @@ mod tests {
         let dsn = std::env::var("RDB_DSN").unwrap_or_else(|_| "localhost/hakobackend_spike".into());
         let db = RethinkDb::open(&dsn).await.unwrap();
         hakobackend_core::conformance::run_conformance_suite(&db).await;
+        hakobackend_core::conformance::run_index_suite(&db).await;
     }
 }
