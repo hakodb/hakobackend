@@ -15,6 +15,10 @@ drop_index = true
 [config]
 # data = file path (created when absent) or :memory:
 # example: path = "./data/ub.sqlite"
+# durability: SQLITE_SYNCHRONOUS=full (default, fsync per commit) |
+#   normal (HakoDB-Interval class: ack immediately, OS flushes on its own
+#   schedule; never corrupt under WAL, power loss may drop last commits).
+#   Measured sqlite/Windows/debug: ~180 -> ~410 rps PUT (A/B, same warm file).
 
 [notes]
 nested = "Subcollections flattened (posts_revisions) + _collectionPath in JSON (stripped on read)"

@@ -25,7 +25,8 @@ impl SqliteDb {
             // 500s under load): wait instead, plus WAL so readers never
             // block writers. Found by the pre-release load run.
             .busy_timeout(std::time::Duration::from_secs(10))
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(sqlite_synchronous());
         // :memory: = 1 connection (each pool connection owns its own DB!).
         let max = if path.is_empty() || path == ":memory:" { 1 } else { 5 };
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -86,6 +87,24 @@ impl SqliteDb {
 
 fn qi(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// Durability knob (HakoDB Interval philosophy, opt-in): `FULL` fsyncs
+/// every commit; `NORMAL` acks immediately and lets the OS flush on its
+/// own schedule — same guarantee class as HakoDB `Interval` (never
+/// corrupt under WAL, but a power loss can drop the last commits).
+/// Env `SQLITE_SYNCHRONOUS=normal`, default `full`. Unknown values fail
+/// closed at boot (a typo must not silently weaken durability).
+fn sqlite_synchronous() -> sqlx::sqlite::SqliteSynchronous {
+    parse_synchronous(&std::env::var("SQLITE_SYNCHRONOUS").unwrap_or_default())
+}
+
+fn parse_synchronous(raw: &str) -> sqlx::sqlite::SqliteSynchronous {
+    match raw.to_lowercase().as_str() {
+        "" | "full" => sqlx::sqlite::SqliteSynchronous::Full,
+        "normal" => sqlx::sqlite::SqliteSynchronous::Normal,
+        other => panic!("[hakobackend-db-sqlite] SQLITE_SYNCHRONOUS `{other}` unknown (full|normal)"),
+    }
 }
 
 /// JSON path: "a.b" → `json_extract(data, '$."a"."b"')`.
@@ -834,6 +853,14 @@ mod tests {
         assert_eq!(jpath_str("a.b"), "'$.\"a\".\"b\"'");
         assert_eq!(jpath_str("o'clock"), "'$.\"o''clock\"'");
         assert_eq!(jpath_str("a\\b\"c"), "'$.\"a\\\\b\\\"c\"'");
+    }
+
+    #[test]
+    fn synchronous_parse() {
+        use sqlx::sqlite::SqliteSynchronous;
+        assert!(matches!(parse_synchronous(""), SqliteSynchronous::Full));
+        assert!(matches!(parse_synchronous("FULL"), SqliteSynchronous::Full));
+        assert!(matches!(parse_synchronous("normal"), SqliteSynchronous::Normal));
     }
 
     fn filter(field: &str, op: FilterOp, value: serde_json::Value) -> Filter {
