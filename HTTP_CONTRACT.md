@@ -177,6 +177,26 @@ anonymous) is scoped to it. Mode/tenant/role need a restart
   (`acme__users`) and tenanted internals (`acme____sessions`) are never
   addressable nor listed (double-prefix reads 404 by design).
 
+## 13. Browser portal (phase C)
+
+Server-rendered HTML over the same JSON core (no JS framework, no new
+deps): plain forms + session cookies (BFF — tokens never reach the
+browser). Cookie POSTs are Origin-checked by the middleware; every
+interpolated value is escaped; credential POSTs (`/portal/login`,
+`/portal/register`) sit under the strict auth limiter like `/api/auth/*`.
+
+- `/portal` routes by role (org admin → `/portal/admin`, tenant admin →
+  `/portal/tenant`, else login); `/portal/status` is public (mode +
+  provider flags, no secrets); `/portal/register` exists in open mode.
+- Org admin: tenants list/create, auth profiles list/create-edit
+  (config values never shown), tenant policy editor (validated before
+  store, broken TOML rejected).
+- Tenant admin (claim-bound): user list/create/delete/roles in
+  `{tenant}__users` (delete drops the doc; live sessions expire on
+  their own), own policy editor, own (+org-global) profiles.
+- Denied pages carry real statuses (403 guards, 401 bad login, 400 bad
+  input) with a back link, not redirects.
+
 ## 11. TTL + unique + coalescing
 
 - **TTL**: a numeric `__ttl_at` (microsecond epoch, same clock as `_time`)

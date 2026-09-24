@@ -10,6 +10,7 @@
 
 mod coalesce;
 mod config;
+mod portal;
 mod realtime;
 mod tenant_auth;
 mod tenant_policy;
@@ -370,13 +371,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/auth/me", get(auth_me))
         .route("/api/auth/github/login", get(github_login))
         .route("/api/auth/github/callback", get(github_callback))
-        .layer(middleware::from_fn_with_state(strict, limit_mw));
+        .layer(middleware::from_fn_with_state(strict.clone(), limit_mw));
 
     let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
         .merge(api)
         .merge(auth_routes)
+        .merge(portal::strict_routes().layer(middleware::from_fn_with_state(strict, limit_mw)))
+        .merge(portal::routes())
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         // gzip JSON responses, but never the live streams: compressing
         // SSE would buffer flushes and add event latency for little gain
@@ -627,7 +630,10 @@ fn bundle_identity(s: &AppState) -> hakobackend_policy::Identity {
 /// itself knows where it belongs. Bundle failure keeps the claim-tagged
 /// global ctx (roleless → policy denies).
 async fn adopt_claim_tenant(s: &AppState, ctx: Option<AuthContext>, token: &str) -> Option<AuthContext> {
-    let t = ctx.as_ref().and_then(|c| c.tenant.clone())?;
+    // No claim = global caller: nothing to adopt, keep the context.
+    let Some(t) = ctx.as_ref().and_then(|c| c.tenant.clone()) else {
+        return ctx;
+    };
     if !hakobackend_core::tenant::is_valid_tenant_slug(&t) {
         return ctx;
     }
@@ -1031,27 +1037,51 @@ async fn auth_profile_put(
         }
         _ => {}
     }
+    let owner = body.get("owner_tenant").and_then(|v| v.as_str());
+    let shared = body.get("shared").and_then(|v| v.as_bool()).unwrap_or(false);
+    let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
+    match put_profile_doc(&s, &id, owner, shared, &spec, config).await {
+        Ok(()) => Json(serde_json::json!({ "success": true, "id": id })).into_response(),
+        Err(e) => e,
+    }
+}
+
+/// Shared core for the JSON + portal profile writers (validation + store
+/// + bundle invalidation in one place).
+async fn put_profile_doc(
+    s: &AppState,
+    id: &str,
+    owner: Option<&str>,
+    shared: bool,
+    spec: &str,
+    config: serde_json::Value,
+) -> Result<(), Response> {
+    if id.trim().is_empty() || id.len() > 128 {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid profile id"));
+    }
+    match hakobackend_auth_core::AuthSpec::parse(spec) {
+        hakobackend_auth_core::AuthSpec::File(_) => {
+            return Err(err(StatusCode::BAD_REQUEST, "file specs stay global-only"))
+        }
+        _ => {}
+    }
     let db = s.db.read().await.clone();
     let mut data = HashMap::new();
-    data.insert("owner_tenant".into(), body.get("owner_tenant").cloned().unwrap_or(serde_json::Value::Null));
-    data.insert("shared".into(), body.get("shared").cloned().unwrap_or(serde_json::json!(false)));
-    data.insert("spec".into(), serde_json::Value::String(spec));
-    data.insert("config".into(), body.get("config").cloned().unwrap_or(serde_json::json!({})));
-    match db
-        .set(
-            tenant_auth::AUTH_PROFILES_COLLECTION,
-            &id,
-            Doc { id: id.clone(), data },
-            false,
-        )
-        .await
+    data.insert(
+        "owner_tenant".into(),
+        owner.map(|o| serde_json::Value::String(o.into())).unwrap_or(serde_json::Value::Null),
+    );
+    data.insert("shared".into(), serde_json::Value::Bool(shared));
+    data.insert("spec".into(), serde_json::Value::String(spec.into()));
+    data.insert("config".into(), config);
+    match db.set(tenant_auth::AUTH_PROFILES_COLLECTION, id, Doc { id: id.into(), data }, false).await
     {
         Ok(_) => {
             // Profiles fan out to unknown tenant sets: clear all bundles.
             s.tenant_auths.invalidate_all();
-            Json(serde_json::json!({ "success": true, "id": id })).into_response()
+            Ok(())
         }
-        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+        Err(e) => Err(err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code())),
     }
 }
 
@@ -1123,29 +1153,33 @@ async fn tenant_create(
         Some(v) => v.to_string(),
         None => return err(StatusCode::BAD_REQUEST, "body requires {slug}"),
     };
-    if !hakobackend_core::tenant::is_valid_tenant_slug(&slug) {
-        return err(StatusCode::BAD_REQUEST, "slug must match ^[a-z0-9][a-z0-9-]{0,62}$");
+    let profile = body.get("auth_profile").and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+    match create_tenant_doc(&s, &slug, profile).await {
+        Ok(()) => Json(serde_json::json!({ "success": true, "slug": slug })).into_response(),
+        Err(e) => e,
+    }
+}
+
+/// Shared core for the JSON + portal tenant writers.
+async fn create_tenant_doc(s: &AppState, slug: &str, profile: Option<&str>) -> Result<(), Response> {
+    if !hakobackend_core::tenant::is_valid_tenant_slug(slug) {
+        return Err(err(StatusCode::BAD_REQUEST, "slug must match ^[a-z0-9][a-z0-9-]{0,62}$"));
     }
     let db = s.db.read().await.clone();
     // Optional link to an auth profile (verified at use time, not here —
     // dangling refs simply fall back to the global chain).
     let mut data = HashMap::new();
-    if let Some(p) = body.get("auth_profile").and_then(|v| v.as_str()).filter(|v| !v.is_empty()) {
+    if let Some(p) = profile {
         data.insert("auth_profile".to_string(), serde_json::Value::String(p.into()));
     }
-    match db
-        .insert(
-            hakobackend_core::tenant::TENANTS_COLLECTION,
-            Doc { id: slug.clone(), data },
-        )
-        .await
+    match db.insert(hakobackend_core::tenant::TENANTS_COLLECTION, Doc { id: slug.into(), data }).await
     {
         Ok(_) => {
             // New tenant: nothing cached yet, but be explicit.
-            s.tenant_auths.invalidate(&slug);
-            Json(serde_json::json!({ "success": true, "slug": slug })).into_response()
+            s.tenant_auths.invalidate(slug);
+            Ok(())
         }
-        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+        Err(e) => Err(err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code())),
     }
 }
 
@@ -1229,6 +1263,27 @@ async fn tenant_register(
         Some(p) => p.to_string(),
         None => return err(StatusCode::BAD_REQUEST, "password required"),
     };
+    match provision_tenant(&s, &slug, id, email, &password).await {
+        Ok((slug, uid)) => {
+            (StatusCode::CREATED, Json(serde_json::json!({ "slug": slug, "id": uid }))).into_response()
+        }
+        Err(e) => e,
+    }
+}
+
+/// Shared core for JSON + portal self-registration: profile + tenant +
+/// owner (stamped) + starter policy, with best-effort rollback.
+async fn provision_tenant(
+    s: &AppState,
+    slug: &str,
+    id: Option<String>,
+    email: Option<String>,
+    password: &str,
+) -> Result<(String, String), Response> {
+    if !hakobackend_core::tenant::is_valid_tenant_slug(slug) {
+        return Err(err(StatusCode::BAD_REQUEST, "slug must match ^[a-z0-9][a-z0-9-]{0,62}$"));
+    }
+    let slug = slug.to_string();
     let db = s.db.read().await.clone();
     let ident = s.policy.get().await.identity.clone();
     // Best-effort rollback (each step undoes the previous inserts).
@@ -1260,10 +1315,10 @@ async fn tenant_register(
         .insert(tenant_auth::AUTH_PROFILES_COLLECTION, Doc { id: slug.clone(), data: pdata })
         .await
     {
-        return match e {
+        return Err(match e {
             hakobackend_core::AppError::AlreadyExists => err(StatusCode::BAD_REQUEST, "slug taken"),
             _ => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
-        };
+        });
     }
     let mut tdata = HashMap::new();
     tdata.insert("auth_profile".to_string(), serde_json::Value::String(slug.clone()));
@@ -1275,27 +1330,27 @@ async fn tenant_register(
         .await
     {
         rollback(&db, None).await;
-        return match e {
+        return Err(match e {
             hakobackend_core::AppError::AlreadyExists => err(StatusCode::BAD_REQUEST, "slug taken"),
             _ => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
-        };
+        });
     }
     s.tenant_auths.invalidate(&slug);
     let local = match s.tenant_auths.get(&slug).await.and_then(|b| b.local.clone()) {
         Some(l) => l,
         None => {
             rollback(&db, None).await;
-            return err(
+            return Err(err(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server cannot mint tenant sessions (UB_LOCAL_JWT_SECRET unset?)",
-            );
+            ));
         }
     };
-    let owner = match local.register(id, email, &password, HashMap::new()).await {
+    let owner = match local.register(id, email, password, HashMap::new()).await {
         Ok(doc) => doc,
         Err(e) => {
             rollback(&db, None).await;
-            return err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code());
+            return Err(err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()));
         }
     };
     // Stamp the owner with the tenant-admin role (register strips roles by
@@ -1316,14 +1371,14 @@ async fn tenant_register(
     };
     if let Err(e) = stamped {
         rollback(&db, Some(owner.id.clone())).await;
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
     if let Err(e) = s.tenant_policies.put(&slug, &tenant_policy::starter_policy(&s.tenant_admin_role)).await
     {
         rollback(&db, Some(owner.id.clone())).await;
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, e));
     }
-    (StatusCode::CREATED, Json(serde_json::json!({ "slug": slug, "id": owner.id }))).into_response()
+    Ok((slug, owner.id))
 }
 
 fn parse_options(q: &HashMap<String, String>) -> Result<QueryOptions, String> {
