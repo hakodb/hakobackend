@@ -1,9 +1,17 @@
 # Docker images without a Dockerfile in the repo (repo policy: no
 # Dockerfile / docker-compose committed). The file is generated inline
-# on every run, then built multi-arch and pushed to GHCR.
+# on every run, then built and pushed to GHCR.
+#
+# Speed design (was 1h47m: emulated arm64 + cold cache every tag):
+# - one NATIVE job per arch (no QEMU): ubuntu-latest/amd64,
+#   ubuntu-24.04-arm/arm64, running in parallel;
+# - cargo-chef layers (deps cook once; app-only changes skip them);
+# - GHA cache backend scoped per arch (persists between runs);
+# - per-leg push-by-digest, then a merge job assembles the
+#   multi-arch tags with `imagetools create`.
 #
 # Tags: ghcr.io/hakodb/hakobackend:<tag> + :latest on releases,
-# :edge on manual runs. PRs build (amd64, no push) as a smoke check.
+# :edge on manual runs. PRs build (no push) as a smoke check.
 
 name: docker
 
@@ -19,19 +27,24 @@ permissions:
   packages: write
 
 jobs:
-  image:
+  gen-dockerfile:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-
       - name: generate Dockerfile (not committed, by policy)
         run: |
           cat > Dockerfile.gen <<'EOF'
-          FROM rust:1-bookworm AS build
+          FROM rust:1-bookworm AS chef
+          RUN cargo install cargo-chef --locked
           WORKDIR /src
+          FROM chef AS planner
+          COPY . .
+          RUN cargo chef prepare --recipe-path recipe.json
+          FROM chef AS builder
+          COPY --from=planner /src/recipe.json recipe.json
+          RUN --mount=type=cache,target=/usr/local/cargo/registry \
+              cargo chef cook --release --locked --recipe-path recipe.json -p hakobackend-server
           COPY . .
           RUN --mount=type=cache,target=/usr/local/cargo/registry \
               --mount=type=cache,target=/src/target \
@@ -42,12 +55,13 @@ jobs:
               && apt-get install -y --no-install-recommends ca-certificates \
               && rm -rf /var/lib/apt/lists \
               && useradd -m app
-          COPY --from=build /hakobackend /usr/local/bin/hakobackend
+          COPY --from=builder /hakobackend /usr/local/bin/hakobackend
           USER app
           WORKDIR /data
           EXPOSE 3000
           ENTRYPOINT ["hakobackend"]
           EOF
+          test -s Dockerfile.gen
 
       - name: tags
         id: tags
@@ -58,23 +72,92 @@ jobs:
           else
             echo "list=ghcr.io/hakodb/hakobackend:edge" >> "$GITHUB_OUTPUT"
           fi
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
-          else
-            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
-          fi
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-context
+          path: |
+            Dockerfile.gen
+          retention-days: 1
+    outputs:
+      tags: ${{ steps.tags.outputs.list }}
+
+  build-amd64:
+    needs: gen-dockerfile
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-context
+      - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
+      - name: build
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.gen
-          platforms: ${{ steps.tags.outputs.platforms }}
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.tags.outputs.list }}
+          platforms: linux/amd64
+          outputs: type=image,name=ghcr.io/hakodb/hakobackend,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=cargo-amd64
+          cache-to: type=gha,mode=max,scope=cargo-amd64
+
+  build-arm64:
+    needs: gen-dockerfile
+    runs-on: ubuntu-24.04-arm
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: docker-context
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.gen
+          platforms: linux/arm64
+          outputs: type=image,name=ghcr.io/hakodb/hakobackend,push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=cargo-arm64
+          cache-to: type=gha,mode=max,scope=cargo-arm64
+
+  merge:
+    needs: [gen-dockerfile, build-amd64, build-arm64]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: assemble multi-arch tags
+        env:
+          TAGS: ${{ needs.gen-dockerfile.outputs.tags }}
+          AMD64: ${{ needs.build-amd64.outputs.digest }}
+          ARM64: ${{ needs.build-arm64.outputs.digest }}
+        run: |
+          for t in ${TAGS//,/ }; do
+            docker buildx imagetools create -t "$t" \
+              "ghcr.io/hakodb/hakobackend@$AMD64" \
+              "ghcr.io/hakodb/hakobackend@$ARM64"
+          done
+          docker buildx imagetools inspect "ghcr.io/hakodb/hakobackend:$(echo "$TAGS" | cut -d, -f1 | cut -d: -f2)"
