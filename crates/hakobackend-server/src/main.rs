@@ -408,6 +408,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         // 8 MB bodies (legacy json-limit parity); larger payloads 413.
         .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+        // Outermost: total-latency clock + sample flag (front_mw runs first).
+        .layer(middleware::from_fn(front_mw))
         .with_state(state);
     if tls {
         // HSTS only meaningful via TLS (no effect on plain http).
@@ -488,8 +490,14 @@ async fn limit_mw(
     req: Request,
     next: Next,
 ) -> Response {
+    let ws_t0 = std::time::Instant::now();
     match s.limiter.check(&client_key(req.headers(), peer, s.trust_proxy)) {
-        Ok(()) => next.run(req).await,
+        Ok(()) => {
+            if WSAMP.try_get().unwrap_or(false) {
+                wstats::add(&wstats::F[2], ws_t0.elapsed().as_nanos() as u64);
+            }
+            next.run(req).await
+        }
         Err(retry_secs) => {
             let mut h = HeaderMap::new();
             h.insert(header::RETRY_AFTER, retry_secs.to_string().parse().unwrap());
@@ -717,6 +725,7 @@ async fn enforce_dpop(
 /// chain resolve → DPoP enforcement (local tokens) → `Extension<Option<AuthContext>>`.
 /// No token / DPoP failure = anonymous (policy rules decide, not middleware).
 async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    let ws_t0 = std::time::Instant::now();
     // Tenant hint (header/query) selects the auth bundle BEFORE verification.
     // Single mode pins the deployment tenant: client hints are ignored.
     let hint = s.pin_hint(
@@ -773,6 +782,9 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
         }
     }
     req.extensions_mut().insert(ctx);
+    if WSAMP.try_get().unwrap_or(false) {
+        wstats::add(&wstats::F[1], ws_t0.elapsed().as_nanos() as u64);
+    }
     next.run(req).await
 }
 
@@ -1489,6 +1501,8 @@ mod wstats {
     pub static G: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     // LIST: authz / eng_list / filter / serdom
     pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // FRONT (packet-in to handler): total / mw_auth / mw_limit / parse
+    pub static F: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     fn row(l: &str, t: &T) -> (String, u64) {
         let n = t.n.load(Ordering::Relaxed);
         let ns = t.ns.load(Ordering::Relaxed);
@@ -1509,6 +1523,56 @@ mod wstats {
         tab("put", &["authz", "get_old", "allow", "preproc", "eng_set", "emit", "serdom"], &W)
             + &tab("get", &["authz", "eng_get", "overlay", "allow_ser"], &G)
             + &tab("list", &["authz", "eng_list", "filter", "serdom"], &L)
+            + &tab("front", &["total", "mw_auth", "mw_limit", "parse"], &F)
+    }
+}
+
+// Per-request sample flag, set by the outermost timing layer and read by
+// middlewares, extractors and handlers with zero signature changes.
+// Absent (tests, direct calls) = unsampled.
+tokio::task_local! {
+    static WSAMP: bool;
+}
+
+/// Outermost timing layer (registered last = runs first): total server-side
+/// latency per sampled request + the sample flag for everything inside.
+/// Streams (WS/SSE) and the endpoint itself are excluded: for streams the
+/// handler return is not the response end.
+async fn front_mw(req: Request, next: Next) -> Response {
+    if !wstats::enabled() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path().to_string();
+    let samp = wstats::sampled();
+    let t0 = std::time::Instant::now();
+    let resp = WSAMP.scope(samp, next.run(req)).await;
+    if samp
+        && !path.starts_with("/ws")
+        && !path.starts_with("/api/stream")
+        && path != "/api/__wstats"
+    {
+        wstats::add(&wstats::F[0], t0.elapsed().as_nanos() as u64);
+    }
+    resp
+}
+
+/// Body extractor that times JSON parsing into the FRONT table.
+/// Same rejection as axum's Json (wire behavior unchanged).
+struct TimedJson<T>(T);
+
+impl<S, T> axum::extract::FromRequest<S> for TimedJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = <axum::Json<T> as axum::extract::FromRequest<S>>::Rejection;
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let t = std::time::Instant::now();
+        let axum::Json(v) = axum::Json::<T>::from_request(req, state).await?;
+        if WSAMP.try_get().unwrap_or(false) {
+            wstats::add(&wstats::F[3], t.elapsed().as_nanos() as u64);
+        }
+        Ok(TimedJson(v))
     }
 }
 
@@ -1525,7 +1589,7 @@ async fn get_or_list(
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let samp = wstats::sampled();
+    let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
     let policy = s.policy_for(auth.as_ref()).await;
     let db = s.db.read().await.clone();
@@ -1760,7 +1824,7 @@ async fn create(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
-    Json(body): Json<serde_json::Value>,
+    TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     // Legacy compat shim: POST /api/collections/<coll>/index {name, fields}
     // (legacy backend, server.ts:193). New shape: POST /api/indexes.
@@ -1823,7 +1887,7 @@ async fn put(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     write_doc(s, auth, path, body, false, skip_hint(&headers)).await
 }
@@ -1833,7 +1897,7 @@ async fn patch(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<serde_json::Value>,
+    TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     // ponytail: merge=true uses the same path as PUT; no manual read-modify-write.
     write_doc(s, auth, path, body, true, skip_hint(&headers)).await
@@ -1862,7 +1926,7 @@ async fn write_doc(
     merge: bool,
     skip_hint: bool,
 ) -> Response {
-    let samp = wstats::sampled();
+    let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
     match parse_collection_path(&path) {
         PathKind::Collection { .. } => (
@@ -2085,6 +2149,46 @@ fn op_method(op_type: &str, existed: bool, is_tx: bool) -> Method {
 
 /// Shared runner. Batch shapes: every op → `{id, success}`. Transaction
 /// shapes: `get` → doc-or-null, writes → `{success: true}`.
+///
+/// Result items are small `Value`s except tx-`get` hits, which carry their
+/// pre-serialized bytes (`Raw`): the response assembler writes them once
+/// instead of building a throwaway Value DOM per doc + re-serializing.
+/// `into_value` (re-parse) exists only for tests; production never parses.
+enum OpOut {
+    V(serde_json::Value),
+    Raw(String),
+}
+
+impl OpOut {
+    fn into_value(self) -> serde_json::Value {
+        match self {
+            OpOut::V(v) => v,
+            OpOut::Raw(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        }
+    }
+}
+
+/// `{success:true, results:[...]}` with `Raw` fragments spliced verbatim.
+/// All-small batches take the single-`Json` path exactly as before.
+fn render_results(results: Vec<OpOut>) -> Response {
+    if results.iter().all(|r| matches!(r, OpOut::V(_))) {
+        let vs: Vec<serde_json::Value> = results.into_iter().map(OpOut::into_value).collect();
+        return Json(serde_json::json!({ "success": true, "results": vs })).into_response();
+    }
+    let mut b = String::from("{\"success\":true,\"results\":[");
+    for (i, r) in results.into_iter().enumerate() {
+        if i > 0 {
+            b.push(',');
+        }
+        match r {
+            OpOut::V(v) => b.push_str(&serde_json::to_string(&v).unwrap_or_else(|_| "null".into())),
+            OpOut::Raw(s) => b.push_str(&s),
+        }
+    }
+    b.push_str("]}");
+    ([(header::CONTENT_TYPE, "application/json")], b).into_response()
+}
+
 async fn run_ops(
     db: &Arc<dyn Database>,
     policy: &Arc<PolicyFile>,
@@ -2092,7 +2196,7 @@ async fn run_ops(
     tenant: Option<String>,
     ops: Vec<BatchOpBody>,
     is_tx: bool,
-) -> Result<Vec<serde_json::Value>, (StatusCode, String, &'static str)> {
+) -> Result<Vec<OpOut>, (StatusCode, String, &'static str)> {
     use hakobackend_core::{TxOp, TxOpKind};
     // Phase 1: resolve + gate each op (reads tolerate missing tables).
     // Unknown op types are rejected outright (fail-closed: an unknown type
@@ -2257,17 +2361,23 @@ async fn run_ops(
     }
     // Phase 3: legacy result shapes — batch: every op → `{id, success}`;
     // transaction: `get` → doc-or-null, writes → `{success: true}`.
+    // tx-get hits serialize once into Raw (no intermediate Value DOM).
     Ok(gated
         .into_iter()
         .zip(outs)
         .map(|(g, o)| {
             let t = g.body.op_type.to_ascii_lowercase();
             if !is_tx {
-                serde_json::json!({ "id": g.id, "success": true })
+                OpOut::V(serde_json::json!({ "id": g.id, "success": true }))
             } else {
                 match t.as_str() {
-                    "get" => o.doc.map(|d| serde_json::to_value(d).unwrap()).unwrap_or(serde_json::Value::Null),
-                    _ => serde_json::json!({ "success": true }),
+                    "get" => match o.doc {
+                        Some(d) => OpOut::Raw(
+                            serde_json::to_string(&d).unwrap_or_else(|_| "null".into()),
+                        ),
+                        None => OpOut::V(serde_json::Value::Null),
+                    },
+                    _ => OpOut::V(serde_json::json!({ "success": true })),
                 }
             }
         })
@@ -2287,7 +2397,7 @@ async fn batch(
     let db = s.db.read().await.clone();
     let policy = s.policy_for(auth.as_ref()).await;
     match run_ops(&db, &policy, auth.as_ref(), s.effective_tenant(auth.as_ref()), ops, false).await {
-        Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
+        Ok(results) => render_results(results),
         Err((StatusCode::INTERNAL_SERVER_ERROR, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
         Err((_, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
     }
@@ -2305,7 +2415,7 @@ async fn transaction(
     let db = s.db.read().await.clone();
     let policy = s.policy_for(auth.as_ref()).await;
     match run_ops(&db, &policy, auth.as_ref(), s.effective_tenant(auth.as_ref()), ops, true).await {
-        Ok(results) => Json(serde_json::json!({ "success": true, "results": results })).into_response(),
+        Ok(results) => render_results(results),
         Err((status, msg, code)) => err_code(status, msg, code),
     }
 }
@@ -2385,13 +2495,6 @@ struct AggSpec {
     alias: Option<String>,
 }
 
-fn agg_number(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Number(n) => n.as_f64(),
-        _ => None,
-    }
-}
-
 async fn aggregate(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -2436,7 +2539,9 @@ async fn aggregate(
                     Some(f) => f,
                     None => return err(StatusCode::BAD_REQUEST, format!("{t} needs a field")),
                 };
-                // Reduce guard: sum/avg list into RAM — refuse past the cap.
+                // Reduce guard: legacy drivers list into RAM — refuse past the cap.
+                // (Drivers with native aggregation never fetch; the guard is
+                // still correct — it bounds the legacy path only.)
                 match db.count(&stored, &opts).await {
                     Ok(n) if n > realtime::MAX_AGG_SCAN_DOCS => {
                         return err(
@@ -2447,17 +2552,14 @@ async fn aggregate(
                     Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
                     _ => {}
                 }
-                let docs = match db.list(&stored, &opts).await {
-                    Ok(d) => d,
-                    Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
-                };
-                let nums: Vec<f64> = docs.iter().filter_map(|d| d.data.get(field).and_then(agg_number)).collect();
-                if t == "sum" {
-                    serde_json::json!(nums.iter().sum::<f64>())
-                } else if nums.is_empty() {
-                    serde_json::json!(0.0)
+                let r = if t == "sum" {
+                    db.sum(&stored, field, &opts).await
                 } else {
-                    serde_json::json!(nums.iter().sum::<f64>() / nums.len() as f64)
+                    db.avg(&stored, field, &opts).await
+                };
+                match r {
+                    Ok(n) => serde_json::json!(n),
+                    Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
                 }
             }
             _ => return err(StatusCode::BAD_REQUEST, format!("unknown aggregation: {}", agg.agg_type)),
@@ -3250,6 +3352,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let res = vals(res);
         assert_eq!(res.len(), 4);
         assert!(res.iter().all(|r| r.get("success") == Some(&serde_json::json!(true))));
         assert_eq!(res[0].get("id"), Some(&serde_json::json!("a")));
@@ -3271,9 +3374,11 @@ mod tests {
         assert!(db.get("w", "d").await.unwrap().is_none());
 
         // Transaction shapes: get → doc, writes → {success}.
-        let res = run_ops(&db, &policy, None, None, vec![batch_op("get", "w", "a", d(0))], true)
-            .await
-            .unwrap();
+        let res = vals(
+            run_ops(&db, &policy, None, None, vec![batch_op("get", "w", "a", d(0))], true)
+                .await
+                .unwrap(),
+        );
         assert_eq!(res[0].get("age"), Some(&serde_json::json!(1)));
 
         // Atomics + stamps flow through batch writes (legacy __type__ wire).
@@ -3297,6 +3402,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let res = vals(res);
         assert_eq!(res[0].get("success"), Some(&serde_json::json!(true)));
         let a = db.get("w", "a").await.unwrap().unwrap();
         assert_eq!(a.data.get("age"), Some(&serde_json::json!(6)));
@@ -3360,6 +3466,36 @@ mod tests {
 
     fn ok_put(r: Response) {
         assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// run_ops yields OpOut (Raw for tx-get hits); tests assert on Values.
+    fn vals(res: Vec<OpOut>) -> Vec<serde_json::Value> {
+        res.into_iter().map(OpOut::into_value).collect()
+    }
+
+    /// Raw fragments splice verbatim; all-small takes the Json fast path.
+    #[tokio::test]
+    async fn render_results_splices_raw() {
+        let doc = Doc {
+            id: "a".into(),
+            data: [("v".to_string(), serde_json::json!(1))].into_iter().collect(),
+        };
+        let raw = serde_json::to_string(&doc).unwrap();
+        let resp = render_results(vec![
+            OpOut::Raw(raw),
+            OpOut::V(serde_json::json!({ "success": true })),
+        ]);
+        assert_eq!(resp.headers()["content-type"], "application/json");
+        let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["success"], serde_json::json!(true));
+        assert_eq!(v["results"][0]["v"], serde_json::json!(1));
+        assert_eq!(v["results"][0]["id"], serde_json::json!("a"));
+        assert_eq!(v["results"][1]["success"], serde_json::json!(true));
+        let resp2 = render_results(vec![OpOut::V(serde_json::json!({ "success": true }))]);
+        let b2 = axum::body::to_bytes(resp2.into_body(), 65536).await.unwrap();
+        let v2: serde_json::Value = serde_json::from_slice(&b2).unwrap();
+        assert_eq!(v2["results"][0]["success"], serde_json::json!(true));
     }
 
     /// Policy-level read-before-write skip (perf opt-in): public PUT skips
@@ -3572,13 +3708,17 @@ mod tests {
         assert!(db.get("acme__users", "a").await.unwrap().is_some());
         assert!(db.get("beta__users", "a").await.unwrap().is_some());
         // Each tenant reads only its own doc back through run_ops.
-        let ra = run_ops(&db, &policy, authed(Some("acme")).as_ref(), Some("acme".into()), vec![batch_op("get", "users", "a", d(""))], true)
-            .await
-            .unwrap();
+        let ra = vals(
+            run_ops(&db, &policy, authed(Some("acme")).as_ref(), Some("acme".into()), vec![batch_op("get", "users", "a", d(""))], true)
+                .await
+                .unwrap(),
+        );
         assert_eq!(ra[0].get("v"), Some(&serde_json::json!("acme")));
-        let rb = run_ops(&db, &policy, authed(Some("beta")).as_ref(), Some("beta".into()), vec![batch_op("get", "users", "a", d(""))], true)
-            .await
-            .unwrap();
+        let rb = vals(
+            run_ops(&db, &policy, authed(Some("beta")).as_ref(), Some("beta".into()), vec![batch_op("get", "users", "a", d(""))], true)
+                .await
+                .unwrap(),
+        );
         assert_eq!(rb[0].get("v"), Some(&serde_json::json!("beta")));
         // Tenant callers cannot address internals, even by stored name.
         let evil = run_ops(

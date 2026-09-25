@@ -23,6 +23,15 @@ pub struct Doc {
     pub data: HashMap<String, serde_json::Value>,
 }
 
+/// Numeric coercion for sum/avg: JSON numbers only (ints exact while small
+/// in f64); strings/bools/null/missing never coerce.
+pub fn agg_number(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
 // --- Query: ported from FILTER_OPS (query.ts) + RethinkDBOptions (rdb.ts) ---
 
 /// Filter operators supported by the gateway. The HakoDB superset covers all of them
@@ -345,6 +354,33 @@ pub trait Database: Send + Sync {
     /// Returns the document before deletion (None when absent).
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError>;
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError>;
+    /// Numeric coercion for sum/avg (JSON numbers only; strings/bools/null
+    /// never coerce — matches the legacy server reduce exactly).
+    /// Sum of a numeric top-level field (non-numeric/missing skipped).
+    /// Default lists + reduces in RAM (uniform across drivers); drivers
+    /// with native aggregation override (hako: index/sweep, no doc fetch).
+    async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        Ok(self
+            .list(collection, q)
+            .await?
+            .iter()
+            .filter_map(|d| d.data.get(field).and_then(agg_number))
+            .sum())
+    }
+    /// Mean over the numeric values (0.0 when none). Same override rule.
+    async fn avg(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        let nums: Vec<f64> = self
+            .list(collection, q)
+            .await?
+            .iter()
+            .filter_map(|d| d.data.get(field).and_then(agg_number))
+            .collect();
+        Ok(if nums.is_empty() {
+            0.0
+        } else {
+            nums.iter().sum::<f64>() / nums.len() as f64
+        })
+    }
     /// Change stream; bridged to broadcast in hakobackend-server (WS/SSE + Redis fan-out).
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError>;
     /// Create an index (simple/composite/FTS). Unsupported capability → reject clearly.
@@ -419,6 +455,12 @@ impl<D: Database + Send + Sync> Database for Arc<D> {
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         self.as_ref().count(collection, q).await
     }
+    async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        self.as_ref().sum(collection, field, q).await
+    }
+    async fn avg(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        self.as_ref().avg(collection, field, q).await
+    }
     async fn subscribe(
         &self,
         collection: &str,
@@ -490,6 +532,9 @@ pub struct Capabilities {
     pub supports_unique: bool,
     /// Custom index names honored (when false → always auto, e.g. HakoDB).
     pub supports_named_index: bool,
+    /// Native count/sum/avg pushdown (when true, TtlDb may compute
+    /// total−expired natively instead of listing; when false it lists).
+    pub supports_native_aggregation: bool,
 }
 
 // --- Index: simple/composite/FTS management contract (HTTP_CONTRACT.md §index) ---
@@ -1147,6 +1192,7 @@ pub mod conformance {
                 supports_drop_index: true,
                 supports_unique: true,
                 supports_named_index: true,
+                supports_native_aggregation: false,
             }
         }
         async fn ensure_collection(&self, _path: &str) -> Result<(), AppError> {

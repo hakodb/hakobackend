@@ -476,6 +476,7 @@ impl Database for MysqlDb {
             supports_drop_index: true,
             supports_unique: true,
             supports_named_index: true,
+            supports_native_aggregation: false,
         }
     }
 

@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{AppError, Capabilities, Change, Database, Doc, IndexInfo, IndexSpec, QueryOptions};
+use super::{agg_number, AppError, Capabilities, Change, Database, Doc, Filter, FilterOp, IndexInfo, IndexSpec, QueryOptions};
 
 /// Expiry field: microsecond epoch. Values that are not positive integers
 /// are ignored (doc stays immortal) — fail-open on malformed stamps.
@@ -32,6 +32,31 @@ pub fn is_expired(doc: &Doc) -> bool {
         .is_some_and(|t| t > 0 && t <= now_micros())
 }
 
+/// Aggregates ignore paging at the trait level too (the server clears it,
+/// but direct callers may not — a limit must never shrink a total).
+fn unpaged(q: &QueryOptions) -> QueryOptions {
+    let mut q = q.clone();
+    q.limit = None;
+    q.offset = None;
+    q
+}
+
+/// Expired-candidate subset: caller's filters AND positive-int `__ttl_at`
+/// <= now. Candidates are ALWAYS re-verified in Rust via [`is_expired`]
+/// (exact): malformed stamps that happen to match natively (floats,
+/// numeric strings, bools) are immortal, so they stay in the total —
+/// exactly as the convention demands.
+fn expired_query(q: &QueryOptions) -> QueryOptions {
+    let mut eq = unpaged(q);
+    eq.filters.push(Filter { field: TTL_FIELD.into(), op: FilterOp::Gt, value: serde_json::json!(0) });
+    eq.filters.push(Filter {
+        field: TTL_FIELD.into(),
+        op: FilterOp::Lte,
+        value: serde_json::json!(now_micros()),
+    });
+    eq
+}
+
 /// Decorator: identical behavior to the inner driver except the dead are
 /// filtered. All gateway paths go through `Arc<dyn Database>`, so wrapping
 /// once at startup covers CRUD, batch, aggregates, groups, and realtime.
@@ -42,6 +67,37 @@ pub struct TtlDb<D: Database> {
 impl<D: Database> TtlDb<D> {
     pub fn new(inner: D) -> Self {
         Self { inner }
+    }
+
+    /// Exact expired-doc count for the subset: fetch the (sweep-kept-small)
+    /// candidates, verify each in Rust via [`is_expired`]. Malformed stamps
+    /// matching natively stay out of this number (they're immortal).
+    async fn expired_count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
+        Ok(self
+            .inner
+            .list(collection, &expired_query(q))
+            .await?
+            .iter()
+            .filter(|d| is_expired(d))
+            .count() as u64)
+    }
+
+    /// Exact (expired numeric sum, expired count) for sum/avg correction.
+    async fn expired_stats(
+        &self,
+        collection: &str,
+        field: &str,
+        q: &QueryOptions,
+    ) -> Result<(f64, u64), AppError> {
+        let mut sum = 0.0;
+        let mut n = 0u64;
+        for d in self.inner.list(collection, &expired_query(q)).await? {
+            if is_expired(&d) {
+                n += 1;
+                sum += d.data.get(field).and_then(agg_number).unwrap_or(0.0);
+            }
+        }
+        Ok((sum, n))
     }
 }
 
@@ -78,9 +134,54 @@ impl<D: Database + Send + Sync> Database for TtlDb<D> {
         Ok(self.inner.delete(collection, id).await?.filter(|d| !is_expired(d)))
     }
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
-        // COUNT(*) can't see the convention: count the filtered list.
-        // Slower than native count on huge collections — sweep keeps them small.
-        Ok(self.list(collection, q).await?.len() as u64)
+        // COUNT(*) can't see the convention — unless the inner driver does
+        // native aggregation, in which case total−expired (both native, no
+        // doc fetch; exact — see expired_query). Otherwise count the
+        // filtered list. Slower on huge collections — sweep keeps them small.
+        if !self.inner.capabilities().supports_native_aggregation {
+            return Ok(self.list(collection, q).await?.len() as u64);
+        }
+        let total = self.inner.count(collection, &unpaged(q)).await?;
+        Ok(total.saturating_sub(self.expired_count(collection, q).await?))
+    }
+    /// Native sum minus the exact expired subset (see [`expired_query`]).
+    /// Legacy drivers take the trait default (list + reduce, unchanged).
+    async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        if !self.inner.capabilities().supports_native_aggregation {
+            return Ok(self
+                .list(collection, q)
+                .await?
+                .iter()
+                .filter_map(|d| d.data.get(field).and_then(agg_number))
+                .sum());
+        }
+        let total = self.inner.sum(collection, field, &unpaged(q)).await?;
+        let (exp_sum, _) = self.expired_stats(collection, field, q).await?;
+        Ok(total - exp_sum)
+    }
+    async fn avg(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        if !self.inner.capabilities().supports_native_aggregation {
+            let nums: Vec<f64> = self
+                .list(collection, q)
+                .await?
+                .iter()
+                .filter_map(|d| d.data.get(field).and_then(agg_number))
+                .collect();
+            return Ok(if nums.is_empty() {
+                0.0
+            } else {
+                nums.iter().sum::<f64>() / nums.len() as f64
+            });
+        }
+        let n_total = self.inner.count(collection, &unpaged(q)).await?;
+        let sum_total = self.inner.sum(collection, field, &unpaged(q)).await?;
+        let (exp_sum, n_exp) = self.expired_stats(collection, field, q).await?;
+        let denom = n_total.saturating_sub(n_exp);
+        Ok(if denom == 0 {
+            0.0
+        } else {
+            (sum_total - exp_sum) / denom as f64
+        })
     }
     async fn subscribe(
         &self,
@@ -161,6 +262,7 @@ mod tests {
                 supports_drop_index: false,
                 supports_unique: false,
                 supports_named_index: false,
+                supports_native_aggregation: false,
             }
         }
         async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {

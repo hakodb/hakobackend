@@ -56,6 +56,12 @@ impl Database for TenantDb {
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         self.inner.count(&self.stored(collection), q).await
     }
+    async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        self.inner.sum(&self.stored(collection), field, q).await
+    }
+    async fn avg(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        self.inner.avg(&self.stored(collection), field, q).await
+    }
     async fn subscribe(
         &self,
         collection: &str,
@@ -107,6 +113,7 @@ mod tests {
                 supports_drop_index: false,
                 supports_unique: false,
                 supports_named_index: false,
+                supports_native_aggregation: false,
             }
         }
         async fn ensure_collection(&self, p: &str) -> Result<(), AppError> {

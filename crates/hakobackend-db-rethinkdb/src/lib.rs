@@ -366,6 +366,7 @@ impl Database for RethinkDb {
             supports_drop_index: true,
             supports_unique: false,
             supports_named_index: true,
+            supports_native_aggregation: false,
         }
     }
 

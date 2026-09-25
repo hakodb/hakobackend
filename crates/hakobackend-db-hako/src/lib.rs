@@ -103,6 +103,38 @@ impl HakoDb {
         }
         hako
     }
+
+    /// Native Sum (`avg=false`) / Avg over translated filters. Key names
+    /// follow the engine (`sum_{f}` / `avg_{f}`); empty sets come back 0.0
+    /// from the engine's default keys — exactly the trait default.
+    async fn aggregate_one(
+        &self,
+        collection: &str,
+        field: &str,
+        q: &QueryOptions,
+        avg: bool,
+    ) -> Result<f64, AppError> {
+        use hakodb::query::query::AggregateOp;
+        let mut query = hakodb::query::query::Query::new(collection);
+        for f in &q.filters {
+            let hf = map_filter(f)?;
+            query = query.where_filter(&hf.field, hf.op, hf.value);
+        }
+        let (op, key) = if avg {
+            (AggregateOp::Avg(field.to_string()), format!("avg_{field}"))
+        } else {
+            (AggregateOp::Sum(field.to_string()), format!("sum_{field}"))
+        };
+        query = query.aggregate(op);
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.execute_aggregation(query)
+                .map(|m| m.get(&key).copied().unwrap_or(0.0))
+                .map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
 }
 
 fn json_to_value(v: &serde_json::Value) -> hakodb::document::value::Value {
@@ -151,6 +183,15 @@ fn map_filter(f: &hakobackend_core::Filter) -> Result<hakodb::query::filter::Fil
     })
 }
 
+/// Cursor shapes keep driver-side evaluation everywhere: native aggregation
+/// ignores cursor bounds while the contract counts/filters them.
+fn has_cursor(q: &QueryOptions) -> bool {
+    q.start_at.is_some()
+        || q.start_after.is_some()
+        || q.end_at.is_some()
+        || q.end_before.is_some()
+}
+
 #[async_trait::async_trait]
 impl Database for HakoDb {
     fn capabilities(&self) -> hakobackend_core::Capabilities {
@@ -166,6 +207,8 @@ impl Database for HakoDb {
             supports_unique: true,
             // HakoDB doesn't store custom names — always auto (documented).
             supports_named_index: false,
+            // Native count/sum/avg (index/sweep, no doc fetch).
+            supports_native_aggregation: true,
         }
     }
 
@@ -208,10 +251,7 @@ impl Database for HakoDb {
         // cursor semantics are legacy direction-ignorant; native honors
         // direction): no limit pushdown there, then apply cursor+offset+limit
         // exactly as before.
-        let has_cursor = q.start_at.is_some()
-            || q.start_after.is_some()
-            || q.end_at.is_some()
-            || q.end_before.is_some();
+        let cursor = has_cursor(q);
         let mut query = hakodb::query::query::Query::new(collection);
         for f in &q.filters {
             let hf = map_filter(f)?;
@@ -220,7 +260,7 @@ impl Database for HakoDb {
         for o in &q.order_by {
             query = query.order_by(&o.field, matches!(o.direction, hakobackend_core::Direction::Asc));
         }
-        if !has_cursor {
+        if !cursor {
             if let Some(n) = q.limit {
                 query = query.limit(n);
             }
@@ -236,7 +276,7 @@ impl Database for HakoDb {
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
-        if has_cursor {
+        if cursor {
             // Native already filters+sorts correctly; apply cursor+offset+limit via the contract.
             Ok(hakobackend_core::conformance::apply_offset_limit(
                 hakobackend_core::conformance::apply_cursor(docs, q),
@@ -324,16 +364,45 @@ impl Database for HakoDb {
         Ok(prev)
     }
 
+    async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        // ponytail: native aggregation (view-based sweep, no full decode)
+        // instead of fetch-all + reduce. Same cursor rule as count: native
+        // aggregation ignores cursor bounds, the contract counts them.
+        // Semantics match the default exactly (numeric-only, missing skip).
+        if has_cursor(q) {
+            return Ok(self
+                .list(collection, q)
+                .await?
+                .iter()
+                .filter_map(|d| d.data.get(field).and_then(hakobackend_core::agg_number))
+                .sum());
+        }
+        self.aggregate_one(collection, field, q, false).await
+    }
+
+    async fn avg(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
+        if has_cursor(q) {
+            let nums: Vec<f64> = self
+                .list(collection, q)
+                .await?
+                .iter()
+                .filter_map(|d| d.data.get(field).and_then(hakobackend_core::agg_number))
+                .collect();
+            return Ok(if nums.is_empty() {
+                0.0
+            } else {
+                nums.iter().sum::<f64>() / nums.len() as f64
+            });
+        }
+        self.aggregate_one(collection, field, q, true).await
+    }
+
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         // ponytail: native aggregation instead of fetch-all + len (O(1)
         // unfiltered, O(index) eq-filtered, sweep otherwise — no per-doc
         // decode/convert/transfer). Cursor shapes keep the legacy path:
         // native aggregation ignores cursor bounds, the contract counts them.
-        let has_cursor = q.start_at.is_some()
-            || q.start_after.is_some()
-            || q.end_at.is_some()
-            || q.end_before.is_some();
-        if has_cursor {
+        if has_cursor(q) {
             return Ok(self.list(collection, q).await?.len() as u64);
         }
         let mut query = hakodb::query::query::Query::new(collection);
@@ -742,10 +811,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Native sum/avg: numeric-only, missing skipped, empty → 0.0, cursor
+    /// shapes fall back to the contract path (same numbers).
+    #[tokio::test]
+    async fn native_sum_avg() {
+        use hakobackend_core::{Filter, FilterOp, QueryOptions};
+        let dir = std::env::temp_dir().join(format!("hakobackend_agg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        let doc = |id: &str, v: serde_json::Value| hakobackend_core::Doc {
+            id: id.into(),
+            data: [("n".to_string(), v)].into_iter().collect(),
+        };
+        db.set("t", "a", doc("a", serde_json::json!(10)), false).await.unwrap();
+        db.set("t", "b", doc("b", serde_json::json!(20)), false).await.unwrap();
+        db.set("t", "c", doc("c", serde_json::json!("xx")), false).await.unwrap();
+        db.set("t", "d", doc("d", serde_json::json!(30)), false).await.unwrap();
+        let q0 = QueryOptions::default();
+        assert_eq!(db.sum("t", "n", &q0).await.unwrap(), 60.0);
+        assert_eq!(db.avg("t", "n", &q0).await.unwrap(), 20.0);
+        assert_eq!(db.sum("t", "missing", &q0).await.unwrap(), 0.0);
+        assert_eq!(db.avg("t", "missing", &q0).await.unwrap(), 0.0);
+        // Filtered (non-eq sweep) + cursor fallback agree.
+        let mut qf = QueryOptions::default();
+        qf.filters.push(Filter { field: "n".into(), op: FilterOp::Gt, value: serde_json::json!(15) });
+        assert_eq!(db.sum("t", "n", &qf).await.unwrap(), 50.0);
+        assert_eq!(db.avg("t", "n", &qf).await.unwrap(), 25.0);
+        // Filtered (non-eq sweep) + cursor fallback agree. Cursor on the
+        // numeric field matches 10/20/30 ("xx" is incomparable → excluded).
+        let mut qc = QueryOptions::default();
+        qc.order_by.push(hakobackend_core::OrderBy { field: "n".into(), direction: hakobackend_core::Direction::Asc });
+        qc.start_after = Some(serde_json::json!(5));
+        assert_eq!(db.sum("t", "n", &qc).await.unwrap(), 60.0);
+        assert_eq!(db.avg("t", "n", &qc).await.unwrap(), 20.0);
+        assert_eq!(db.count("t", &qc).await.unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Unique enforcement: duplicate values rejected, freed values reusable,
     /// composite/FTS unique stays a clear rejection.
     #[tokio::test]
     async fn unique_shadow_registry() {
+
         use hakobackend_core::{IndexKind, IndexSpec};
         let dir = std::env::temp_dir().join(format!("hakobackend_uniq_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -777,6 +884,50 @@ mod tests {
         // Non-simple unique stays rejected.
         let bad = IndexSpec { name: None, fields: vec!["a".into(), "b".into()], unique: true, kind: IndexKind::Composite };
         assert!(db.create_index("users", &bad).await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// TtlDb over native aggregation stays EXACT: well-formed expired docs
+    /// are subtracted; malformed stamps (float/string/bool/<=0) are immortal
+    /// and remain in the totals — exactly the convention.
+    #[tokio::test]
+    async fn ttl_native_agg_exact() {
+        use hakobackend_core::ttl::{now_micros, TtlDb, TTL_FIELD};
+        use hakobackend_core::{Database, QueryOptions};
+        let dir = std::env::temp_dir().join(format!("hakobackend_ttlagg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = TtlDb::new(HakoDb::open(dir.to_string_lossy().as_ref()).unwrap());
+        let now = now_micros();
+        let doc = |id: &str, n: serde_json::Value, ttl: Option<serde_json::Value>| {
+            let mut data = std::collections::HashMap::new();
+            data.insert("n".to_string(), n);
+            if let Some(t) = ttl {
+                data.insert(TTL_FIELD.to_string(), t);
+            }
+            hakobackend_core::Doc { id: id.into(), data }
+        };
+        macro_rules! j {
+            ($e:expr) => {
+                serde_json::json!($e)
+            };
+        }
+        db.set("t", "live1", doc("live1", j!(10), None), false).await.unwrap();
+        db.set("t", "live2", doc("live2", j!(20), None), false).await.unwrap();
+        db.set("t", "future", doc("future", j!(30), Some(j!(now + 3_600_000_000))), false).await.unwrap();
+        db.set("t", "dead", doc("dead", j!(100), Some(j!(now - 1_000_000))), false).await.unwrap();
+        db.set("t", "zero", doc("zero", j!(1000), Some(j!(0))), false).await.unwrap();
+        db.set("t", "neg", doc("neg", j!(1000), Some(j!(-5))), false).await.unwrap();
+        db.set("t", "float", doc("float", j!(1000), Some(j!(1.5))), false).await.unwrap();
+        db.set("t", "str", doc("str", j!(1000), Some(j!("tomorrow"))), false).await.unwrap();
+        db.set("t", "bool", doc("bool", j!(1000), Some(j!(true))), false).await.unwrap();
+        let q0 = QueryOptions::default();
+        // 9 docs, 1 truly expired → 8 live; n sums 10+20+30+1000*5 = 5060.
+        assert_eq!(db.count("t", &q0).await.unwrap(), 8);
+        assert_eq!(db.sum("t", "n", &q0).await.unwrap(), 5060.0);
+        let avg = db.avg("t", "n", &q0).await.unwrap();
+        assert!((avg - 5060.0 / 8.0).abs() < 1e-9, "avg {avg}");
+        assert_eq!(db.sum("t", "missing", &q0).await.unwrap(), 0.0);
+        assert_eq!(db.avg("t", "missing", &q0).await.unwrap(), 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
