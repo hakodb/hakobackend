@@ -139,7 +139,11 @@ Fixes shipped (all conformance-green):
 - Deploy: prod `:3005` runs 0.1.4 (systemd, backup `hakobackend.0.1.0.bak`
   beside the binary; stop→replace→start, SELinux context preserved).
 
-## 8. eng_list anatomy (closed): the index is the cure
+## 8. eng_list anatomy (closed) + TopN proof (0.8.25)
+
+`eng_list` ~10ms on 2000 unindexed docs = full scan + per-doc
+`HakoDoc::decode` + driver `to_doc` + in-memory sort. Proven by elimination
+(index experiment) and now by construction (TopN):
 
 `eng_list` ~10-12ms on 2000 unindexed docs = full scan + per-doc
 `HakoDoc::decode` + driver `to_doc` + in-memory sort. Proven by elimination
@@ -158,6 +162,11 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   The earlier keep-alive 42us skip figure is WITHDRAWN (order effect: hint
   run went second on warm cache). Skip saves ≈77us on overwrite, ≈10us on
   create — the wstats numbers are the clean ones (sampled within-run).
+- TopN (hakodb 0.8.25, driver cursor-only): order-only 296→**1175 rps**
+  (+4x vs best pre-TopN 368: +3.2x), eq+order 820→1279 (TopN over the
+  full scan, decode-100-only), blended `eng_list` 9961→**4033us** (−60%).
+  Engine parity suite (`tests/topn_parity.rs`, 13 shapes) locks exactness;
+  `topn_runs()` counter proves lane engagement.
 
 ## 10. Pointer/passthrough verdict + per-driver positions
 
