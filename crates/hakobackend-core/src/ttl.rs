@@ -144,7 +144,7 @@ impl<D: Database + Send + Sync> Database for TtlDb<D> {
         let total = self.inner.count(collection, &unpaged(q)).await?;
         Ok(total.saturating_sub(self.expired_count(collection, q).await?))
     }
-    /// Native sum minus the exact expired subset (see [`expired_query`]).
+    /// Native sum minus the exact expired subset (see `expired_query` below).
     /// Legacy drivers take the trait default (list + reduce, unchanged).
     async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {
         if !self.inner.capabilities().supports_native_aggregation {

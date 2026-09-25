@@ -770,7 +770,6 @@ fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hakobackend_core::Database as _;
 
     /// Lazy teardown: dropping the last receiver reaps the bridge thread
     /// (within one idle tick) and prunes the entry, so a later subscribe
