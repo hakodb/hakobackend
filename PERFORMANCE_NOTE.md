@@ -119,7 +119,27 @@ Fixes shipped (all conformance-green):
    cursor-only (see driver comment). Real speed for unindexed order+limit
    still needs an index on the sort field (`/api/indexes` — supported).
 
-## 8. Pointer/passthrough verdict + per-driver positions
+## 8. eng_list anatomy (closed): the index is the cure
+
+`eng_list` ~10-12ms on 2000 unindexed docs = full scan + per-doc
+`HakoDoc::decode` + driver `to_doc` + in-memory sort. Proven by elimination
+on the bench box (driver 0.8.24, narrowed `list()`):
+
+- Baseline (no index): eq-filter 1076, eq+order 1104, order-only 368, biglist ~910 rps.
+- After `POST /api/indexes {collection: people, fields: [age]}` (simple):
+  eq-filter **2395** (+2.2x), order-only **2096** (+5.7x), eq+order/biglist
+  flat (controls: eq+order was already fast on its 28-doc set; biglist has
+  no filter/order — pure serialize, unchanged).
+- Indexed path decodes only returned docs (limit pushed via
+  SecondaryIndexRange); unindexed path decodes all 2000. That delta IS the
+  ~10ms. No code change needed for ordered/filtered queries: declare the
+  index. (Unindexed order+limit stays a full scan by correctness — §7.5.)
+- `get_old` split (wstats, same box): miss ~10us, hit ~77us (decode+to_doc).
+  The earlier keep-alive 42us skip figure is WITHDRAWN (order effect: hint
+  run went second on warm cache). Skip saves ≈77us on overwrite, ≈10us on
+  create — the wstats numbers are the clean ones (sampled within-run).
+
+## 9. Pointer/passthrough verdict + per-driver positions
 
 - Remaining `json!(...)` literals are sub-µs noise (tiny responses).
   Remaining per-doc DOMs that matter: `to_doc` (Hako Value→JSON per field)
