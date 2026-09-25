@@ -1,6 +1,6 @@
 [package]
 name = "hakobackend-server"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 
 [dependencies]
@@ -27,6 +27,7 @@ clap = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 tokio-stream = { workspace = true }
+mime = { workspace = true }
 
 # jemalloc only where it builds (Linux/macOS): MSVC is unsupported
 # upstream. Windows keeps the system allocator.

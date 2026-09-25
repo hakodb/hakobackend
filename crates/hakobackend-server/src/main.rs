@@ -1501,8 +1501,8 @@ mod wstats {
     pub static G: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     // LIST: authz / eng_list / filter / serdom
     pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
-    // FRONT (packet-in to handler): total / mw_auth / mw_limit / parse
-    pub static F: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // FRONT (packet-in to handler): total / mw_auth / mw_limit / collect / parse
+    pub static F: [T; 5] = [T::new(), T::new(), T::new(), T::new(), T::new()];
     fn row(l: &str, t: &T) -> (String, u64) {
         let n = t.n.load(Ordering::Relaxed);
         let ns = t.ns.load(Ordering::Relaxed);
@@ -1523,7 +1523,7 @@ mod wstats {
         tab("put", &["authz", "get_old", "allow", "preproc", "eng_set", "emit", "serdom"], &W)
             + &tab("get", &["authz", "eng_get", "overlay", "allow_ser"], &G)
             + &tab("list", &["authz", "eng_list", "filter", "serdom"], &L)
-            + &tab("front", &["total", "mw_auth", "mw_limit", "parse"], &F)
+            + &tab("front", &["total", "mw_auth", "mw_limit", "collect", "parse"], &F)
     }
 }
 
@@ -1556,23 +1556,57 @@ async fn front_mw(req: Request, next: Next) -> Response {
     resp
 }
 
-/// Body extractor that times JSON parsing into the FRONT table.
-/// Same rejection as axum's Json (wire behavior unchanged).
+/// Body extractor that splits body-collect vs JSON-parse into the FRONT
+/// table. Behavior is axum's `Json` exactly: same content-type rule (same
+/// `mime` logic), same `Bytes` collection (same errors), same
+/// `Json::from_bytes` classification (same 400/415/422). A parity test
+/// below pins the status codes.
 struct TimedJson<T>(T);
+
+/// axum's content-type rule, verbatim (axum 0.8 `json.rs`): application/json
+/// or any application/*+json suffix. Kept in sync by the parity test.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers.get(header::CONTENT_TYPE) else {
+        return false;
+    };
+    let Ok(content_type) = content_type.to_str() else {
+        return false;
+    };
+    let Ok(mime) = content_type.parse::<mime::Mime>() else {
+        return false;
+    };
+    mime.type_() == "application"
+        && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+}
 
 impl<S, T> axum::extract::FromRequest<S> for TimedJson<T>
 where
-    T: serde::de::DeserializeOwned,
+    T: serde::de::DeserializeOwned + std::fmt::Debug,
     S: Send + Sync,
 {
     type Rejection = <axum::Json<T> as axum::extract::FromRequest<S>>::Rejection;
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let t = std::time::Instant::now();
-        let axum::Json(v) = axum::Json::<T>::from_request(req, state).await?;
-        if WSAMP.try_get().unwrap_or(false) {
-            wstats::add(&wstats::F[3], t.elapsed().as_nanos() as u64);
+        if !json_content_type(req.headers()) {
+            // Reproduce axum's exact rejection (status+body) via a bodyless
+            // clone: same headers, so axum fails on the same check without
+            // touching a body. Pinned by the parity test below.
+            let (parts, _) = req.into_parts();
+            let bare = Request::from_parts(parts, axum::body::Body::empty());
+            return Err(axum::Json::<T>::from_request(bare, state).await.unwrap_err());
         }
-        Ok(TimedJson(v))
+        let samp = WSAMP.try_get().unwrap_or(false);
+        let t0 = std::time::Instant::now();
+        let bytes = axum::body::Bytes::from_request(req, state).await?;
+        if samp {
+            wstats::add(&wstats::F[3], t0.elapsed().as_nanos() as u64);
+            // Re-anchor: parse time excludes collection.
+        }
+        let t1 = std::time::Instant::now();
+        let v = axum::Json::<T>::from_bytes(&bytes)?;
+        if samp {
+            wstats::add(&wstats::F[4], t1.elapsed().as_nanos() as u64);
+        }
+        Ok(TimedJson(v.0))
     }
 }
 
@@ -3471,6 +3505,35 @@ mod tests {
     /// run_ops yields OpOut (Raw for tx-get hits); tests assert on Values.
     fn vals(res: Vec<OpOut>) -> Vec<serde_json::Value> {
         res.into_iter().map(OpOut::into_value).collect()
+    }
+
+    /// TimedJson rejects exactly like axum's Json (415/400 pinned here;
+    /// 422 flows from the same `from_bytes` both use).
+    #[tokio::test]
+    async fn timed_json_parity() {
+        use axum::extract::FromRequest;
+        async fn code(ct: Option<&str>, body: &'static str) -> StatusCode {
+            let mut b = axum::http::Request::builder().uri("/x").method("PUT");
+            if let Some(c) = ct {
+                b = b.header("content-type", c);
+            }
+            let req = b.body(axum::body::Body::from(body)).unwrap();
+            match TimedJson::<serde_json::Value>::from_request(req, &()).await {
+                Ok(_) => StatusCode::OK,
+                Err(e) => axum::response::IntoResponse::into_response(e).status(),
+            }
+        }
+        assert_eq!(code(Some("application/json"), "{\"a\":1}").await, StatusCode::OK);
+        assert_eq!(
+            code(Some("application/cloudevents+json"), "{\"a\":1}").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            code(Some("text/json"), "{\"a\":1}").await,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(code(None, "{\"a\":1}").await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(code(Some("application/json"), "{nope").await, StatusCode::BAD_REQUEST);
     }
 
     /// Raw fragments splice verbatim; all-small takes the Json fast path.

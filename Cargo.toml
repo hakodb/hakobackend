@@ -25,3 +25,4 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "my
 tikv-jemallocator = "0.6"
 unreql = "0.2"
 futures = "0.3"
+mime = "0.3"
