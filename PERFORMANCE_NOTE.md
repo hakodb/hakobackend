@@ -83,8 +83,10 @@ So: packet → worker task → (blocking pool for hako ops) → inline emit
 
 ## 7. Gateway wstats + hot-spot fixes (Linux EL8, hako/Always, 8 workers)
 
-Per-stage gateway timing (1/16 sampled, throwaway `/api/__wstats`,
-hakobench-style accumulators — branch deleted after measuring):
+Per-stage gateway timing (1/16 sampling, hakobench-style accumulators).
+The throwaway branch is gone: since v0.1.1 the profiler is permanent and
+gated — `UB_WSTATS=1`, exercise the paths, `GET /api/__wstats` (404 when
+disabled; one atomic load per request when off). Baseline tables below.
 
 - PUT handler ~339us: `get_old` 115.1 (34%) > `eng_set` 209.7 (fsync)
   > `preproc` 5.1 > `authz` 3.5 ≈ `serdom` 3.6 > `emit` 1.1 > `allow` 0.7.
@@ -116,3 +118,26 @@ Fixes shipped (all conformance-green):
    until the published `hakodb` dep includes the fix, then narrow to
    cursor-only (see driver comment). Real speed for unindexed order+limit
    still needs an index on the sort field (`/api/indexes` — supported).
+
+## 8. Pointer/passthrough verdict + per-driver positions
+
+- Remaining `json!(...)` literals are sub-µs noise (tiny responses).
+  Remaining per-doc DOMs that matter: `to_doc` (Hako Value→JSON per field)
+  and tx-`get` embed (`to_value` per op, ~10us/doc — ripple-blocked, see below).
+- Zero-copy passthrough (serve engine bytes as HTTP bytes) was investigated
+  and REJECTED for the current wire shape: the flat doc merges `id` (stored
+  separately in hako/sqlite/pg/mysql) into the JSON, so `id` injection forces
+  a parse anyway. Hako's `query_raw` returns binary (not JSON); sqlite/pg
+  return JSON text but id-less. Passthrough needs a breaking envelope change
+  (`{id, data}` nested) — not worth it at current margins.
+- tx-`get` RawValue embed skipped: `run_ops` returns `Vec<Value>` consumed
+  by batch+tx response builders and asserted by tests; bypassing the DOM
+  means hand-assembled response bodies. Revisit only if tx-heavy workloads
+  show it (wstats measures it as `allow_ser`-adjacent per op).
+- Per-driver pushdown: sqlite full SQL (WHERE/cursor/ORDER/LIMIT) — best
+  positioned; postgres ORDER+OFFSET+LIMIT pushed; hako native + count (this
+  release); **rethinkdb none** — full scan + in-driver `sort_and_limit`
+  (contract §5 allows it). ReQL supports order_by/skip/limit natively:
+  queued as the next driver target. mysql assumed pg-like (verify on measure).
+- Our server is one consumer among public ones; every driver above is
+  measurable with the same bench scripts + permanent wstats (§7).

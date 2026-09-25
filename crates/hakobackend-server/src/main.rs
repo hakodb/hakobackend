@@ -388,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
+        .route("/api/__wstats", get(wstats_dump))
         .merge(api)
         .merge(auth_routes)
         .merge(portal::strict_routes().layer(middleware::from_fn_with_state(strict, limit_mw)))
@@ -417,6 +418,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = cfg.listen();
+    // Stage profiler (PERFORMANCE_NOTE §7): opt-in, restart to toggle.
+    if std::env::var("UB_WSTATS").map(|v| v == "1").unwrap_or(false) {
+        wstats::set_enabled(true);
+        eprintln!("[ub] wstats on: GET /api/__wstats (1/16 sampling)");
+    }
     // Graceful drain on Ctrl+C / SIGTERM: in-flight requests finish, then
     // sockets close. Subscriptions abort with their tasks (client resubscribes).
     let shutdown = async {
@@ -962,7 +968,7 @@ async fn list_collections(
                 .into_iter()
                 .map(|(_, logical)| logical)
                 .collect();
-            Json(serde_json::to_value(out).unwrap()).into_response()
+            Json(out).into_response()
         }
                 Err(_) => err_internal(),
     }
@@ -1167,7 +1173,7 @@ async fn auth_profile_list(
                     })
                 })
                 .collect();
-            Json(serde_json::to_value(out).unwrap()).into_response()
+            Json(out).into_response()
         }
             Err(_) => err_internal(),
     }
@@ -1240,7 +1246,7 @@ async fn tenant_list(
     {
         Ok(docs) => {
             let slugs: Vec<_> = docs.into_iter().map(|d| d.id).collect();
-            Json(serde_json::to_value(slugs).unwrap()).into_response()
+            Json(slugs).into_response()
         }
                 Err(_) => err_internal(),
     }
@@ -1441,12 +1447,86 @@ fn parse_options(q: &HashMap<String, String>) -> Result<QueryOptions, String> {
     }
 }
 
+// Gateway stage profiler (hakobench-style accumulators, cf. PERFORMANCE_NOTE
+// §7 where the v0.1.1 baseline tables live). Permanent since v0.1.1 so any
+// future optimization re-measures handler stages without a rebuild: set
+// UB_WSTATS=1, exercise the paths, GET /api/__wstats (404 when disabled).
+// Cost when off: one atomic load per request; when on: 1/16 sampling.
+mod wstats {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+    pub fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+    pub struct T {
+        pub n: AtomicU64,
+        pub ns: AtomicU64,
+    }
+    impl T {
+        pub const fn new() -> T {
+            T { n: AtomicU64::new(0), ns: AtomicU64::new(0) }
+        }
+    }
+    static REQ: AtomicU64 = AtomicU64::new(0);
+    #[inline]
+    pub fn sampled() -> bool {
+        if !enabled() {
+            return false;
+        }
+        REQ.fetch_add(1, Ordering::Relaxed) % 16 == 0
+    }
+    #[inline]
+    pub fn add(t: &T, ns: u64) {
+        t.n.fetch_add(1, Ordering::Relaxed);
+        t.ns.fetch_add(ns, Ordering::Relaxed);
+    }
+    // PUT: authz / get_old / allow / preproc / eng_set / emit / serdom
+    pub static W: [T; 7] = [T::new(), T::new(), T::new(), T::new(), T::new(), T::new(), T::new()];
+    // GET-single: authz / eng_get / overlay / allow_ser
+    pub static G: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // LIST: authz / eng_list / filter / serdom
+    pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    fn row(l: &str, t: &T) -> (String, u64) {
+        let n = t.n.load(Ordering::Relaxed);
+        let ns = t.ns.load(Ordering::Relaxed);
+        let t10 = if n == 0 { 0 } else { ns.saturating_mul(10) / n.max(1) / 1000 };
+        (format!("  {l:<10}{}.{}us/req   (n={n})\n", t10 / 10, t10 % 10), t10)
+    }
+    fn tab(name: &str, labels: &[&str], t: &[T]) -> String {
+        let mut o = format!("\n[GWSTATS {name}]\n");
+        let mut tot10 = 0u64;
+        for (i, l) in labels.iter().enumerate() {
+            let (r, t10) = row(l, &t[i]);
+            o += &r;
+            tot10 += t10;
+        }
+        o + &format!("  {:<10}{}.{}us/req   (approx total)\n", "total", tot10 / 10, tot10 % 10)
+    }
+    pub fn render() -> String {
+        tab("put", &["authz", "get_old", "allow", "preproc", "eng_set", "emit", "serdom"], &W)
+            + &tab("get", &["authz", "eng_get", "overlay", "allow_ser"], &G)
+            + &tab("list", &["authz", "eng_list", "filter", "serdom"], &L)
+    }
+}
+
+async fn wstats_dump() -> Response {
+    if !wstats::enabled() {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    wstats::render().into_response()
+}
+
 async fn get_or_list(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let samp = wstats::sampled();
+    let mut ws_t = std::time::Instant::now();
     let policy = s.policy_for(auth.as_ref()).await;
     let db = s.db.read().await.clone();
     let tenant = s.effective_tenant(auth.as_ref());
@@ -1459,10 +1539,18 @@ async fn get_or_list(
                 return r;
             }
             let stored = stored(tenant.as_deref(), &collection);
+            if samp {
+                wstats::add(&wstats::G[0], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
             match db.get(&stored, &id).await {
                 Ok(maybe_doc) => {
                     // Coalescer overlay: pending PATCHes merge over storage
                     // so read-your-write holds inside the window.
+                    if samp {
+                        wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
                     let overlaid = s.coalescer.overlay(
                         &stored,
                         &id,
@@ -1472,6 +1560,10 @@ async fn get_or_list(
                         Some(data) => Some(Doc { id: id.clone(), data }),
                         None => maybe_doc,
                     };
+                    if samp {
+                        wstats::add(&wstats::G[2], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
                     match doc {
                         Some(doc) => {
                             if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
@@ -1479,7 +1571,11 @@ async fn get_or_list(
                             }
                             // ponytail: serialize Doc straight to bytes; the old
                             // to_value() built a throwaway Value DOM first.
-                            Json(doc).into_response()
+                            let r = Json(doc).into_response();
+                            if samp {
+                                wstats::add(&wstats::G[3], ws_t.elapsed().as_nanos() as u64);
+                            }
+                            r
                         }
                         None => err(StatusCode::NOT_FOUND, "Document not found"),
                     }
@@ -1497,21 +1593,39 @@ async fn get_or_list(
             let stored = stored(tenant.as_deref(), &collection);
             match parse_options(&q) {
                 Err(msg) => err(StatusCode::BAD_REQUEST, msg),
-                Ok(opts) => match db.list(&stored, &opts).await {
+                Ok(opts) => {
+                    if samp {
+                        wstats::add(&wstats::L[0], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
+                    match db.list(&stored, &opts).await {
                     // Per-doc filter (replacement for the server.ts:233 loop): documents
                     // failing the rule are excluded from the response, with no extra N+1
                     // queries when drivers push rules into queries (phase 3).
                     // Policy sees logical names: one file serves all tenants.
                     Ok(docs) => {
+                        if samp {
+                            wstats::add(&wstats::L[1], ws_t.elapsed().as_nanos() as u64);
+                            ws_t = std::time::Instant::now();
+                        }
                         let visible: Vec<_> = docs
                             .into_iter()
                             .filter(|d| policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
                             .collect();
+                        if samp {
+                            wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
+                            ws_t = std::time::Instant::now();
+                        }
                         // ponytail: direct serialization, no intermediate Value DOM.
-                        Json(visible).into_response()
+                        let r = Json(visible).into_response();
+                        if samp {
+                            wstats::add(&wstats::L[3], ws_t.elapsed().as_nanos() as u64);
+                        }
+                        r
                     }
                     Err(_) => err_internal(),
-                },
+                    }
+                }
             }
         }
     }
@@ -1614,7 +1728,7 @@ async fn index_list(
     }
     let tenant = s.effective_tenant(auth.as_ref());
     match s.db.read().await.list_indexes(&stored(tenant.as_deref(), &collection)).await {
-        Ok(indexes) => Json(serde_json::to_value(indexes).unwrap()).into_response(),
+        Ok(indexes) => Json(indexes).into_response(),
                 Err(_) => err_internal(),
     }
 }
@@ -1748,6 +1862,8 @@ async fn write_doc(
     merge: bool,
     skip_hint: bool,
 ) -> Response {
+    let samp = wstats::sampled();
+    let mut ws_t = std::time::Instant::now();
     match parse_collection_path(&path) {
         PathKind::Collection { .. } => (
             StatusCode::BAD_REQUEST,
@@ -1770,6 +1886,10 @@ async fn write_doc(
             // The per-request header hint joins the policy flag; both lose
             // to Owner (authZ-neutral by construction, see skip_hint).
             // PATCH merge always reads (needs the base + missing→404).
+            if samp {
+                wstats::add(&wstats::W[0], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
             let skip_rbw = !merge
                 && !policy.needs_existing(&collection, Method::Update)
                 && (skip_hint || policy.skip_read_before_write(&collection, Method::Update));
@@ -1778,9 +1898,17 @@ async fn write_doc(
             } else {
                 db.get(&stored, &id).await.ok().flatten()
             };
+            if samp {
+                wstats::add(&wstats::W[1], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
             // Owner rule evaluated against the existing document (who owns this data?).
             if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
                 return forbidden();
+            }
+            if samp {
+                wstats::add(&wstats::W[2], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
             }
             // Legacy parity: PATCH on a missing doc is 404 (use PUT to create).
             if merge && existing.is_none() {
@@ -1819,11 +1947,19 @@ async fn write_doc(
                 hakobackend_core::atomics::stamp_update(data, created_at)
             };
             // Merge already applied above; store the final body as-is.
+            if samp {
+                wstats::add(&wstats::W[3], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
             match db.set(&stored, &id, Doc { id: id.clone(), data }, false).await {
                 Ok(doc) => {
                     // Gateway bus: instant lane for subscribers (the shared
                     // poller stays as reconciler for foreign writes).
                     // Wire shape unchanged ({success:true}).
+                    if samp {
+                        wstats::add(&wstats::W[4], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
                     realtime::emit(
                         &stored,
                         Change {
@@ -1834,7 +1970,15 @@ async fn write_doc(
                             new: Some(doc),
                         },
                     );
-                    Json(serde_json::json!({ "success": true })).into_response()
+                    if samp {
+                        wstats::add(&wstats::W[5], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
+                    let r = Json(serde_json::json!({ "success": true })).into_response();
+                    if samp {
+                        wstats::add(&wstats::W[6], ws_t.elapsed().as_nanos() as u64);
+                    }
+                    r
                 }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -2216,7 +2360,7 @@ async fn collection_group(
             }
         }
     }
-    Json(serde_json::to_value(out).unwrap()).into_response()
+    Json(out).into_response()
 }
 
 // --- Aggregates (legacy POST /api/aggregate/* parity) ---
