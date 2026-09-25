@@ -183,10 +183,11 @@ on the bench box (driver 0.8.24, narrowed `list()`):
 - Per-driver pushdown: sqlite full SQL (WHERE/cursor/ORDER/LIMIT) — best
   positioned; postgres ORDER+OFFSET+LIMIT pushed; hako native
   (count/sum/avg + ordered limit, TTL-exact total−expired protocol in
-  `TtlDb`, gated on `supports_native_aggregation`); **rethinkdb none** —
-  full scan + in-driver `sort_and_limit` (contract §5 allows it). ReQL
-  supports order_by/skip/limit natively: queued as the next driver target
-  (gateway-first per decision — per-driver after). mysql assumed pg-like
+  `TtlDb`, gated on `supports_native_aggregation`); **rethinkdb: eq-filter
+  object + unordered skip/limit + native count** (live 2.4.3: eq-filter
+  58→211 rps, eq+order 59→194, biglist 55→152; order-only unchanged by
+  design — ReQL-vs-contract ordering parity on missing/mixed-type fields
+  is unverified, so the driver re-sorts + truncates). mysql assumed pg-like
   (verify on measure).
 - Our server is one consumer among public ones; every driver above is
   measurable with the same bench scripts + permanent wstats (§7).
