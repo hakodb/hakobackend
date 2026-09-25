@@ -57,6 +57,15 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
 - `name` optional; drivers without naming (HakoDB) auto-generate deterministically
   (`field`, `composite(a+b)`, `fts(body)`).
 - Drivers without a drop API (HakoDB) → clear 400.
+- **Query coverage rule (measured, PERFORMANCE_NOTE §8): nothing is
+  automatic.** `auto_provision` creates collections + only the `[[indexes]]`
+  you declare; no index is ever inferred from query patterns. A filtered or
+  ordered query without a matching index is a full scan + full decode
+  (~10ms/2000 docs on hako; 224 rps order-only). Declare indexes for every
+  field you filter or sort by: `simple` on the sort/filter field (ordered
+  scans + point lookups), `composite` with the equality field(s) first and
+  the sort field last (filter+order in one walk). Measured: simple index on
+  the sort field took order-only 368→2096 rps, eq-filter 1076→2395 rps.
 - Legacy-shim exception: a collection genuinely named `index` as the
   last segment is NOT hijacked — use the new `/api/indexes` form.
 

@@ -20,10 +20,16 @@ data = "./data/hako.ub"
 rules = "./policy.toml"
 
 # Ready-made indexes: created at startup + reload (per-item failure = WARN).
+# RULE: index every field you filter or order_by (nothing is inferred —
+# unindexed order+limit is a full scan; see HTTP_CONTRACT §3).
 # [[indexes]]
 # collection = "posts"
 # fields = ["age"]
 # kind = "simple"  # simple | composite | fts
+# [[indexes]]  # filter (status ==) + order (createdAt desc) in one walk
+# collection = "posts"
+# fields = ["status", "createdAt"]
+# kind = "composite"
 
 # In-process flood protection (no redis): req/min per IP + burst.
 # /api/health is always open (probes); /api/auth/* gets the strict layer.
