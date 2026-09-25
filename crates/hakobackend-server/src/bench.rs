@@ -242,13 +242,32 @@ pub async fn run(db: &Arc<dyn Database>, n: usize) -> Result<Vec<Row>, String> {
         )
         .await
         .is_ok();
+    // Index builds are background: queries issued before readiness plan
+    // against an empty index and return nothing. Poll a known-nonempty
+    // point count until it lands (same hazard exists over HTTP).
+    let mut ready = !indexed;
+    if indexed {
+        let mut probe = QueryOptions::default();
+        probe.filters.push(eq_age(30));
+        for _ in 0..300 {
+            let c = db.count(COLL, &probe).await.map_err(|e| e.to_string())?;
+            if c > 0 {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
     rows.push(Row {
         name: "index",
-        ops: usize::from(indexed),
+        ops: usize::from(ready),
         secs: 0.0,
-        note: if indexed { "setup" } else { "unsupported" },
+        note: if ready { "setup" } else { "unsupported" },
     });
-    if !indexed {
+    if !ready {
+        if indexed {
+            return Err("index never became ready".into());
+        }
         for name in ["query-idx", "count", "offset-idx", "cursor-idx"] {
             rows.push(Row { name, ops: 0, secs: 0.0, note: "no index" });
         }
