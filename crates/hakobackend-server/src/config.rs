@@ -76,6 +76,14 @@ pub struct Args {
     /// acks at merge time, driver failures surface in logs.
     #[arg(long, default_value_t = false)]
     pub coalesce_writes: bool,
+    /// Stage profiler (PERFORMANCE_NOTE §7): UB_WSTATS=1 / config / this flag.
+    /// 1/16 sampling + GET /api/__wstats (404 when off).
+    #[arg(long, default_value_t = false)]
+    pub wstats: bool,
+    /// Internal per-driver benchmark: fixed shapes, auto-clean seeds, then
+    /// exit (no serving). Comparability first: sequential, same N every run.
+    #[arg(long, default_value_t = false)]
+    pub benchmark: bool,
 }
 
 /// Final result after merge (the only one the server uses).
@@ -96,6 +104,10 @@ pub struct UbConfig {
     pub limit_auth: (u32, u32),
     pub trust_proxy: bool,
     pub coalesce_writes: bool,
+    /// Stage profiler on (env UB_WSTATS=1 also enables).
+    pub wstats: bool,
+    /// Run the internal benchmark then exit instead of serving.
+    pub benchmark: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
     /// Ready-to-use index declarations (created at startup + reload — legacy
@@ -209,6 +221,12 @@ struct FileConfig {
     tls_key: Option<String>,
     #[serde(default)]
     coalesce_writes: bool,
+    /// Stage profiler (flag `--wstats` wins when set).
+    #[serde(default)]
+    wstats: bool,
+    /// Internal benchmark then exit (flag `--benchmark` wins when set).
+    #[serde(default)]
+    benchmark: bool,
     #[serde(default)]
     indexes: Vec<IndexDecl>,
     #[serde(default)]
@@ -359,6 +377,8 @@ pub fn resolve(args: &Args) -> UbConfig {
         ),
         trust_proxy: args.trust_proxy || file.trust_proxy.unwrap_or(false),
         coalesce_writes: args.coalesce_writes || file.coalesce_writes,
+        wstats: args.wstats || file.wstats,
+        benchmark: args.benchmark || file.benchmark,
         tls_cert: args.tls_cert.clone().or(file.tls_cert),
         tls_key: args.tls_key.clone().or(file.tls_key),
         indexes: file.indexes,
@@ -441,6 +461,12 @@ limit_auth = 20
 limit_auth_burst = 5
 # trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
 
+# Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
+# wstats = false
+# Internal per-driver benchmark (same as --benchmark): fixed shapes,
+# auto-clean seeds, then exit without serving.
+# benchmark = false
+
 # TLS (both required; empty = plain http). DPoP scheme + Secure cookies follow automatically.
 # tls_cert = "./cert.pem"
 # tls_key = "./key.pem"
@@ -474,6 +500,8 @@ mod tests {
             validate: false,
             print_default_config: false,
             coalesce_writes: false,
+            wstats: false,
+            benchmark: false,
         }
     }
 
@@ -518,6 +546,26 @@ mod tests {
         a.config = Some(write_tmp("hakobackend_empty_test.toml", ""));
         let cfg = resolve(&a);
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn wstats_benchmark_flag_file_env() {
+        // Defaults off.
+        let cfg = resolve(&args());
+        assert!(!cfg.wstats && !cfg.benchmark);
+        // Flag wins.
+        let mut a = args();
+        a.wstats = true;
+        a.benchmark = true;
+        let cfg = resolve(&a);
+        assert!(cfg.wstats && cfg.benchmark);
+        // File enables when flags off.
+        let f = write_tmp("hakobackend_diag_test.toml", "wstats = true\nbenchmark = true\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert!(cfg.wstats && cfg.benchmark);
+        let _ = std::fs::remove_file(f);
     }
 
     #[test]

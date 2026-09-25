@@ -169,7 +169,6 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   `topn_runs()` counter proves lane engagement.
 
 ## 10. Pointer/passthrough verdict + per-driver positions
-
 - Remaining `json!(...)` literals are sub-µs noise (tiny responses).
   Remaining per-doc DOMs that matter: `to_doc` (Hako Value→JSON per field);
   tx-`get` embed is fixed (0.1.4 `OpOut::Raw`, single serialize + verbatim splice).
@@ -191,3 +190,32 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   (verify on measure).
 - Our server is one consumer among public ones; every driver above is
   measurable with the same bench scripts + permanent wstats (§7).
+
+## 11. Per-shape wstats + `__benchmark` (0.1.5 unreleased)
+
+- LIST splits by shape (`classify`: order / filter / filter-order / cursor
+  / paged / plain) into `shape-*` tables; the blended `list` table stays
+  for baseline continuity. Shape is computed from options only (no I/O).
+- wstats enablement, any one wins: `--wstats` flag, `wstats = true` in
+  `hakobackend.toml`, `UB_WSTATS=1` env. Same for `--benchmark` /
+  `benchmark = true` (runs then exits, no serving).
+- `__benchmark` (new `bench.rs`, driver-level, TTL wrapper on): fixed
+  N=2000 seed `{age, tag}` (bench4-compatible), sequential ops, shapes
+  seed-put/put/post/patch/batch/get/walk/index/query-idx/count/offset-idx/
+  cursor-idx + auto-clean verified by final count == 0 (any deviation
+  aborts loudly). Cursor walks id-order (unique keys — tied sort fields
+  lose rows by contract, so age-cursor totals would be meaningless).
+  hakobench stays the reference for durability sweeps; this runs the
+  deployment default and compares drivers shape-by-shape.
+- First numbers (sqlite, Windows dev, sync journal — floor, not target):
+  seed-put 74, put 149, post 283, patch 285, batch(100) 2884,
+  get 1904, walk 17959 docs/s, query-idx 307, count 313, offset-idx 126,
+  cursor-idx 11391 docs/s, cleanup verified.
+- Pre-existing failure, ROOT-CAUSED + FIXED (uncommitted): `bus_instant_lane`
+  was not flaky — `subscribe()` returned before `run_source` registered its
+  bus receivers, so a synchronous emit-then-recv always dropped the echo
+  (fire-and-forget bus, 1s timeout < 2s poll tick). Deterministic on
+  current-thread runtimes. Fix: oneshot ready-handshake (subscribe returns
+  after StreamMap built; 5s timeout degrades to old behavior, never hangs).
+  Same race affected real clients (open page → immediate write missed its
+  echo until the next tick). Suite now 37 green.

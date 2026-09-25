@@ -10,6 +10,7 @@
 
 mod coalesce;
 mod config;
+mod bench;
 mod portal;
 mod realtime;
 mod tenant_auth;
@@ -295,6 +296,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data).await.expect("open database");
     println!("[ub] driver={} data={} config={} mode={}{}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source }, cfg.service_mode.as_str(), cfg.service_tenant.as_deref().map(|t| format!(" tenant={t}")).unwrap_or_default());
+    // Flags are read here: `cli` moves into AppState below.
+    let wstats_flag = cli.wstats;
+    let benchmark_flag = cli.benchmark;
+    // Internal benchmark: fixed shapes against the ACTIVE driver+config,
+    // auto-clean seeds, then exit (no serving, no auth/policy involved).
+    if benchmark_flag || cfg.benchmark {
+        return match bench::run(&db, bench::N).await {
+            Ok(rows) => {
+                bench::print_table(&cfg.driver, bench::N, &rows);
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        };
+    }
     // Single mode has no registry: the pinned tenant + its owned local
     // profile are ensured at boot (idempotent; existing docs untouched).
     if cfg.service_mode == ServiceMode::Single {
@@ -420,8 +435,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let addr = cfg.listen();
-    // Stage profiler (PERFORMANCE_NOTE §7): opt-in, restart to toggle.
-    if std::env::var("UB_WSTATS").map(|v| v == "1").unwrap_or(false) {
+    // Stage profiler: flag/config/env (any one wins), restart to toggle.
+    if wstats_flag
+        || cfg.wstats
+        || std::env::var("UB_WSTATS").map(|v| v == "1").unwrap_or(false)
+    {
         wstats::set_enabled(true);
         eprintln!("[ub] wstats on: GET /api/__wstats (1/16 sampling)");
     }
@@ -1501,6 +1519,56 @@ mod wstats {
     pub static G: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     // LIST: authz / eng_list / filter / serdom
     pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // Per-shape LIST split (same 3 inner stages): order / filter /
+    // filter-order / cursor / paged / plain. L stays as the blended total
+    // (recorded baselines keep comparing); S isolates the shape.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ListShape {
+        Order,
+        Filter,
+        FilterOrder,
+        Cursor,
+        Paged,
+        Plain,
+    }
+    pub struct ShapeStats {
+        pub eng: T,
+        pub filter: T,
+        pub serdom: T,
+    }
+    impl ShapeStats {
+        pub const fn new() -> ShapeStats {
+            ShapeStats { eng: T::new(), filter: T::new(), serdom: T::new() }
+        }
+    }
+    pub static S: [ShapeStats; 6] = [
+        ShapeStats::new(),
+        ShapeStats::new(),
+        ShapeStats::new(),
+        ShapeStats::new(),
+        ShapeStats::new(),
+        ShapeStats::new(),
+    ];
+    const SHAPE_LABELS: [&str; 6] = ["order", "filter", "filter-order", "cursor", "paged", "plain"];
+    pub fn classify(q: &hakobackend_core::QueryOptions) -> ListShape {
+        let cursor = q.start_at.is_some()
+            || q.start_after.is_some()
+            || q.end_at.is_some()
+            || q.end_before.is_some();
+        if cursor {
+            ListShape::Cursor
+        } else if !q.order_by.is_empty() && !q.filters.is_empty() {
+            ListShape::FilterOrder
+        } else if !q.order_by.is_empty() {
+            ListShape::Order
+        } else if !q.filters.is_empty() {
+            ListShape::Filter
+        } else if q.limit.is_some() || q.offset.is_some() {
+            ListShape::Paged
+        } else {
+            ListShape::Plain
+        }
+    }
     // FRONT (packet-in to handler): total / mw_auth / mw_limit / collect / parse
     pub static F: [T; 5] = [T::new(), T::new(), T::new(), T::new(), T::new()];
     fn row(l: &str, t: &T) -> (String, u64) {
@@ -1509,21 +1577,42 @@ mod wstats {
         let t10 = if n == 0 { 0 } else { ns.saturating_mul(10) / n.max(1) / 1000 };
         (format!("  {l:<10}{}.{}us/req   (n={n})\n", t10 / 10, t10 % 10), t10)
     }
-    fn tab(name: &str, labels: &[&str], t: &[T]) -> String {
+    fn tab(name: &str, labels: &[&str], t: &[&T]) -> String {
         let mut o = format!("\n[GWSTATS {name}]\n");
         let mut tot10 = 0u64;
         for (i, l) in labels.iter().enumerate() {
-            let (r, t10) = row(l, &t[i]);
+            let (r, t10) = row(l, t[i]);
             o += &r;
             tot10 += t10;
         }
         o + &format!("  {:<10}{}.{}us/req   (approx total)\n", "total", tot10 / 10, tot10 % 10)
     }
     pub fn render() -> String {
-        tab("put", &["authz", "get_old", "allow", "preproc", "eng_set", "emit", "serdom"], &W)
-            + &tab("get", &["authz", "eng_get", "overlay", "allow_ser"], &G)
-            + &tab("list", &["authz", "eng_list", "filter", "serdom"], &L)
-            + &tab("front", &["total", "mw_auth", "mw_limit", "collect", "parse"], &F)
+        let mut o = tab(
+            "put",
+            &["authz", "get_old", "allow", "preproc", "eng_set", "emit", "serdom"],
+            &[&W[0], &W[1], &W[2], &W[3], &W[4], &W[5], &W[6]],
+        ) + &tab(
+            "get",
+            &["authz", "eng_get", "overlay", "allow_ser"],
+            &[&G[0], &G[1], &G[2], &G[3]],
+        ) + &tab(
+            "list",
+            &["authz", "eng_list", "filter", "serdom"],
+            &[&L[0], &L[1], &L[2], &L[3]],
+        ) + &tab(
+            "front",
+            &["total", "mw_auth", "mw_limit", "collect", "parse"],
+            &[&F[0], &F[1], &F[2], &F[3], &F[4]],
+        );
+        for (i, s) in S.iter().enumerate() {
+            o += &tab(
+                &format!("shape-{}", SHAPE_LABELS[i]),
+                &["eng", "filter", "serdom"],
+                &[&s.eng, &s.filter, &s.serdom],
+            );
+        }
+        o
     }
 }
 
@@ -1696,6 +1785,7 @@ async fn get_or_list(
                         wstats::add(&wstats::L[0], ws_t.elapsed().as_nanos() as u64);
                         ws_t = std::time::Instant::now();
                     }
+                    let shape = wstats::classify(&opts) as usize;
                     match db.list(&stored, &opts).await {
                     // Per-doc filter (replacement for the server.ts:233 loop): documents
                     // failing the rule are excluded from the response, with no extra N+1
@@ -1704,6 +1794,7 @@ async fn get_or_list(
                     Ok(docs) => {
                         if samp {
                             wstats::add(&wstats::L[1], ws_t.elapsed().as_nanos() as u64);
+                            wstats::add(&wstats::S[shape].eng, ws_t.elapsed().as_nanos() as u64);
                             ws_t = std::time::Instant::now();
                         }
                         let visible: Vec<_> = docs
@@ -1712,12 +1803,14 @@ async fn get_or_list(
                             .collect();
                         if samp {
                             wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
+                            wstats::add(&wstats::S[shape].filter, ws_t.elapsed().as_nanos() as u64);
                             ws_t = std::time::Instant::now();
                         }
                         // ponytail: direct serialization, no intermediate Value DOM.
                         let r = Json(visible).into_response();
                         if samp {
                             wstats::add(&wstats::L[3], ws_t.elapsed().as_nanos() as u64);
+                            wstats::add(&wstats::S[shape].serdom, ws_t.elapsed().as_nanos() as u64);
                         }
                         r
                     }
@@ -3486,6 +3579,7 @@ mod tests {
                 limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
+                wstats: false, benchmark: false,
             },
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,
@@ -3505,6 +3599,34 @@ mod tests {
     /// run_ops yields OpOut (Raw for tx-get hits); tests assert on Values.
     fn vals(res: Vec<OpOut>) -> Vec<serde_json::Value> {
         res.into_iter().map(OpOut::into_value).collect()
+    }
+
+    /// ListShape classification drives the per-shape wstats tables.
+    #[test]
+    fn list_shape_classify() {
+        use hakobackend_core::{Direction, Filter, FilterOp, OrderBy, QueryOptions};
+        use wstats::ListShape;
+        let f = || Filter { field: "age".into(), op: FilterOp::Eq, value: serde_json::json!(1) };
+        let o = || OrderBy { field: "age".into(), direction: Direction::Asc };
+        let q = QueryOptions::default();
+        assert_eq!(wstats::classify(&q), ListShape::Plain);
+        let mut q = QueryOptions::default();
+        q.limit = Some(10);
+        assert_eq!(wstats::classify(&q), ListShape::Paged);
+        let mut q = QueryOptions::default();
+        q.filters.push(f());
+        assert_eq!(wstats::classify(&q), ListShape::Filter);
+        let mut q = QueryOptions::default();
+        q.order_by.push(o());
+        assert_eq!(wstats::classify(&q), ListShape::Order);
+        let mut q = QueryOptions::default();
+        q.filters.push(f());
+        q.order_by.push(o());
+        assert_eq!(wstats::classify(&q), ListShape::FilterOrder);
+        let mut q = QueryOptions::default();
+        q.start_after = Some(serde_json::json!(1));
+        q.order_by.push(o());
+        assert_eq!(wstats::classify(&q), ListShape::Cursor);
     }
 
     /// TimedJson rejects exactly like axum's Json (415/400 pinned here;

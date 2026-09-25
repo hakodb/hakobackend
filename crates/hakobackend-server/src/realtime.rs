@@ -308,9 +308,21 @@ pub async fn subscribe(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let watch = db.capabilities().supports_watch;
     let snapshot_docs = snapshot.len();
+    // Ready handshake: subscribe() returns only after the source registered
+    // its bus receivers. Without it, an emit landing between spawn and first
+    // poll is dropped silently (fire-and-forget bus) — the subscriber misses
+    // its own echo until the next tick. Timeout degrades to today's behavior
+    // (never hang a subscribe on a dying source).
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_source(
-        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx,
+        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx, ready_tx,
     ));
+    if tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
+        .await
+        .is_err()
+    {
+        eprintln!("[realtime] subscribe ready timeout (degraded: first echo may lag a tick)");
+    }
     Ok(Subscription { rx, handle, snapshot_docs })
 }
 
@@ -325,6 +337,7 @@ async fn run_source(
     mut snapshot: HashMap<String, Doc>,
     watch: bool,
     tx: tokio::sync::mpsc::UnboundedSender<OutEvent>,
+    ready: tokio::sync::oneshot::Sender<()>,
 ) {
     // Policy sees logical names; storage/snapshot use stored names.
     let lf = &logical_of;
@@ -345,6 +358,8 @@ async fn run_source(
         if map.is_empty() {
             return;
         }
+        // Bus receivers registered: subscribe() may return now.
+        let _ = ready.send(());
         let snap_q = snapshot_options(&options);
         let mut gate = RateGate::new();
         loop {
@@ -406,6 +421,8 @@ async fn run_source(
             });
             map.insert(format!("bus\0{coll}"), Box::pin(bus) as Boxed);
         }
+        // Bus receivers registered: subscribe() may return now.
+        let _ = ready.send(());
         let snap_q = snapshot_options(&options);
         loop {
             match map.next().await {
