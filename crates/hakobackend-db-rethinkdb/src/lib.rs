@@ -9,9 +9,10 @@
 //!   default beyond connect).
 //! - documents keep a string `id` primary key; `Doc { id, data }` maps to
 //!   `{id, ..data}` and back.
-//! - lists are table scans + the core `doc_matches` / `matches_cursor` /
-//!   `sort_and_limit` helpers (contract §5 allows this; ReQL pushdown is
-//!   later optimization work, not correctness work).
+//! - lists push exact-set shapes to ReQL (all-eq-scalar filters as an
+//!   object predicate; skip/limit on unordered non-cursor shapes) and keep
+//!   driver-side filter/cursor/sort/truncate for the rest (contract §5
+//!   allows this; order pushdown waits on a missing-field parity study).
 //! - `set` ensures the table, then read + shallow-extend + replace
 //!   (exact, like sqlite); the server already pre-merges, so the extend
 //!   is idempotent.
@@ -162,6 +163,36 @@ fn from_rethink(v: serde_json::Value) -> Option<Doc> {
     let mut map = v.as_object()?.clone();
     let id = map.remove("id")?.as_str()?.to_string();
     Some(Doc { id, data: map.into_iter().collect() })
+}
+
+/// Eq-subset the server can push: top-level, non-dotted field + non-null
+/// scalar (number/string/bool). ReQL object predicates match exactly the
+/// contract's Eq on such shapes (a missing field never matches either
+/// side). Excluded (stay driver-side): null/array/object values (ReQL
+/// null-equivalence differs), dotted paths (object predicates are
+/// top-level only), every other operator.
+fn pushable_eq(f: &hakobackend_core::Filter) -> Option<(String, serde_json::Value)> {
+    use hakobackend_core::FilterOp;
+    if !matches!(f.op, FilterOp::Eq) {
+        return None;
+    }
+    if f.field.is_empty() || f.field.contains('.') {
+        return None;
+    }
+    match &f.value {
+        serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Bool(_) => Some((f.field.clone(), f.value.clone())),
+        _ => None,
+    }
+}
+
+/// Any cursor bound present (contract cursors filter post-fetch).
+fn has_cursor(q: &QueryOptions) -> bool {
+    q.start_at.is_some()
+        || q.start_after.is_some()
+        || q.end_at.is_some()
+        || q.end_before.is_some()
 }
 
 fn write_err(context: &str, v: &serde_json::Value) -> AppError {
@@ -413,10 +444,32 @@ impl Database for RethinkDb {
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         use hakobackend_core::conformance::{doc_matches, matches_cursor, sort_and_limit};
         let table = encode_table(collection);
-        let rows: Vec<serde_json::Value> = match self
-            .exec_all(r.db(self.db.clone()).table(table.clone()))
-            .await
-        {
+        // Exact-set pushdown: eq scalars narrow server-side. Partial is
+        // safe (superset fetch; the driver still filters every row below).
+        // Paging pushes only with no cursor and no order: cursors filter
+        // post-fetch, and ReQL-vs-contract ordering parity on
+        // missing/mixed-type fields is unverified — the driver re-sorts +
+        // truncates instead (same rows, contract order guaranteed).
+        let mut pushed = serde_json::Map::new();
+        for f in &q.filters {
+            if let Some((k, v)) = pushable_eq(f) {
+                pushed.insert(k, v);
+            }
+        }
+        let push_page = !has_cursor(q) && q.order_by.is_empty();
+        let mut cmd = r.db(self.db.clone()).table(table.clone());
+        if !pushed.is_empty() {
+            cmd = cmd.filter(serde_json::Value::Object(pushed));
+        }
+        if push_page {
+            if let Some(n) = q.offset {
+                cmd = cmd.skip(n);
+            }
+            if let Some(n) = q.limit {
+                cmd = cmd.limit(n);
+            }
+        }
+        let rows: Vec<serde_json::Value> = match self.exec_all(cmd).await {
             Ok(v) => v,
             Err(e) if missing_table(&e) => return Ok(vec![]),
             Err(_) => return Err(AppError::Internal("db error".into())),
@@ -514,7 +567,32 @@ impl Database for RethinkDb {
     }
 
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
-        Ok(self.list(collection, q).await?.len() as u64)
+        // Native count with the same eq pushdown — but unlike list(),
+        // partial is NOT safe (nothing narrows after a count). All filters
+        // pushable (or none) + no cursor + no paging, else the legacy path.
+        // Missing tables count 0 (legacy list().len() parity).
+        if has_cursor(q) || q.limit.is_some() || q.offset.is_some() {
+            return Ok(self.list(collection, q).await?.len() as u64);
+        }
+        let mut pushed = serde_json::Map::new();
+        for f in &q.filters {
+            match pushable_eq(f) {
+                Some((k, v)) => {
+                    pushed.insert(k, v);
+                }
+                None => return Ok(self.list(collection, q).await?.len() as u64),
+            }
+        }
+        let table = encode_table(collection);
+        let mut cmd = r.db(self.db.clone()).table(table.clone());
+        if !pushed.is_empty() {
+            cmd = cmd.filter(serde_json::Value::Object(pushed));
+        }
+        match self.exec_one::<u64>(cmd.count(())).await {
+            Ok(n) => Ok(n),
+            Err(e) if missing_table(&e) => Ok(0),
+            Err(_) => Err(AppError::Internal("db error".into())),
+        }
     }
 
     /// Emulated transaction (RethinkDB has no multi-doc transactions):
@@ -901,6 +979,35 @@ mod tests {
         assert_eq!(v.get("id"), Some(&serde_json::json!("a")));
         assert_eq!(from_rethink(v).unwrap().id, "a");
         assert!(from_rethink(serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn pushable_eq_shapes() {
+        use hakobackend_core::{Filter, FilterOp};
+        let f = |field: &str, op: FilterOp, value: serde_json::Value| Filter {
+            field: field.into(),
+            op,
+            value,
+        };
+        // Pushable: top-level eq scalars (id included).
+        assert_eq!(
+            pushable_eq(&f("age", FilterOp::Eq, serde_json::json!(30))),
+            Some(("age".into(), serde_json::json!(30)))
+        );
+        assert!(pushable_eq(&f("id", FilterOp::Eq, serde_json::json!("a"))).is_some());
+        assert!(pushable_eq(&f("ok", FilterOp::Eq, serde_json::json!(true))).is_some());
+        // Not pushable: other ops, null/array/object, dotted paths, empty field.
+        assert!(pushable_eq(&f("age", FilterOp::Gt, serde_json::json!(30))).is_none());
+        assert!(pushable_eq(&f("age", FilterOp::In, serde_json::json!([30]))).is_none());
+        assert!(pushable_eq(&f("age", FilterOp::Eq, serde_json::Value::Null)).is_none());
+        assert!(pushable_eq(&f("age", FilterOp::Eq, serde_json::json!([1]))).is_none());
+        assert!(pushable_eq(&f("a.b", FilterOp::Eq, serde_json::json!(1))).is_none());
+        assert!(pushable_eq(&f("", FilterOp::Eq, serde_json::json!(1))).is_none());
+        // Cursor detection.
+        let mut q = QueryOptions::default();
+        assert!(!has_cursor(&q));
+        q.start_after = Some(serde_json::json!(1));
+        assert!(has_cursor(&q));
     }
 
     #[test]
