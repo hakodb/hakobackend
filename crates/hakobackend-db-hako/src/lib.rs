@@ -201,21 +201,17 @@ impl Database for HakoDb {
     }
 
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
-        // Ordered/cursor shapes fetch the full set (natively sorted), then
-        // apply cursor+offset+limit via the contract helper. The engine
-        // planner fixes for ordered limit pushdown (P6/P7 scan_limit gating)
-        // are in the local hakodb tree but NOT yet in the published crate
-        // this driver builds against (`hakodb = "0.8.23"` from the registry):
-        // pushing limit under ORDER BY with the old planner truncates BEFORE
-        // the executor sort (wrong TOP-N — caught by conformance). When the
-        // dep bumps past the fix, narrow this to cursor-only shapes.
-        // Unordered non-cursor shapes push limit+offset (safe under any
-        // planner: unordered scans may satisfy TOP-N from any rows).
-        let needs_full = q.start_at.is_some()
+        // Direct translate to the native query model (requires hakodb
+        // >= 0.8.24: the planner never pushes a scan limit under unsatisfied
+        // ORDER BY, so limit+offset are safe to push for every non-cursor
+        // shape). Cursor shapes keep driver-side post-processing (contract
+        // cursor semantics are legacy direction-ignorant; native honors
+        // direction): no limit pushdown there, then apply cursor+offset+limit
+        // exactly as before.
+        let has_cursor = q.start_at.is_some()
             || q.start_after.is_some()
             || q.end_at.is_some()
-            || q.end_before.is_some()
-            || !q.order_by.is_empty();
+            || q.end_before.is_some();
         let mut query = hakodb::query::query::Query::new(collection);
         for f in &q.filters {
             let hf = map_filter(f)?;
@@ -224,7 +220,7 @@ impl Database for HakoDb {
         for o in &q.order_by {
             query = query.order_by(&o.field, matches!(o.direction, hakobackend_core::Direction::Asc));
         }
-        if !needs_full {
+        if !has_cursor {
             if let Some(n) = q.limit {
                 query = query.limit(n);
             }
@@ -240,7 +236,7 @@ impl Database for HakoDb {
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
-        if needs_full {
+        if has_cursor {
             // Native already filters+sorts correctly; apply cursor+offset+limit via the contract.
             Ok(hakobackend_core::conformance::apply_offset_limit(
                 hakobackend_core::conformance::apply_cursor(docs, q),
