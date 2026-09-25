@@ -133,9 +133,20 @@ pub struct Defaults {
     pub write: Rule,
 }
 
+/// Policy-level performance switches (all default off = legacy behavior).
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct CollectionPolicy {
-    pub get: Option<Rule>,
+pub struct Performance {
+    /// Skip read-before-write on PUT when no Owner rule governs the write
+    /// (~115us saved per PUT: the `existing` lookup is pure overhead then).
+    /// Tradeoff: PUT-overwrite resets `createdAt` (no old doc to preserve
+    /// it from — use PATCH merge when that matters). PATCH merge always
+    /// reads (it needs the base); Owner-governed writes ignore this flag.
+    #[serde(default)]
+    pub skip_read_before_write: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct CollectionPolicy {    pub get: Option<Rule>,
     pub list: Option<Rule>,
     pub create: Option<Rule>,
     pub update: Option<Rule>,
@@ -176,6 +187,9 @@ pub struct PolicyFile {
     pub defaults: Defaults,
     #[serde(default)]
     pub collections: HashMap<String, CollectionPolicy>,
+    /// Performance switches (all default off). See [`Performance`].
+    #[serde(default)]
+    pub performance: Performance,
 }
 
 impl PolicyFile {
@@ -188,6 +202,7 @@ impl PolicyFile {
                 write: Rule::Public,
             },
             collections: HashMap::new(),
+            performance: Performance::default(),
         }
     }
 
@@ -235,6 +250,23 @@ impl PolicyFile {
         // owner_field: the per-collection override wins over the user's global default.
         let owner_field = policy.owner_field.as_deref().unwrap_or(&self.identity.owner_field);
         eval(rule, auth, Some(owner_field), resource)
+    }
+
+    /// True when a rule governing `method` on `collection` reads the
+    /// existing document. Today only `Owner` does; every other rule
+    /// decides on the auth context alone, so `allow` with `None` decides
+    /// identically and read-before-write is pure overhead.
+    pub fn needs_existing(&self, collection: &str, method: Method) -> bool {
+        let empty = CollectionPolicy::default();
+        let policy = self.find(collection).unwrap_or(&empty);
+        matches!(policy.slot(method, &self.defaults), Rule::Owner)
+    }
+
+    /// Policy-level read-before-write skip (perf, opt-in): true only when
+    /// the flag is set AND [`Self::needs_existing`] is false.
+    /// Owner-governed writes always return false (correctness first).
+    pub fn skip_read_before_write(&self, collection: &str, method: Method) -> bool {
+        self.performance.skip_read_before_write && !self.needs_existing(collection, method)
     }
 }
 
@@ -313,6 +345,29 @@ mod tests {
         assert!(p.allow(Some(&me), "profiles", Method::Get, Some(&doc("u1"))));
         assert!(!p.allow(Some(&me), "profiles", Method::Get, Some(&doc("u2"))));
         assert!(!p.allow(None, "profiles", Method::Get, Some(&doc("u1"))));
+    }
+
+    #[test]
+    fn skip_read_before_write_flag() {
+        // Off by default: legacy read-before-write everywhere.
+        let p = policy("[defaults]\nread = \"public\"\nwrite = \"public\"\n");
+        assert!(!p.skip_read_before_write("w", Method::Update));
+        // Opt-in with no Owner rules: skip allowed.
+        let p = policy(
+            "[defaults]\nread = \"public\"\nwrite = \"public\"\n[performance]\nskip_read_before_write = true\n",
+        );
+        assert!(p.skip_read_before_write("w", Method::Update));
+        // Owner in defaults: flag ignored (correctness first).
+        let p = policy(
+            "[defaults]\nread = \"public\"\nwrite = \"owner\"\n[performance]\nskip_read_before_write = true\n",
+        );
+        assert!(!p.skip_read_before_write("w", Method::Update));
+        // Per-collection Owner override also blocks, other collections skip.
+        let p = policy(
+            "[defaults]\nread = \"public\"\nwrite = \"public\"\n[collections.mine]\nwrite = \"owner\"\n[performance]\nskip_read_before_write = true\n",
+        );
+        assert!(!p.skip_read_before_write("mine", Method::Update));
+        assert!(p.skip_read_before_write("w", Method::Update));
     }
 
     #[test]

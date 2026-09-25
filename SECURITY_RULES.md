@@ -69,7 +69,32 @@ owner_field = "pemilikId"     # default "ownerId"; per-collection override allow
   self-service writable — escalation guards like the legacy backend's
   `isModifyingRestrictedFields` land in phase-2 policy (`immutable_fields`, `owner_only_fields`).
 
-## 6. Standard error codes (legacy backend parity)
+## 6. Performance switches (all default off = legacy behavior)
+
+```toml
+[performance]
+skip_read_before_write = true  # PUT skips the old-doc lookup (~115us saved)
+```
+
+- Applies to PUT only, and only where **no `owner` rule** governs the write
+  (only `owner` reads the existing doc; every other rule decides on the auth
+  context alone). Owner-governed writes ignore the flag (correctness first).
+- Tradeoff: a PUT-overwrite resets `createdAt` (no old doc to preserve it
+  from). Use PATCH merge when `createdAt` stability matters — merge always
+  reads (it needs the base).
+- Per-request form (no policy change): `X-Hako-Skip-RBW: 1` (or `true`).
+  Advisory perf hint, never authZ: `allow()` with `None` decides identically
+  for every non-`owner` rule, and `owner`-governed writes ignore it (still
+  read, stranger still 403). Header (any API caller) was chosen over cookie:
+  BFF cookies are browser-only, and a server-set cookie would add state for
+  zero extra trust — the hint is client-asserted either way and harmless by
+  the argument above. This matches the gateway's hint discipline (`X-Tenant`
+  is distrusted for routing; this hint is safe because it cannot change any
+  allow decision).
+- Future: rule-based bypass via header/cookie intercepted at the gateway
+  (so hot callers can opt out per request instead of per policy file).
+
+## 7. Standard error codes (legacy backend parity)
 
 | Situation | Status | Body |
 |---|---|---|
@@ -79,7 +104,7 @@ owner_field = "pemilikId"     # default "ownerId"; per-collection override allow
 | Duplicate | 400 | `already-exists` |
 | Rate-limit / full queue | 429 | no internal details |
 
-## 7. Auth standards (local: implemented phase C; external: verifier-only)
+## 8. Auth standards (local: implemented phase C; external: verifier-only)
 
 - Dual-token BFF pattern: 5–15 min access JWT + rotating opaque refresh on every use
   (hash in `__sessions` DB, `__Host-` cookies HttpOnly+Secure+SameSite=Strict Path=/).

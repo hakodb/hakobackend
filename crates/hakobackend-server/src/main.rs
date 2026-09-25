@@ -1477,7 +1477,9 @@ async fn get_or_list(
                             if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
                                 return forbidden();
                             }
-                            Json(serde_json::to_value(doc).unwrap()).into_response()
+                            // ponytail: serialize Doc straight to bytes; the old
+                            // to_value() built a throwaway Value DOM first.
+                            Json(doc).into_response()
                         }
                         None => err(StatusCode::NOT_FOUND, "Document not found"),
                     }
@@ -1505,7 +1507,8 @@ async fn get_or_list(
                             .into_iter()
                             .filter(|d| policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
                             .collect();
-                        Json(serde_json::to_value(visible).unwrap()).into_response()
+                        // ponytail: direct serialization, no intermediate Value DOM.
+                        Json(visible).into_response()
                     }
                     Err(_) => err_internal(),
                 },
@@ -1693,7 +1696,7 @@ async fn create(
                             new: Some(doc.clone()),
                         },
                     );
-                    Json(serde_json::to_value(doc).unwrap()).into_response()
+                    Json(doc).into_response()
                 }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }
@@ -1705,22 +1708,46 @@ async fn put(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    write_doc(s, auth, path, body, false).await
+    write_doc(s, auth, path, body, false, skip_hint(&headers)).await
 }
 
 async fn patch(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // ponytail: merge=true uses the same path as PUT; no manual read-modify-write.
-    write_doc(s, auth, path, body, true).await
+    write_doc(s, auth, path, body, true, skip_hint(&headers)).await
 }
 
-async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: serde_json::Value, merge: bool) -> Response {
+/// Per-request read-before-write skip hint (advisory perf only, never
+/// authZ): `X-Hako-Skip-RBW: 1|true`. Safe by construction — `allow` with
+/// `None` decides identically for every non-Owner rule, and Owner-governed
+/// writes always read (the hint is ignored there, see write_doc). Only
+/// observable effect: PUT-overwrite resets `createdAt`. Header (any API
+/// caller) beats cookie here: BFF cookies are browser-only, and a
+/// server-set cookie would add state for zero extra trust (the hint is
+/// client-asserted either way and harmless by the argument above).
+fn skip_hint(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-hako-skip-rbw")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+}
+
+async fn write_doc(
+    s: AppState,
+    auth: Option<AuthContext>,
+    path: String,
+    body: serde_json::Value,
+    merge: bool,
+    skip_hint: bool,
+) -> Response {
     match parse_collection_path(&path) {
         PathKind::Collection { .. } => (
             StatusCode::BAD_REQUEST,
@@ -1738,7 +1765,19 @@ async fn write_doc(s: AppState, auth: Option<AuthContext>, path: String, body: s
             let db = s.db.read().await.clone();
             let tenant = s.effective_tenant(auth.as_ref());
             let stored = stored(tenant.as_deref(), &collection);
-            let existing = db.get(&stored, &id).await.ok().flatten();
+            // Policy-level read-before-write skip (PUT only): with no Owner
+            // rule governing the write the old doc is pure overhead (~115us).
+            // The per-request header hint joins the policy flag; both lose
+            // to Owner (authZ-neutral by construction, see skip_hint).
+            // PATCH merge always reads (needs the base + missing→404).
+            let skip_rbw = !merge
+                && !policy.needs_existing(&collection, Method::Update)
+                && (skip_hint || policy.skip_read_before_write(&collection, Method::Update));
+            let existing = if skip_rbw {
+                None
+            } else {
+                db.get(&stored, &id).await.ok().flatten()
+            };
             // Owner rule evaluated against the existing document (who owns this data?).
             if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
                 return forbidden();
@@ -3126,6 +3165,160 @@ mod tests {
         assert!(a.data.get("createdAt").and_then(|v| v.as_str()).is_some());
         assert!(a.data.get("updatedAt").and_then(|v| v.as_str()).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    async fn rbw_state(policy_toml: &str, tag: &str) -> (AppState, Arc<dyn Database>) {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, policy_toml).unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let dbh = Arc::new(tokio::sync::RwLock::new(raw.clone()));
+        let st = AppState {
+            db: dbh.clone(),
+            policy: Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned()))),
+            auth: Arc::new(tokio::sync::RwLock::new(Arc::new(
+                open_chain(&AuthSpec::Off, None, None).expect("off chain builds"),
+            ))),
+            local: Arc::new(tokio::sync::RwLock::new(None)),
+            github: Arc::new(tokio::sync::RwLock::new(None)),
+            limits: Arc::new(LimitLayers {
+                global: Arc::new(Limiter::new(Quota::per_minute(600, 100))),
+                auth: Arc::new(Limiter::new(Quota::per_minute(20, 5))),
+                trust_proxy: false,
+            }),
+            tls: false,
+            admin_role: "admin".into(),
+            mode: ServiceMode::Managed,
+            service_tenant: None,
+            tenant_admin_role: "tenant-admin".into(),
+            cli: Args {
+                config: None, driver: None, data: None, rules: None, auth: None,
+                host: None, port: None, admin_role: None, mode: None, tenant: None,
+                tenant_admin_role: None, public_url: None, limit_global: None,
+                limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
+                trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
+                print_default_config: false, coalesce_writes: false,
+            },
+            coalescer: Arc::new(coalesce::Coalescer::default()),
+            coalesce_on: false,
+            tenant_policies: Arc::new(tenant_policy::TenantPolicies::new(dbh.clone())),
+            tenant_auths: Arc::new(tenant_auth::TenantAuths::new(
+                dbh,
+                hakobackend_policy::Identity::default(),
+            )),
+        };
+        (st, raw)
+    }
+
+    fn ok_put(r: Response) {
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// Policy-level read-before-write skip (perf opt-in): public PUT skips
+    /// the old-doc lookup (overwrite resets createdAt — documented tradeoff);
+    /// Owner-governed writes ignore the flag (a stranger stays 403). The
+    /// `X-Hako-Skip-RBW` header does the same per request; also Owner-bound.
+    #[tokio::test]
+    async fn put_skip_read_before_write() {
+        let (st, db) = rbw_state(
+            "[defaults]\nread = \"public\"\nwrite = \"public\"\n[performance]\nskip_read_before_write = true\n",
+            "skip",
+        )
+        .await;
+        ok_put(
+            write_doc(
+                st.clone(),
+                None,
+                "w/d1".into(),
+                serde_json::json!({"v": 1, "createdAt": "orig"}),
+                false,
+                false,
+            )
+            .await,
+        );
+        ok_put(write_doc(st, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false).await);
+        let d = db.get("w", "d1").await.unwrap().unwrap();
+        assert_eq!(d.data.get("v"), Some(&serde_json::json!(2)));
+        // Skip = stamp_new on overwrite: no old doc to preserve createdAt from.
+        assert_ne!(d.data.get("createdAt").and_then(|v| v.as_str()), Some("orig"));
+
+        // Control: flag off → createdAt preserved on overwrite.
+        let (st2, db2) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "keep").await;
+        ok_put(
+            write_doc(
+                st2.clone(),
+                None,
+                "w/d1".into(),
+                serde_json::json!({"v": 1, "createdAt": "orig"}),
+                false,
+                false,
+            )
+            .await,
+        );
+        ok_put(write_doc(st2, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false).await);
+        let d2 = db2.get("w", "d1").await.unwrap().unwrap();
+        assert_eq!(d2.data.get("createdAt").and_then(|v| v.as_str()), Some("orig"));
+
+        // Header hint without the policy flag: same skip, per request.
+        let (st4, db4) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "hint").await;
+        assert!(!st4.policy.get().await.performance.skip_read_before_write);
+        ok_put(
+            write_doc(
+                st4.clone(),
+                None,
+                "w/d1".into(),
+                serde_json::json!({"v": 1, "createdAt": "orig"}),
+                false,
+                true,
+            )
+            .await,
+        );
+        ok_put(write_doc(st4, None, "w/d1".into(), serde_json::json!({"v": 2}), false, true).await);
+        let d4 = db4.get("w", "d1").await.unwrap().unwrap();
+        assert_ne!(d4.data.get("createdAt").and_then(|v| v.as_str()), Some("orig"));
+        // Header parsing itself: 1/true yes, everything else no.
+        let mut h = HeaderMap::new();
+        assert!(!skip_hint(&h));
+        h.insert("x-hako-skip-rbw", "1".parse().unwrap());
+        assert!(skip_hint(&h));
+        h.insert("x-hako-skip-rbw", "true".parse().unwrap());
+        assert!(skip_hint(&h));
+        h.insert("x-hako-skip-rbw", "0".parse().unwrap());
+        assert!(!skip_hint(&h));
+
+        // Owner policy + flag: the flag is ignored, stranger stays 403.
+        let (st3, db3) = rbw_state(
+            "[defaults]\nread = \"public\"\nwrite = \"owner\"\n[performance]\nskip_read_before_write = true\n",
+            "owner",
+        )
+        .await;
+        db3
+            .set(
+                "w",
+                "d9",
+                Doc {
+                    id: "d9".into(),
+                    data: [("ownerId".to_string(), serde_json::json!("u1"))]
+                        .into_iter()
+                        .collect(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let stranger = Some(hakobackend_core::AuthContext {
+            uid: "u2".into(),
+            ..Default::default()
+        });
+        let r = write_doc(st3.clone(), stranger.clone(), "w/d9".into(), serde_json::json!({"v": 2}), false, false).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        // Header hint under Owner: also ignored, still 403.
+        let r = write_doc(st3, stranger, "w/d9".into(), serde_json::json!({"v": 2}), false, true).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
     fn merge_op(t: &str, id: &str, data: serde_json::Value) -> BatchOpBody {

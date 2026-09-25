@@ -185,25 +185,33 @@ impl Database for HakoDb {
     }
 
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
-        let db = self.inner.clone();
-        let (c, i) = (collection.to_string(), id.to_string());
-        tokio::task::spawn_blocking(move || {
-            db.get(&c, &i)
-                .map(|opt| opt.map(|h| Self::to_doc(i.clone(), h)))
-                .map_err(|e| AppError::Internal(e.to_string()))
-        })
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
+        // ponytail: direct sync call, no spawn_blocking hop. Single-doc reads
+        // are microsecond-scale and never fsync (proven ~1us engine-native);
+        // the pool schedule+hop costs more than the op itself. The engine is
+        // already shared across threads today (Arc + blocking pool), so this
+        // changes which threads call it, not the concurrency shape. Bulk
+        // paths (list/query/decode-all, ms-scale) stay on the blocking pool.
+        // A dedicated single engine thread was rejected: reads would queue
+        // behind fsync writes; a dedicated pool keeps the same hop + new
+        // machinery for no gain.
+        self.inner
+            .get(collection, id)
+            .map(|opt| opt.map(|h| Self::to_doc(id.to_string(), h)))
+            .map_err(|e| AppError::Internal(e.to_string()))
     }
 
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
-        // Two native HakoDB semantic traps (found via the conformance suite):
-        // 1. Cursor operates on sorted KEYS (ids), not order-field values.
-        // 2. Full-scan pushes limit into the scan BEFORE manual sort
-        //    (planner.rs:286-297, assuming "unordered may take any TOP-N").
-        // With a cursor OR order_by: fetch the full set (natively sorted),
-        // then apply cursor+offset+limit via the contract helper (parity guaranteed).
-        let emulate = q.start_at.is_some()
+        // Ordered/cursor shapes fetch the full set (natively sorted), then
+        // apply cursor+offset+limit via the contract helper. The engine
+        // planner fixes for ordered limit pushdown (P6/P7 scan_limit gating)
+        // are in the local hakodb tree but NOT yet in the published crate
+        // this driver builds against (`hakodb = "0.8.23"` from the registry):
+        // pushing limit under ORDER BY with the old planner truncates BEFORE
+        // the executor sort (wrong TOP-N — caught by conformance). When the
+        // dep bumps past the fix, narrow this to cursor-only shapes.
+        // Unordered non-cursor shapes push limit+offset (safe under any
+        // planner: unordered scans may satisfy TOP-N from any rows).
+        let needs_full = q.start_at.is_some()
             || q.start_after.is_some()
             || q.end_at.is_some()
             || q.end_before.is_some()
@@ -216,7 +224,7 @@ impl Database for HakoDb {
         for o in &q.order_by {
             query = query.order_by(&o.field, matches!(o.direction, hakobackend_core::Direction::Asc));
         }
-        if !emulate {
+        if !needs_full {
             if let Some(n) = q.limit {
                 query = query.limit(n);
             }
@@ -232,7 +240,7 @@ impl Database for HakoDb {
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
-        if emulate {
+        if needs_full {
             // Native already filters+sorts correctly; apply cursor+offset+limit via the contract.
             Ok(hakobackend_core::conformance::apply_offset_limit(
                 hakobackend_core::conformance::apply_cursor(docs, q),
@@ -321,7 +329,31 @@ impl Database for HakoDb {
     }
 
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
-        Ok(self.list(collection, q).await?.len() as u64)
+        // ponytail: native aggregation instead of fetch-all + len (O(1)
+        // unfiltered, O(index) eq-filtered, sweep otherwise — no per-doc
+        // decode/convert/transfer). Cursor shapes keep the legacy path:
+        // native aggregation ignores cursor bounds, the contract counts them.
+        let has_cursor = q.start_at.is_some()
+            || q.start_after.is_some()
+            || q.end_at.is_some()
+            || q.end_before.is_some();
+        if has_cursor {
+            return Ok(self.list(collection, q).await?.len() as u64);
+        }
+        let mut query = hakodb::query::query::Query::new(collection);
+        for f in &q.filters {
+            let hf = map_filter(f)?;
+            query = query.where_filter(&hf.field, hf.op, hf.value);
+        }
+        query = query.aggregate(hakodb::query::query::AggregateOp::Count);
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.execute_aggregation(query)
+                .map(|m| m.get("count").copied().unwrap_or(0.0) as u64)
+                .map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
     }
 
     async fn subscribe(
