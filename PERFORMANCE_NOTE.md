@@ -119,6 +119,26 @@ Fixes shipped (all conformance-green):
    cursor-only (see driver comment). Real speed for unindexed order+limit
    still needs an index on the sort field (`/api/indexes` — supported).
 
+## 9. Front path (0.1.4): collect, not parse
+
+`UB_WSTATS=1` FRONT table splits what used to be one `parse` stage
+(`TimedJson`: same content-type rule, same `Bytes` collection, same
+`from_bytes` classification as axum's `Json` — parity test pins 415/400):
+
+- `mw_auth` 5.0us, `mw_limit` 2.7us — middleware is noise. The hunt in
+  front of the handler was justified and is over.
+- `collect` **509us** vs `parse` **4us** (PUT bodies ~50B, keep-alive,
+  loopback). Serde is innocent; the cost is body-byte arrival + task
+  wakeup under load (hyper body channel across tokio tasks, 8 workers on
+  4 CPUs). Not code fat — transport + runtime scheduling.
+- Consequence for "RPS jauh dari engine": per-PUT server-side ≈ 570us
+  front + ~300us handler. Volume answers stay what they were: `/api/batch`
+  (25K docs/s amortizes collect over the batch) and index declarations
+  for reads. A tokio worker-tuning experiment may shave the wakeup tail;
+  not scheduled — batch covers the need.
+- Deploy: prod `:3005` runs 0.1.4 (systemd, backup `hakobackend.0.1.0.bak`
+  beside the binary; stop→replace→start, SELinux context preserved).
+
 ## 8. eng_list anatomy (closed): the index is the cure
 
 `eng_list` ~10-12ms on 2000 unindexed docs = full scan + per-doc
@@ -139,25 +159,26 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   run went second on warm cache). Skip saves ≈77us on overwrite, ≈10us on
   create — the wstats numbers are the clean ones (sampled within-run).
 
-## 9. Pointer/passthrough verdict + per-driver positions
+## 10. Pointer/passthrough verdict + per-driver positions
 
 - Remaining `json!(...)` literals are sub-µs noise (tiny responses).
-  Remaining per-doc DOMs that matter: `to_doc` (Hako Value→JSON per field)
-  and tx-`get` embed (`to_value` per op, ~10us/doc — ripple-blocked, see below).
+  Remaining per-doc DOMs that matter: `to_doc` (Hako Value→JSON per field);
+  tx-`get` embed is fixed (0.1.4 `OpOut::Raw`, single serialize + verbatim splice).
 - Zero-copy passthrough (serve engine bytes as HTTP bytes) was investigated
   and REJECTED for the current wire shape: the flat doc merges `id` (stored
   separately in hako/sqlite/pg/mysql) into the JSON, so `id` injection forces
   a parse anyway. Hako's `query_raw` returns binary (not JSON); sqlite/pg
   return JSON text but id-less. Passthrough needs a breaking envelope change
   (`{id, data}` nested) — not worth it at current margins.
-- tx-`get` RawValue embed skipped: `run_ops` returns `Vec<Value>` consumed
-  by batch+tx response builders and asserted by tests; bypassing the DOM
-  means hand-assembled response bodies. Revisit only if tx-heavy workloads
-  show it (wstats measures it as `allow_ser`-adjacent per op).
+- tx-`get` RawValue embed shipped in 0.1.4 (`OpOut::Raw` + `render_results`;
+  re-parse exists only for tests). Remaining embed cost: one serialize per doc.
 - Per-driver pushdown: sqlite full SQL (WHERE/cursor/ORDER/LIMIT) — best
-  positioned; postgres ORDER+OFFSET+LIMIT pushed; hako native + count (this
-  release); **rethinkdb none** — full scan + in-driver `sort_and_limit`
-  (contract §5 allows it). ReQL supports order_by/skip/limit natively:
-  queued as the next driver target. mysql assumed pg-like (verify on measure).
+  positioned; postgres ORDER+OFFSET+LIMIT pushed; hako native
+  (count/sum/avg + ordered limit, TTL-exact total−expired protocol in
+  `TtlDb`, gated on `supports_native_aggregation`); **rethinkdb none** —
+  full scan + in-driver `sort_and_limit` (contract §5 allows it). ReQL
+  supports order_by/skip/limit natively: queued as the next driver target
+  (gateway-first per decision — per-driver after). mysql assumed pg-like
+  (verify on measure).
 - Our server is one consumer among public ones; every driver above is
   measurable with the same bench scripts + permanent wstats (§7).
