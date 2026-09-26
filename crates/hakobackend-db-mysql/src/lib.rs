@@ -489,7 +489,7 @@ impl Database for MysqlDb {
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
         // Internal `__*` collections are not exposed over HTTP.
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '\\_%' ESCAPE '\\'",
+            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '!_%' ESCAPE '!'",
         )
         .fetch_all(&self.pool)
         .await
