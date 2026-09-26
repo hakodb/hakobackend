@@ -34,7 +34,11 @@ impl SqliteDb {
             .pragma("mmap_size", "67108864")
             .pragma("journal_size_limit", "33554432");
         // :memory: = 1 connection (each pool connection owns its own DB!).
-        let max = if path.is_empty() || path == ":memory:" { 1 } else { 5 };
+        // ponytail: file DBs get headroom over typical bench concurrency —
+        // max 5 starved an 8-worker bench (checkout queueing inside every
+        // exec span). sqlite/WAL reads never block each other; writers
+        // serialize inside sqlite itself (busy_timeout), not the pool.
+        let max = if path.is_empty() || path == ":memory:" { 1 } else { 16 };
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(max)
             .connect_with(opts)
