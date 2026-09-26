@@ -488,9 +488,11 @@ impl Database for MysqlDb {
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
         // Internal `__*` collections are not exposed over HTTP.
+        // CAST: INFORMATION_SCHEMA returns TABLE_NAME as VARBINARY, which
+        // sqlx will not decode into String (ColumnDecode) — force CHAR.
         // TEMP-DEBUG (revert after diagnosis): surface the sqlx error.
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '!_%' ESCAPE '!'",
+            "SELECT CAST(TABLE_NAME AS CHAR) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '!_%' ESCAPE '!'",
         )
         .fetch_all(&self.pool)
         .await
