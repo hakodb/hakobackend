@@ -2,8 +2,9 @@
 //!
 //! Core binds no provider except the contract (`hakobackend_core::AuthProvider`).
 //! External providers are verifier-only; only `local` acts as issuer (phase C).
-//! User roles & collections belong to the user via `hakobackend_policy::Identity`; final roles =
-//! **union** of claim roles + user-doc roles.
+//! Identity mapping (uid/email fields) belongs to the user via
+//! `hakobackend_policy::Identity`; contexts carry uid + provider marker only
+//! (roles were removed with the tenant system).
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -41,14 +42,6 @@ impl AuthSpec {
 
 // --- Declarative mapping file (`--auth ./custom.toml`) ---
 
-/// One claim → user-owned free-form role rule.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RoleRule {
-    pub claim: String,
-    pub equals: String,
-    pub role: String,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ClaimMapping {
     /// Claim in `extra` used as uid/email (default: provider default).
@@ -63,8 +56,6 @@ pub struct CustomAuth {
     pub providers: Vec<String>,
     #[serde(default)]
     pub mapping: ClaimMapping,
-    #[serde(default)]
-    pub rules: Vec<RoleRule>,
     /// DPoP mode for the `local` chain member (off|accept|require).
     /// Typo = load error (fail-closed). Without it: env UB_LOCAL_DPOP.
     pub dpop: Option<String>,
@@ -75,33 +66,18 @@ impl CustomAuth {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         toml::from_str(&raw).map_err(|e| format!("parse {path}: {e}"))
     }
-
-    /// Roles from claims: match when a string claim == equals or an array contains it.
-    pub fn roles_from_claims(&self, claims: &Claims) -> Vec<String> {
-        self.rules
-            .iter()
-            .filter(|r| match claims.extra.get(&r.claim) {
-                Some(serde_json::Value::String(s)) => s == &r.equals,
-                Some(serde_json::Value::Array(a)) => a.iter().any(|v| v.as_str() == Some(&r.equals)),
-                _ => false,
-            })
-            .map(|r| r.role.clone())
-            .collect()
-    }
 }
 
-// --- Resolver: verify → mapping → user-doc role union ---
+// --- Resolver: verify → mapping (uid/email + provider marker) ---
 
 /// Opened verifier chain (order = priority).
 pub struct AuthChain {
     pub providers: Vec<Arc<dyn AuthProvider>>,
     pub mapping: ClaimMapping,
-    pub rules: Vec<RoleRule>,
 }
 
 impl AuthChain {
     /// First valid claim wins; all fail → None (anonymous).
-    /// When `db` is present, user-doc roles (`identity`) are unioned (deduped).
     /// User-doc lookup key = namespaced uid (`github:123`).
     pub async fn resolve(
         &self,
@@ -109,40 +85,19 @@ impl AuthChain {
         db: Option<&dyn Database>,
         token: &str,
     ) -> Option<AuthContext> {
+        let _ = (identity, db);
         for p in &self.providers {
             if let Ok(claims) = p.verify(token).await {
-                return Some(self.to_context(identity, db, &claims).await);
+                return Some(self.to_context(&claims).await);
             }
         }
         None
     }
 
-    async fn to_context(&self, identity: &Identity, db: Option<&dyn Database>, claims: &Claims) -> AuthContext {
-        let custom = CustomAuth {
-            providers: vec![],
-            mapping: self.mapping.clone(),
-            rules: self.rules.clone(),
-            dpop: None,
-        };
-        let mut roles = custom.roles_from_claims(claims);
+    async fn to_context(&self, claims: &Claims) -> AuthContext {
         let uid = field(&claims.extra, self.mapping.uid_field.as_deref())
             .map(|v| format!("{}:{v}", claims.provider))
             .unwrap_or_else(|| claims.namespaced());
-        if let Some(db) = db {
-            let mut hit = db.get(&identity.users_collection, &uid).await.ok().flatten();
-            if hit.is_none() && claims.provider == "local" {
-                // Local registers store RAW ids (`root`, not `local:root`) while
-                // oauth provision stores namespaced docs. Fall back to the raw
-                // claim id — scoped to provider `local` only, so a github uid
-                // can never inherit roles from an unrelated local doc.
-                hit = db.get(&identity.users_collection, &claims.uid).await.ok().flatten();
-            }
-            if let Some(doc) = hit {
-                roles.extend(identity.roles_of(&doc));
-            }
-        }
-        roles.sort();
-        roles.dedup();
         let email = field(&claims.extra, self.mapping.email_field.as_deref()).or_else(|| claims.email.clone());
         let mut extra = HashMap::new();
         // Provider marker for DPoP enforcement in middleware (not for rules).
@@ -150,7 +105,7 @@ impl AuthChain {
         if let Some(e) = email {
             extra.insert("email".to_string(), serde_json::Value::String(e));
         }
-        AuthContext { uid, roles, tenant: claims.tenant.clone(), extra }
+        AuthContext { uid, extra }
     }
 }
 
@@ -178,16 +133,15 @@ pub fn open_chain(
     custom: Option<&CustomAuth>,
     local: Option<Arc<dyn AuthProvider>>,
 ) -> Result<AuthChain, String> {
-    let (names, mapping, rules) = match spec {
+    let (names, mapping) = match spec {
         AuthSpec::Off => return Ok(AuthChain {
             providers: vec![],
             mapping: ClaimMapping::default(),
-            rules: vec![],
         }),
-        AuthSpec::Named(names) => (names.clone(), ClaimMapping::default(), vec![]),
+        AuthSpec::Named(names) => (names.clone(), ClaimMapping::default()),
         AuthSpec::File(_) => {
             let c = custom.ok_or("File spec requires loaded CustomAuth")?;
-            (c.providers.clone(), c.mapping.clone(), c.rules.clone())
+            (c.providers.clone(), c.mapping.clone())
         }
     };
     if names.iter().any(|n| n == "off" || n == "none") || names.is_empty() {
@@ -203,7 +157,7 @@ pub fn open_chain(
             providers.push(open_builtin(n)?);
         }
     }
-    Ok(AuthChain { providers, mapping, rules })
+    Ok(AuthChain { providers, mapping })
 }
 
 #[cfg(test)]
@@ -234,7 +188,6 @@ mod tests {
                 uid: self.uid.into(),
                 email: None,
                 extra: [("groups".to_string(), json!(self.groups))].into_iter().collect(),
-                tenant: None,
             })
         }
     }
@@ -246,7 +199,6 @@ mod tests {
                 Arc::new(Fake { name: "local", expect: "loc-tok", uid: "abc", groups: vec![], fail: false }),
             ],
             mapping: ClaimMapping::default(),
-            rules: vec![RoleRule { claim: "groups".into(), equals: "ops".into(), role: "pengurus".into() }],
         }
     }
 
@@ -262,70 +214,8 @@ mod tests {
         assert_eq!(a.uid, "local:abc");
         let b = c.resolve(&identity(), None, "gh-tok").await.unwrap();
         assert_eq!(b.uid, "github:123");
-        assert_eq!(b.roles, vec!["pengurus"]);
         // Token unknown to all → anonymous.
         assert!(c.resolve(&identity(), None, "bukan-token").await.is_none());
-    }
-
-    #[tokio::test]
-    async fn union_peran_user_doc() {
-        // Minimal fake DB: only get() is used for enrichment.
-        struct FakeDb {
-            doc: hakobackend_core::Doc,
-        }
-        #[async_trait::async_trait]
-        impl Database for FakeDb {
-            fn capabilities(&self) -> hakobackend_core::Capabilities {
-                hakobackend_core::Capabilities { driver: "fake", supports_watch: false, supports_transactions: false, supports_composite: false, supports_fts: false, supports_drop_index: false, supports_unique: false, supports_named_index: false, supports_native_aggregation: false }
-            }
-            async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
-                Ok(())
-            }
-            async fn list_collections(&self) -> Result<Vec<String>, AppError> {
-                Ok(vec![])
-            }
-            async fn get(&self, _c: &str, id: &str) -> Result<Option<Doc>, AppError> {
-                Ok((id == self.doc.id).then(|| self.doc.clone()))
-            }
-            async fn list(&self, _c: &str, _q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
-                Ok(vec![])
-            }
-            async fn insert(&self, _c: &str, doc: Doc) -> Result<Doc, AppError> {
-                Ok(doc)
-            }
-            async fn set(&self, _c: &str, id: &str, doc: Doc, _m: bool) -> Result<Doc, AppError> {
-                Ok(Doc { id: id.into(), data: doc.data })
-            }
-            async fn delete(&self, _c: &str, _id: &str) -> Result<Option<Doc>, AppError> {
-                Ok(None)
-            }
-            async fn count(&self, _c: &str, _q: &QueryOptions) -> Result<u64, AppError> {
-                Ok(0)
-            }
-            async fn subscribe(&self, _c: &str) -> Result<tokio::sync::broadcast::Receiver<hakobackend_core::Change>, AppError> {
-                Ok(tokio::sync::broadcast::channel(1).0.subscribe())
-            }
-            async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
-                Err(AppError::BadRequest("fake without index".into()))
-            }
-            async fn list_indexes(&self, _c: &str) -> Result<Vec<hakobackend_core::IndexInfo>, AppError> {
-                Ok(vec![])
-            }
-            async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
-                Err(AppError::BadRequest("fake without index".into()))
-            }
-        }
-        let db = FakeDb {
-            doc: Doc {
-                // Lookup key = namespaced uid.
-                id: "github:123".into(),
-                data: [("role".to_string(), json!(["penulis"]))].into_iter().collect(),
-            },
-        };
-        let c = chain();
-        let ctx = c.resolve(&identity(), Some(&db), "gh-tok").await.unwrap();
-        // Union + dedup: pengurus (claims) + penulis (document).
-        assert_eq!(ctx.roles, vec!["pengurus", "penulis"]);
     }
 
     #[test]
@@ -359,22 +249,10 @@ mod tests {
             providers = ["github", "local"]
             [mapping]
             uid_field = "sub"
-            [[rules]]
-            claim = "groups"
-            equals = "ops"
-            role = "pengurus"
             "#,
         )
         .unwrap();
         assert_eq!(c.providers, vec!["github", "local"]);
         assert_eq!(c.mapping.uid_field.as_deref(), Some("sub"));
-        let claims = Claims {
-            provider: "github",
-            uid: "x".into(),
-            email: None,
-            extra: [("groups".to_string(), json!(["dev", "ops"]))].into_iter().collect(),
-            tenant: None,
-        };
-        assert_eq!(c.roles_from_claims(&claims), vec!["pengurus"]);
     }
 }

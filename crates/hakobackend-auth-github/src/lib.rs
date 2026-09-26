@@ -72,8 +72,8 @@ impl AuthProvider for GithubVerifier {
             provider: "github",
             uid: id.to_string(),
             email: user.get("email").and_then(|v| v.as_str()).map(str::to_string),
-            extra: user,
-            tenant: None,
+            extra: user
+            
         };
         self.cache.write().await.insert(token.to_string(), (claims.clone(), Instant::now()));
         Ok(claims)
@@ -600,3 +600,4 @@ mod tests {
         }
     }
 }
+

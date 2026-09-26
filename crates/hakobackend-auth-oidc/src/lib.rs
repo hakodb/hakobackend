@@ -141,8 +141,8 @@ impl AuthProvider for OidcVerifier {
             provider: "oidc",
             uid: sub,
             email,
-            extra: data.claims,
-            tenant: None,
+            extra: data.claims
+            
         })
     }
 }
@@ -255,3 +255,4 @@ mod tests {
         assert!(OidcVerifier::from_env().is_err());
     }
 }
+

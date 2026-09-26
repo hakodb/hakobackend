@@ -94,8 +94,8 @@ impl AuthProvider for FirebaseVerifier {
             provider: "firebase",
             uid: sub,
             email,
-            extra: data.claims,
-            tenant: None,
+            extra: data.claims
+            
         })
     }
 }
@@ -214,3 +214,6 @@ mod tests {
         assert!(FirebaseVerifier::from_env().is_err());
     }
 }
+
+
+

@@ -5,7 +5,7 @@
 //! sees tokens. Refresh reuse → revoke all user sessions (fail-closed).
 //! Argon2id passwords; sessions in the internal `__sessions` collection (see SECURITY_RULES §4).
 //! Env: `UB_LOCAL_JWT_SECRET` (required), `UB_LOCAL_USERS` (default `users`),
-//! `UB_LOCAL_DEFAULT_ROLE` (optional), `UB_LOCAL_ACCESS_TTL` (secs, default 600),
+//! `UB_LOCAL_ACCESS_TTL` (secs, default 600),
 //! `UB_LOCAL_REFRESH_TTL` (secs, default 30 days).
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
@@ -37,7 +37,6 @@ pub struct LocalConfig {
     pub jwt_secret: Vec<u8>,
     pub access_ttl_secs: u64,
     pub refresh_ttl_secs: u64,
-    pub default_role: Option<String>,
 }
 
 impl LocalConfig {
@@ -54,7 +53,6 @@ impl LocalConfig {
             jwt_secret: jwt_secret.into_bytes(),
             access_ttl_secs: num("UB_LOCAL_ACCESS_TTL", 600),
             refresh_ttl_secs: num("UB_LOCAL_REFRESH_TTL", 30 * 86400),
-            default_role: std::env::var("UB_LOCAL_DEFAULT_ROLE").ok(),
         })
     }
 }
@@ -70,9 +68,6 @@ pub struct LocalAuth {
     identity: Identity,
     dpop_mode: std::sync::Mutex<DpopMode>,
     dpop_replay: std::sync::Mutex<dpop::ReplayCache>,
-    /// Tenant this provider serves (per-tenant instances). Bound into JWTs
-    /// and forced into contexts; None = global provider.
-    forced_tenant: Option<String>,
 }
 
 impl LocalAuth {
@@ -86,21 +81,7 @@ impl LocalAuth {
             identity,
             dpop_mode: std::sync::Mutex::new(DpopMode::from_env()),
             dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
-            forced_tenant: None,
         }))
-    }
-
-    /// Scope this provider to one tenant: user store lookups, minted JWTs,
-    /// and contexts all carry it. Consumes nothing else — same handle shape.
-    pub fn with_tenant(self: &Arc<Self>, tenant: &str) -> Arc<Self> {
-        Arc::new(Self {
-            cfg: self.cfg.clone(),
-            db: self.db.clone(),
-            identity: self.identity.clone(),
-            dpop_mode: std::sync::Mutex::new(self.dpop_mode()),
-            dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
-            forced_tenant: Some(tenant.into()),
-        })
     }
 
     /// Effective DPoP mode (env `UB_LOCAL_DPOP`, overridable via `dpop` in custom.toml).
@@ -172,20 +153,8 @@ impl LocalAuth {
     }
 
     fn ctx_of(&self, uid: &str, doc: &Doc) -> AuthContext {
-        // Tenant comes from the admin-managed user doc (never from login
-        // input); invalid slugs are dropped so they can never namespace.
-        // A forced provider tenant wins over the doc field.
-        let tenant = self.forced_tenant.clone().or_else(|| {
-            doc.data
-                .get("tenant")
-                .and_then(|v| v.as_str())
-                .filter(|t| hakobackend_core::tenant::is_valid_tenant_slug(t))
-                .map(str::to_string)
-        });
         AuthContext {
             uid: uid.into(),
-            roles: self.identity.roles_of(doc),
-            tenant,
             extra: match doc.data.get("email").and_then(|v| v.as_str()) {
                 Some(e) => [("email".to_string(), serde_json::Value::String(e.into()))].into_iter().collect(),
                 None => HashMap::new(),
@@ -193,8 +162,9 @@ impl LocalAuth {
         }
     }
 
-    /// Self-service registration: `role`/`password_hash` from the body are ALWAYS discarded
-    /// (anti self-escalation); roles only come from `UB_LOCAL_DEFAULT_ROLE` when set.
+    /// Self-service registration: `password_hash` from the body is ALWAYS
+    /// discarded (never store plaintext). Profile fields otherwise pass
+    /// through as plain data — no role concept remains to escalate into.
     pub async fn register(
         &self,
         id: Option<String>,
@@ -233,14 +203,9 @@ impl LocalAuth {
         let hash = hash_password(password.to_string()).await?;
         let mut data = profile;
         data.remove(PASSWORD_FIELD);
-        data.remove(&self.identity.role_field);
-        data.remove("roles");
         data.insert(PASSWORD_FIELD.into(), serde_json::Value::String(hash));
         if let Some(e) = email {
             data.insert("email".into(), serde_json::Value::String(e));
-        }
-        if let Some(r) = &self.cfg.default_role {
-            data.insert(self.identity.role_field.clone(), serde_json::Value::String(r.clone()));
         }
         self.db.insert(self.users(), Doc { id, data }).await.map_err(internal)
     }
@@ -304,7 +269,6 @@ impl LocalAuth {
 
     /// Login via an external provider (OAuth result): find-or-create the user document
     /// with a namespaced id (`github:7`), then issue a local session (BFF).
-    /// Provisioned WITHOUT roles (fail-closed; admin assigns via CRUD).
     /// No auto-merge by email (prevents takeover via unverified email).
     pub async fn login_external(
         &self,
@@ -317,8 +281,6 @@ impl LocalAuth {
             None => {
                 let mut data = profile;
                 data.remove(PASSWORD_FIELD);
-                data.remove(&self.identity.role_field);
-                data.remove("roles");
                 if let Some(e) = email.clone() {
                     data.insert("email".into(), serde_json::Value::String(e));
                 }
@@ -366,7 +328,6 @@ impl LocalAuth {
             exp: now + self.cfg.access_ttl_secs,
             iat: now,
             cnf: cnf.map(|jkt| Cnf { jkt }),
-            tenant: self.forced_tenant.clone(),
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -441,9 +402,6 @@ struct AccessClaims {
     iat: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cnf: Option<Cnf>,
-    /// Tenant bound at issuance (per-tenant providers). Absent = global.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tenant: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -467,7 +425,6 @@ impl AuthProvider for LocalAuth {
             uid: data.claims.sub,
             email: data.claims.email,
             extra: HashMap::new(),
-            tenant: data.claims.tenant,
         })
     }
 }
@@ -665,7 +622,6 @@ mod tests {
             identity: Identity::default(),
             dpop_mode: std::sync::Mutex::new(DpopMode::Off),
             dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
-            forced_tenant: None,
         })
     }
 
@@ -673,12 +629,10 @@ mod tests {
     async fn register_login_verify() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
-        // role from the body is discarded; empty default_role → no roles.
+        // Profile passes through as plain data (no role concept remains).
         let mut profile = HashMap::new();
-        profile.insert("role".into(), serde_json::Value::String("admin".into()));
         profile.insert("nick".into(), serde_json::Value::String("budi".into()));
         let doc = a.register(Some("budi".into()), Some("b@x.id".into()), "rahasia123", profile).await.unwrap();
-        assert!(doc.data.get("role").is_none());
         assert_eq!(doc.data.get("nick").unwrap(), "budi");
         assert!(doc.data.get(PASSWORD_FIELD).unwrap().as_str().unwrap().starts_with("$argon2"));
         // Duplicates rejected; short passwords rejected.
@@ -725,16 +679,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_provision_without_roles_idempotent() {
+    async fn oauth_provision_idempotent() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
         let mut profile = HashMap::new();
         profile.insert("login".into(), serde_json::Value::String("octocat".into()));
-        profile.insert("role".into(), serde_json::Value::String("admin".into()));
         let (ctx1, _) = a.login_external("github:7", None, profile).await.unwrap();
-        // Roles from the profile are discarded; namespaced uid.
+        // Namespaced uid.
         assert_eq!(ctx1.uid, "github:7");
-        assert!(ctx1.roles.is_empty());
         // Second login: the document is reused (not duplicated/overwritten).
         let (ctx2, _) = a.login_external("github:7", None, HashMap::new()).await.unwrap();
         assert_eq!(ctx2.uid, "github:7");
