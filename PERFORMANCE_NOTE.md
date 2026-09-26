@@ -318,3 +318,28 @@ Agg ~76K); Par/Tx rows are bimodal noise, compare isolated runs only.
 - **universal**: batch > single puts; indexes > code; measure with
   `__benchmark` (driver) then `bench/*.py` (gateway) then wstats
   (stages) — in that order, cheapest signal first.
+
+## 15. Bun sqlite claims vs our sqlite (assessed, not assumed)
+
+Bun docs claim 3-6x over better-sqlite3, 8-9x over deno **for read
+queries** (Northwind, M1 Max — their own screenshot: Product 33.85us,
+OrderDetail 146ms/2155 rows). That compares **JS binding overhead**,
+not engines — everyone links the same SQLite C library. Bun wins by
+constructing JS objects straight from C; there is no JS in our stack
+(Rust sqlx, no GC), so structurally we bind leaner than any JS driver.
+
+Head-to-head (EL8 VPS, release, FULL sync): our GET 47us/row (full JSON
+parse + HashMap) vs Bun Product 33.85us — same order, different
+machines, no evidence against us. Our full scan: 2100 docs in 8ms
+(3.8us/row) vs Bun 68us/row (wider rows + JS objects) — same verdict.
+
+sqlite in hakobackend is NOT capped. Server `__benchmark` (sqlite,
+N=2000): seed 807, put 862, post 884, patch 790, **batch 19741**,
+get 21174, walk 278375 docs/s, query-idx 4925, count 5572,
+offset-idx 1927, cursor-idx 247612 docs/s. Remaining headroom, all
+measured or reasoned: FULL→NORMAL (~2.3x writes), batch (already 19.7K),
+declared indexes (5x queries), temp_store/mmap/WAL-cap pragmas (now
+default). Reads keep ~1.5-2x inside parse+HashMap — heroic effort
+territory (SIMD/raw passthrough, already rejected on wire-shape
+grounds), not worth it. Chasing Bun = wrong layer: they optimize JS
+binding, which we don't have.
