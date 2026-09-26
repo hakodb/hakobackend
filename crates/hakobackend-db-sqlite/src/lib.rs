@@ -26,7 +26,13 @@ impl SqliteDb {
             // block writers. Found by the pre-release load run.
             .busy_timeout(std::time::Duration::from_secs(10))
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .synchronous(sqlite_synchronous());
+            .synchronous(sqlite_synchronous())
+            // Doc-DB tuning (all safe, all measured-neutral-or-better):
+            // temp sorts/index builds never touch disk, reads may mmap,
+            // WAL cannot bloat past 32MB (checkpoint truncates).
+            .pragma("temp_store", "MEMORY")
+            .pragma("mmap_size", "67108864")
+            .pragma("journal_size_limit", "33554432");
         // :memory: = 1 connection (each pool connection owns its own DB!).
         let max = if path.is_empty() || path == ":memory:" { 1 } else { 5 };
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -309,9 +315,12 @@ fn build_order(q: &QueryOptions) -> String {
         .order_by
         .iter()
         .map(|o| {
+            // `id` lives in its own column (never inside the JSON body):
+            // ordering by the JSON path would sort NULLs (insertion order).
+            let col = if o.field == "id" { "id".to_string() } else { jpath(&o.field) };
             format!(
                 "{} {}",
-                jpath(&o.field),
+                col,
                 match o.direction {
                     Direction::Asc => "ASC",
                     Direction::Desc => "DESC",
@@ -909,6 +918,23 @@ mod tests {
     fn identifier_quoted() {
         assert_eq!(qi("a\"b"), "\"a\"\"b\"");
         assert_eq!(jpath("a.b"), "json_extract(data, '$.\"a\".\"b\"')");
+    }
+
+    /// Regression: order by id follows the id column, never the JSON body
+    /// (bodies carry no id — the JSON path sorts NULLs = insertion order).
+    #[tokio::test]
+    async fn order_by_id_uses_column() {
+        use hakobackend_core::{Database as _, Direction, OrderBy, QueryOptions};
+        let db = SqliteDb::open(":memory:").await.unwrap();
+        for id in ["c", "a", "b"] {
+            let mut data = std::collections::HashMap::new();
+            data.insert("v".to_string(), serde_json::json!(1));
+            db.set("t", id, hakobackend_core::Doc { id: id.into(), data }, false).await.unwrap();
+        }
+        let mut q = QueryOptions::default();
+        q.order_by.push(OrderBy { field: "id".into(), direction: Direction::Asc });
+        let ids: Vec<_> = db.list("t", &q).await.unwrap().into_iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec!["a", "b", "c"], "order by id follows id order");
     }
 
     /// Full conformance needs live sqlite (file/:memory:) — runs without a server.

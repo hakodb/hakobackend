@@ -282,9 +282,11 @@ fn build_order(q: &QueryOptions) -> String {
         .order_by
         .iter()
         .map(|o| {
+            // `id` is a real column (never inside the JSON body).
+            let col = if o.field == "id" { "id".to_string() } else { jcol(&o.field) };
             format!(
                 "{} {}",
-                jcol(&o.field),
+                col,
                 match o.direction {
                     Direction::Asc => "ASC",
                     Direction::Desc => "DESC",
@@ -820,6 +822,21 @@ mod tests {
         let mut params = Vec::new();
         push_filter(&mut sql, f, &mut params).unwrap();
         (sql, params)
+    }
+
+    /// `id` orders by the real column (never the JSON body, which has none).
+    #[test]
+    fn build_order_id_uses_column() {
+        use hakobackend_core::{Direction, OrderBy, QueryOptions};
+        let mut q = QueryOptions::default();
+        q.order_by.push(OrderBy { field: "id".into(), direction: Direction::Asc });
+        assert!(build_order(&q).contains("id ASC"));
+        let mut q = QueryOptions::default();
+        q.order_by.push(OrderBy { field: "id".into(), direction: Direction::Desc });
+        q.order_by.push(OrderBy { field: "age".into(), direction: Direction::Asc });
+        let s = build_order(&q);
+        assert!(s.contains("id DESC"), "{s}");
+        assert!(s.contains("JSON_EXTRACT"), "{s}");
     }
 
     #[test]

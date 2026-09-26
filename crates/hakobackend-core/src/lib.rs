@@ -629,6 +629,23 @@ mod tests {
     }
 
     #[test]
+    fn sort_by_id_uses_doc_id() {
+        // `id` lives outside `data` (drivers strip it into a column):
+        // ordering must follow the id, never the (absent) data field.
+        let doc = |id: &str| Doc { id: id.into(), data: Default::default() };
+        let mut q = QueryOptions::default();
+        q.order_by.push(OrderBy { field: "id".into(), direction: Direction::Asc });
+        let ids: Vec<_> = conformance::sort_and_limit(
+            vec![doc("c"), doc("a"), doc("b")],
+            &q,
+        )
+        .into_iter()
+        .map(|d| d.id)
+        .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
     fn filter_op_wire_legacy() {
         // Legacy symbolic (used by the old SDK) + word (new form) → same variant.
         for (wire, word, op) in [
@@ -788,15 +805,20 @@ pub mod conformance {
 
     /// Standard list pipeline: sort → cursor → offset → limit (legacy parity).
     /// Emulating drivers / MemDb use this so results are ALWAYS identical.
+    /// `id` compares the document id (it lives outside `data`).
     pub fn sort_and_limit(mut docs: Vec<Doc>, q: &QueryOptions) -> Vec<Doc> {
         if !q.order_by.is_empty() {
             docs.sort_by(|a, b| {
                 for o in &q.order_by {
-                    let ord = match (nested(&a.data, &o.field), nested(&b.data, &o.field)) {
-                        (Some(x), Some(y)) => cmp_json(x, y).unwrap_or(Ordering::Equal),
-                        (Some(_), None) => Ordering::Greater,
-                        (None, Some(_)) => Ordering::Less,
-                        (None, None) => Ordering::Equal,
+                    let ord = if o.field == "id" {
+                        a.id.cmp(&b.id)
+                    } else {
+                        match (nested(&a.data, &o.field), nested(&b.data, &o.field)) {
+                            (Some(x), Some(y)) => cmp_json(x, y).unwrap_or(Ordering::Equal),
+                            (Some(_), None) => Ordering::Greater,
+                            (None, Some(_)) => Ordering::Less,
+                            (None, None) => Ordering::Equal,
+                        }
                     };
                     let ord = match o.direction {
                         Direction::Asc => ord,
@@ -905,6 +927,31 @@ pub mod conformance {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].data.get("age"), Some(&serde_json::json!(35)));
         assert_eq!(db.count(&coll, &q0).await.unwrap(), 3);
+
+        // 5a. Order by id follows id order, never insertion order (`id`
+        // lives outside the doc body on every driver).
+        let idcoll = format!("{coll}_ids");
+        for id in ["c", "a", "b"] {
+            db.set(&idcoll, id, mk(serde_json::json!({"v": 1})), false).await.unwrap();
+        }
+        let ids = |dir: Direction| {
+            let coll = idcoll.clone();
+            async move {
+                let mut q = QueryOptions::default();
+                q.order_by.push(OrderBy { field: "id".into(), direction: dir });
+                db.list(&coll, &q)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|d| d.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(ids(Direction::Asc).await, vec!["a", "b", "c"]);
+        assert_eq!(ids(Direction::Desc).await, vec!["c", "b", "a"]);
+        for id in ["c", "a", "b"] {
+            db.delete(&idcoll, id).await.unwrap();
+        }
 
         // 5b. Cursor (reference = order_by[0]) + offset. rdb.ts:cursorFilter parity.
         let ordered = |cursor: QueryOptions| {
