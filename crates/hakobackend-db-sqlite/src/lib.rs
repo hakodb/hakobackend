@@ -933,6 +933,50 @@ mod tests {
         assert_eq!(jpath("a.b"), "json_extract(data, '$.\"a\".\"b\"')");
     }
 
+    /// Statement-cache eligibility: page values ride as bound params, so
+    /// every page of the same shape shares one prepared statement.
+    /// Interpolated LIMIT/OFFSET made each page a cache miss (prepare
+    /// per query).
+    #[test]
+    fn page_sql_static_across_pages() {
+        use hakobackend_core::QueryOptions;
+        let mut p1 = Vec::new();
+        let mut p2 = Vec::new();
+        let q1 = QueryOptions { limit: Some(10), offset: Some(0), ..Default::default() };
+        let q2 = QueryOptions { limit: Some(10), offset: Some(20), ..Default::default() };
+        assert_eq!(build_page(&q1, &mut p1), " LIMIT ? OFFSET ?");
+        assert_eq!(build_page(&q2, &mut p2), " LIMIT ? OFFSET ?");
+        assert!(matches!(&p1[..], [P::I(10), P::I(0)]));
+        assert!(matches!(&p2[..], [P::I(10), P::I(20)]));
+        let mut p3 = Vec::new();
+        let q3 = QueryOptions { limit: Some(5), offset: None, ..Default::default() };
+        assert_eq!(build_page(&q3, &mut p3), " LIMIT ?");
+        assert!(matches!(&p3[..], [P::I(5)]));
+        let mut p4 = Vec::new();
+        let q4 = QueryOptions { limit: None, offset: Some(7), ..Default::default() };
+        assert_eq!(build_page(&q4, &mut p4), " LIMIT -1 OFFSET ?");
+        assert!(matches!(&p4[..], [P::I(7)]));
+        let mut p5 = Vec::new();
+        assert_eq!(build_page(&QueryOptions::default(), &mut p5), "");
+        assert!(p5.is_empty());
+    }
+
+    /// Bound pages return the right rows (params actually bind).
+    #[tokio::test]
+    async fn paged_list_binds() {
+        use hakobackend_core::{Database as _, QueryOptions};
+        let db = SqliteDb::open(":memory:").await.unwrap();
+        for i in 0..5 {
+            let id = format!("d{i}");
+            let mut data = std::collections::HashMap::new();
+            data.insert("v".to_string(), serde_json::json!(i));
+            db.set("t", &id, hakobackend_core::Doc { id: id.clone(), data }, false).await.unwrap();
+        }
+        let q = QueryOptions { limit: Some(2), offset: Some(2), ..Default::default() };
+        let ids: Vec<_> = db.list("t", &q).await.unwrap().into_iter().map(|d| d.id).collect();
+        assert_eq!(ids.len(), 2, "bound LIMIT/OFFSET page the rows");
+    }
+
     /// Regression: order by id follows the id column, never the JSON body
     /// (bodies carry no id — the JSON path sorts NULLs = insertion order).
     #[tokio::test]
