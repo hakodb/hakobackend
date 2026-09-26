@@ -306,6 +306,18 @@ fails DSN parse (use encoded host form); mysql needs a dummy host
 (empty host fails parse, socket still wins); shell `&` in DSNs must
 go through a config file, never bare CLI flags.
 
+## 12d. Gateway fast path (no-auth + health bypass, VPS)
+
+- `/api/health` + `/api/ready` merge AFTER `auth_mw` (both open by
+  policy, neither reads the auth context): ab -k hello 17.6K → 23.1K
+  rps (+31%).
+- Anonymous fast path in `auth_mw` (no bearer/cookie → insert None ctx,
+  skip method/uri allocs + DPoP hop; policy decides downstream,
+  identical outcome): hako GET 2142–2274 → 2896–2938 (+30%),
+  PUT 1316 → 2176 (+60%, same path).
+- wstats split on hako GET: eng ~8µs + translate ~5µs = driver ~12µs
+  of ~2800µs/req — driver declared minimal, no further driver work.
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
