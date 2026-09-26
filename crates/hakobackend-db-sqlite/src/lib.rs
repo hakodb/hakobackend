@@ -298,11 +298,24 @@ fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<P>)
 }
 
 /// LIMIT/OFFSET for SQLite: OFFSET needs LIMIT (use -1 = unbounded).
-fn build_page(q: &QueryOptions) -> String {
+/// ponytail: bound (not interpolated) so the SQL text is static per shape
+/// and hits sqlx's per-connection statement cache. Interpolated LIMIT/OFFSET
+/// made every distinct page a cache miss (prepare per query).
+fn build_page(q: &QueryOptions, params: &mut Vec<P>) -> String {
     match (q.limit, q.offset) {
-        (Some(n), Some(o)) => format!(" LIMIT {n} OFFSET {o}"),
-        (Some(n), None) => format!(" LIMIT {n}"),
-        (None, Some(o)) => format!(" LIMIT -1 OFFSET {o}"),
+        (Some(n), Some(o)) => {
+            params.push(P::I(n as i64));
+            params.push(P::I(o as i64));
+            " LIMIT ? OFFSET ?".to_string()
+        }
+        (Some(n), None) => {
+            params.push(P::I(n as i64));
+            " LIMIT ?".to_string()
+        }
+        (None, Some(o)) => {
+            params.push(P::I(o as i64));
+            " LIMIT -1 OFFSET ?".to_string()
+        }
         (None, None) => String::new(),
     }
 }
@@ -567,10 +580,10 @@ impl Database for SqliteDb {
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         let table = hakobackend_core::flat_table_name(collection);
         self.ensure_table(&table).await?;
-        let (where_, params) = build_where(collection, q)?;
+        let (where_, mut params) = build_where(collection, q)?;
         let mut sql = format!("SELECT id, data FROM {}{}", qi(&table), where_);
         sql.push_str(&build_order(q));
-        sql.push_str(&build_page(q));
+        sql.push_str(&build_page(q, &mut params));
         let mut query = sqlx::query(&sql);
         bind_params!(query, params);
         let rows = query.fetch_all(&self.pool).await.map_err(|_| AppError::Internal("db error".into()))?;
