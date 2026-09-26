@@ -318,6 +318,26 @@ go through a config file, never bare CLI flags.
 - wstats split on hako GET: eng ~8µs + translate ~5µs = driver ~12µs
   of ~2800µs/req — driver declared minimal, no further driver work.
 
+## 12e. Same-client correction + saturation proof (VPS, ab -k)
+
+The python bench understated ~10x (GIL client-bound). Same client
+(`ab -n 5000 -c 50 -k`), hako backend, fast-path build:
+
+| shape | python (8 thr) | ab -k (50 conc) |
+|---|---|---|
+| hello /api/ready | ~3.0K | **23.1K** |
+| GET doc | ~2.9K | **29.7K** |
+| PUT doc | ~2.2K | **10.6K** (fsync) |
+
+vmstat during 30K GET: 81% CPU (us 37 + **sy 44**). Nearly half the
+ceiling is kernel TCP on weak vCPUs — not code. Engine 400K+ vs
+gateway 30K = HTTP tax (~130µs/core-req: TCP + hyper + middleware +
+JSON), consistent with hakobench 936K (engine-native, no HTTP) and
+axum 80–150K claims (strong hardware, 5–10x per-core). Config
+reviewed: keep-alive, hyper NODELAY defaults, no extra layers —
+nothing left to turn. Higher RPS needs bigger payloads (batch does
+25K docs/s), better CPUs, or kernel bypass (out of scope).
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
