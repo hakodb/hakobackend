@@ -8,8 +8,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod atomics;
-pub mod tenant;
-pub mod tenant_db;
 pub mod ttl;
 
 // --- Document: id + flexible fields (schemaless, like Firestore) ---
@@ -221,10 +219,6 @@ pub struct AuthContext {
     /// Namespaced uid (`github:123`, `local:abc`) so providers never collide.
     pub uid: String,
     #[serde(default)]
-    pub roles: Vec<String>,
-    #[serde(default)]
-    pub tenant: Option<String>,
-    #[serde(default)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
@@ -237,9 +231,6 @@ pub struct Claims {
     pub uid: String,
     pub email: Option<String>,
     pub extra: HashMap<String, serde_json::Value>,
-    /// Tenant bound at issuance (local JWTs). External providers leave it
-    /// empty; the server binds them via the tenant user store instead.
-    pub tenant: Option<String>,
 }
 
 impl Claims {
@@ -425,7 +416,7 @@ pub trait Database: Send + Sync {
 }
 
 /// Shared handles (`Arc`) forward to the driver: decorators and caches hold
-/// one handle type everywhere (`TenantDb::new(db_arc)` just works).
+/// one handle type everywhere.
 #[async_trait::async_trait]
 impl<D: Database + Send + Sync> Database for Arc<D> {
     fn capabilities(&self) -> Capabilities {
