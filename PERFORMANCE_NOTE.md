@@ -187,8 +187,18 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   object + unordered skip/limit + native count** (live 2.4.3: eq-filter
   58→211 rps, eq+order 59→194, biglist 55→152; order-only unchanged by
   design — ReQL-vs-contract ordering parity on missing/mixed-type fields
-  is unverified, so the driver re-sorts + truncates). mysql assumed pg-like
-  (verify on measure).
+  is unverified, so the driver re-sorts + truncates). mysql same shape as
+  pg. Live wall (8 workers, EL8 localhost, docker pg16/mysql8 — since
+  removed): pg PUT 1116 GET 2032 eq 736 eq+order 719 order-only 424
+  biglist 507; mysql PUT 772 GET 1861 eq 446 eq+order 453 order-only 356
+  biglist 374.
+- Live-test catches (all fixed): pg subcollection path filter bound a
+  jsonb param vs a TEXT column (`text = jsonb` 42883) — unquote the param
+  (`($n #>> '{}')`); mysql `list_collections` `ESCAPE '\'` is a syntax
+  error (→ `!` escape) AND information_schema returns VARBINARY (sqlx
+  ColumnDecode → `CAST AS CHAR`); common order-by-id bug (sqlite/pg/mysql
+  JSON path sorts NULLs): `id` column everywhere + contract fallback,
+  pinned by shared conformance §5a.
 - Our server is one consumer among public ones; every driver above is
   measurable with the same bench scripts + permanent wstats (§7).
 
