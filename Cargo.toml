@@ -26,3 +26,12 @@ tikv-jemallocator = "0.6"
 unreql = "0.2"
 futures = "0.3"
 mime = "0.3"
+
+# Blueprint-tested release tuning (measured, not faith): thin LTO for
+# cross-crate inlining (server→core→drivers→hakodb), single codegen unit
+# for deeper optimization. Costs build time (~2-3x link), pays runtime.
+# panic=abort deliberately NOT set (unwinding keeps graceful shutdown +
+# catch paths intact; abort saves nothing measurable here).
+[profile.release]
+lto = "thin"
+codegen-units = 1
