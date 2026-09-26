@@ -287,6 +287,25 @@ Do NOT compare §12 vs §12b absolute numbers (different hardware).
 P2 verdict at gateway level: no isolated before/after run — the win
 is structural (one prepare per page-shape, unit-pinned per driver).
 
+## 12c. Unix sockets for co-located pg/mysql (zero code)
+
+sqlx parses socket DSNs natively (pg: percent-encoded socket dir as
+host; mysql: `?socket=` file path + dummy host). Share the socket dir
+via docker volume. VPS bench2 8×100, same hardware/data shapes:
+
+| driver | transport | PUT | GET |
+|---|---|---|---|
+| postgres 16 | TCP localhost | 694–776 | 1339–2013 |
+| postgres 16 | unix socket | **1431** | **2412–2440** (+65–80%) |
+| mysql 8 | TCP localhost | 329–457 | 1192–1441 |
+| mysql 8 | unix socket | **929** | **2144–2149** (+65–140%) |
+
+The TCP stack (not the engine, not the driver translate path at
+3–12µs) was the cost. Gotchas earned: `?socket=` with EMPTY pg host
+fails DSN parse (use encoded host form); mysql needs a dummy host
+(empty host fails parse, socket still wins); shell `&` in DSNs must
+go through a config file, never bare CLI flags.
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never

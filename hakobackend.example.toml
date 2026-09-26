@@ -8,6 +8,14 @@ port = 3000
 driver = "hako"
 # file path (hako/sqlite) or DSN (postgres/mysql)
 data = "./data/hako.ub"
+# Co-located postgres/mysql: unix socket instead of TCP (measured
+# +65-140% gateway RPS on weak CPUs — TCP stack is the cost, not the
+# engine). Share the socket dir into the backend container, e.g.
+# docker -v pg-sock:/var/run/postgresql, then:
+# postgres: data = "postgres://user:pass@%2Fvar%2Frun%2Fpostgresql/dbname"
+#   (host = percent-encoded socket DIR; sqlx uses it instead of TCP)
+# mysql:    data = "mysql://user:pass@localhost/dbname?socket=/var/run/mysqld/mysqld.sock"
+#   (dummy host required — empty host fails DSN parse; socket wins over TCP)
 
 # Auth: off (default, dev) | local | chain:github,local | ./custom.toml.
 # Unknown names fail fast at startup (fail-closed).
