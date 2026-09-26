@@ -181,6 +181,26 @@ fn build_where(collection: &str, q: &QueryOptions) -> Result<(String, Vec<serde_
     Ok((where_, params))
 }
 
+/// Page clause with bound LIMIT/OFFSET (`next` continues the $n sequence
+/// from build_where). Static text per shape → per-connection prepared
+/// statement cache hits; interpolated values made every page a miss.
+/// Page values bind as integers AFTER the jsonb WHERE params (LIMIT
+/// takes bigint, never jsonb — 42804 otherwise).
+fn build_page(next: &mut i32, q: &QueryOptions, params: &mut Vec<i64>) -> String {
+    let mut sql = String::new();
+    if let Some(o) = q.offset {
+        sql.push_str(&format!(" OFFSET ${next}"));
+        params.push(o as i64);
+        *next += 1;
+    }
+    if let Some(n) = q.limit {
+        sql.push_str(&format!(" LIMIT ${next}"));
+        params.push(n as i64);
+        *next += 1;
+    }
+    sql
+}
+
 fn build_order(q: &QueryOptions) -> String {
     if q.order_by.is_empty() {
         return String::new();
@@ -451,14 +471,14 @@ impl Database for PgDb {
         let (where_, params) = build_where(collection, q)?;
         let mut sql = format!("SELECT id, data FROM {}{}", qi(&table), where_);
         sql.push_str(&build_order(q));
-        if let Some(n) = q.offset {
-            sql.push_str(&format!(" OFFSET {n}"));
-        }
-        if let Some(n) = q.limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
+        let mut next = params.len() as i32 + 1;
+        let mut page_params = Vec::new();
+        sql.push_str(&build_page(&mut next, q, &mut page_params));
         let mut query = sqlx::query(&sql);
         for p in params {
+            query = query.bind(p);
+        }
+        for p in page_params {
             query = query.bind(p);
         }
         let rows = query.fetch_all(&self.pool).await.map_err(|e| AppError::Internal(safe_db_err(e)))?;
@@ -746,6 +766,25 @@ mod tests {
         let s = build_order(&q);
         assert!(s.contains("id DESC"), "{s}");
         assert!(s.contains("data#>'"), "{s}");
+    }
+
+    /// Page values ride as bound params ($n continues the WHERE sequence),
+    /// so every page of the same shape shares one prepared statement.
+    /// Page params bind as integers (LIMIT takes bigint, not jsonb).
+    #[test]
+    fn page_placeholders_static() {
+        use hakobackend_core::QueryOptions;
+        let mut p1: Vec<i64> = Vec::new();
+        let mut n1 = 1;
+        let q1 = QueryOptions { limit: Some(10), offset: Some(0), ..Default::default() };
+        assert_eq!(build_page(&mut n1, &q1, &mut p1), " OFFSET $1 LIMIT $2");
+        assert_eq!(p1, vec![0, 10]);
+        // Different page, same text (cache hit); numbering follows params.
+        let mut p2: Vec<i64> = Vec::new();
+        let mut n2 = 2;
+        let q2 = QueryOptions { limit: Some(10), offset: Some(20), ..Default::default() };
+        assert_eq!(build_page(&mut n2, &q2, &mut p2), " OFFSET $2 LIMIT $3");
+        assert_eq!(p2, vec![20, 10]);
     }
 
     #[test]

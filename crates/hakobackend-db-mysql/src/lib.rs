@@ -265,11 +265,25 @@ fn push_cursor(filters: &mut Vec<String>, q: &QueryOptions, params: &mut Vec<Str
 }
 
 /// LIMIT/OFFSET for MySQL: without count use 2^64-1 (unbounded).
-fn build_page(q: &QueryOptions) -> String {
+/// ponytail: bound (not interpolated) so the SQL text is static per shape
+/// and hits the per-connection prepared-statement cache (same fix as the
+/// sqlite driver). The 2^64-1 literal stays inline — only the varying
+/// values ride as params.
+fn build_page(q: &QueryOptions, params: &mut Vec<String>) -> String {
     match (q.limit, q.offset) {
-        (Some(n), Some(o)) => format!(" LIMIT {n} OFFSET {o}"),
-        (Some(n), None) => format!(" LIMIT {n}"),
-        (None, Some(o)) => format!(" LIMIT 18446744073709551615 OFFSET {o}"),
+        (Some(n), Some(o)) => {
+            params.push(n.to_string());
+            params.push(o.to_string());
+            " LIMIT ? OFFSET ?".to_string()
+        }
+        (Some(n), None) => {
+            params.push(n.to_string());
+            " LIMIT ?".to_string()
+        }
+        (None, Some(o)) => {
+            params.push(o.to_string());
+            " LIMIT 18446744073709551615 OFFSET ?".to_string()
+        }
         (None, None) => String::new(),
     }
 }
@@ -524,10 +538,10 @@ impl Database for MysqlDb {
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         let table = hakobackend_core::flat_table_name(collection);
         self.ensure_table(&table).await?;
-        let (where_, params) = build_where(collection, q)?;
+        let (where_, mut params) = build_where(collection, q)?;
         let mut sql = format!("SELECT id, CAST(data AS CHAR) as data FROM {}{}", qi(&table), where_);
         sql.push_str(&build_order(q));
-        sql.push_str(&build_page(q));
+        sql.push_str(&build_page(q, &mut params));
         let mut query = sqlx::query(&sql);
         for p in params {
             query = query.bind(p);
@@ -868,6 +882,25 @@ mod tests {
     fn identifier_quoted() {
         assert_eq!(qi("a`b"), "`a``b`");
         assert_eq!(jpath("a.b"), "$.\"a\".\"b\"");
+    }
+
+    /// Page values ride as bound params, so every page of the same shape
+    /// shares one prepared statement (was: interpolated = prepare/query).
+    #[test]
+    fn page_sql_static_across_pages() {
+        use hakobackend_core::QueryOptions;
+        let mut p1 = Vec::new();
+        let mut p2 = Vec::new();
+        let q1 = QueryOptions { limit: Some(10), offset: Some(0), ..Default::default() };
+        let q2 = QueryOptions { limit: Some(10), offset: Some(20), ..Default::default() };
+        assert_eq!(build_page(&q1, &mut p1), " LIMIT ? OFFSET ?");
+        assert_eq!(build_page(&q2, &mut p2), " LIMIT ? OFFSET ?");
+        assert_eq!(p1, vec!["10", "0"]);
+        assert_eq!(p2, vec!["10", "20"]);
+        let mut p3 = Vec::new();
+        let q3 = QueryOptions { limit: None, offset: Some(7), ..Default::default() };
+        assert_eq!(build_page(&q3, &mut p3), " LIMIT 18446744073709551615 OFFSET ?");
+        assert_eq!(p3, vec!["7"]);
     }
 
     /// Full conformance needs live MySQL/MariaDB — via env UB_MYSQL_DSN, ignored by default.
