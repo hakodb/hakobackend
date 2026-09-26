@@ -488,12 +488,16 @@ impl Database for MysqlDb {
 
     async fn list_collections(&self) -> Result<Vec<String>, AppError> {
         // Internal `__*` collections are not exposed over HTTP.
+        // TEMP-DEBUG (revert after diagnosis): surface the sqlx error.
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME NOT LIKE '!_%' ESCAPE '!'",
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| AppError::Internal("db error".into()))?;
+        .map_err(|e| {
+            eprintln!("[mysql-dbg] list_collections: {e:?}");
+            AppError::Internal("db error".into())
+        })?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
