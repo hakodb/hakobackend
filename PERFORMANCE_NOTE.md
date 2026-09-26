@@ -264,6 +264,29 @@ Engine matrix Always/1000docs (same C++ harness): v0.7.6 → 0.8.24 →
 TopN ≈ flat-or-better everywhere (WPS ~1360/8800, Qry ~21.5K,
 Agg ~76K); Par/Tx rows are bimodal noise, compare isolated runs only.
 
+## 12b. Cross-driver comparison, VPS rerun (PG/P2 era)
+
+VPS localhost, 8 workers, fresh data per driver, limiters raised
+(defaults 600/min 429 the bench itself — found the hard way),
+backend @P2 (bound LIMIT/OFFSET everywhere) + hako 0.8.29,
+pg16/mysql8 docker defaults. bench2 (put/get 8×100) + bench4
+(seed 2000, queries 8×50). All green, including pg/mysql live
+conformance with bound page params (pg needed integer binds —
+jsonb in LIMIT is 42804; mysql coerces string params fine).
+
+| driver | PUT | GET | eq | eq+order | order-only | biglist |
+|---|---|---|---|---|---|---|
+| hako 0.8.29 | 1316 | 2142 | 758 | 1058 | 913 | 784 |
+| sqlite | 493 | 2186 | 532 | 512 | 369 | 387 |
+| postgres 16 | 776 | 1434 | 548 | 559 | 252 | 316 |
+| mysql 8 | 457 | 1441 | 420 | 432 | 339 | 370 |
+
+Ranking holds from §12 (hako leads every shape; sqlite GET ties
+hako — the per-op fixed cost dominates small reads on all drivers).
+Do NOT compare §12 vs §12b absolute numbers (different hardware).
+P2 verdict at gateway level: no isolated before/after run — the win
+is structural (one prepare per page-shape, unit-pinned per driver).
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
