@@ -400,15 +400,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/auth/github/callback", get(github_callback))
         .layer(middleware::from_fn_with_state(strict.clone(), limit_mw));
 
-    let mut app = Router::new()
+    // ponytail: health/ready merge AFTER auth_mw — both are open by
+    // policy and neither reads the auth context (health is static JSON,
+    // ready takes State only). Skips hint parsing, cookie/token reads,
+    // DPoP checks and 2-3 String allocs per probe. wstats stays under
+    // auth (operational surface, unchanged behavior).
+    let open = Router::new()
         .route("/api/health", get(health))
-        .route("/api/ready", get(ready))
+        .route("/api/ready", get(ready));
+    let mut app = Router::new()
         .route("/api/__wstats", get(wstats_dump))
         .merge(api)
         .merge(auth_routes)
         .merge(portal::strict_routes().layer(middleware::from_fn_with_state(strict, limit_mw)))
         .merge(portal::routes())
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .merge(open)
         // gzip JSON responses, but never the live streams: compressing
         // SSE would buffer flushes and add event latency for little gain
         // (stream frames are already tiny; WS upgrades carry no body).
@@ -764,6 +771,18 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     );
     let from_cookie = read_cookie(req.headers(), ACCESS_COOKIE);
     let token = bearer(req.headers()).or_else(|| from_cookie.clone());
+    // ponytail: anonymous fast path — no credentials means no resolution,
+    // DPoP, or CSRF work. Policy decides public/deny downstream from the
+    // None context (identical outcome); skips 2 String allocs + async hop
+    // per public read/write. Tenant hint still parsed above (scoped policy
+    // needs it); the token-bearing path below is untouched.
+    if token.is_none() && from_cookie.is_none() {
+        req.extensions_mut().insert(None::<AuthContext>);
+        if WSAMP.try_get().unwrap_or(false) {
+            wstats::add(&wstats::F[1], ws_t0.elapsed().as_nanos() as u64);
+        }
+        return next.run(req).await;
+    }
     let method = req.method().to_string();
     let uri = base_uri(s.tls, req.headers(), req.uri().path());
     let ctx = match &token {
