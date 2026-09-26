@@ -165,7 +165,10 @@ fn build_where(collection: &str, q: &QueryOptions) -> Result<(String, Vec<serde_
     let mut n = 0i32;
     if collection.contains('/') {
         n += 1;
-        filters.push(format!("(data#>>'{{{PATH_FIELD}}}') = ${n}"));
+        // #>> yields TEXT but params bind as jsonb: unquote the param too,
+        // else `text = jsonb` is undefined (42883). All other sites bind
+        // Rust strings (TEXT) and are unaffected.
+        filters.push(format!("(data#>>'{{{PATH_FIELD}}}') = (${n} #>> '{{}}')"));
         params.push(serde_json::Value::String(collection.into()));
     }
     for f in &q.filters {
