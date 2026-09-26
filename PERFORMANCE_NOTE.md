@@ -229,4 +229,92 @@ on the bench box (driver 0.8.24, narrowed `list()`):
   current-thread runtimes. Fix: oneshot ready-handshake (subscribe returns
   after StreamMap built; 5s timeout degrades to old behavior, never hangs).
   Same race affected real clients (open page → immediate write missed its
-  echo until the next tick). Suite now 37 green.
+   echo until the next tick). Suite now 37 green.
+
+## 12. Cross-driver comparison (EL8 localhost, 8 workers, fresh data)
+
+Wall gateway RPS (bench2/bench4 in `bench/`, 8 workers × 100/50, hako
+Interval / sqlite FULL / docker pg16 + mysql8 defaults):
+
+| driver | PUT | GET | eq | eq+order | order-only | biglist |
+|---|---|---|---|---|---|---|
+| hako 0.1.4+TopN | ~2150 | ~2900 | ~1100 | ~1100-1300 | 296→1175 / 2096 idx | ~900 |
+| postgres 16 | 1116 | 2032 | 736 | 719 | 424 | 507 |
+| mysql 8 | 772 | 1861 | 446 | 453 | 356 | 374 |
+| rethinkdb 2.4.3 | 226→259 | ~2000 | 58→211 | 59→194 | 48 | 55→152 |
+| sqlite | dev-box only (not comparable; run `__benchmark` on target) | | | | | |
+
+`__benchmark` sequential, release, N=2000 (hako/Interval server):
+
+| shape | hako rps | sqlite-dev rps |
+|---|---|---|
+| seed-put / put / post / patch | 12K / 19K / 20K / 19K | 74 / 149 / 283 / 285 |
+| batch (1 tx @100) | 164323 docs/s | 2884 |
+| get / walk / cursor-idx | 399K / 654K / 60K docs/s | 1904 / 17959 / 11391 |
+| query-idx / count / offset-idx | 776 / 18190 / 1039 | 307 / 313 / 126 |
+
+wstats handler baselines (hako): PUT ~290-340 (get_old 115→73 hit,
+eng_set ~150-230 fsync variance), GET ~25-94 (eng_get 78→14),
+LIST blended ~13.1ms→~3-4ms (TopN/indexed), FRONT total ~1200 blended
+(mw_auth 5, mw_limit 2.7, collect ~350-570, parse 4). Per-shape tables
+(`shape-order/filter/filter-order/cursor/paged/plain`) isolate further —
+cursor eng highest by design (full fetch + post-filter).
+
+Engine matrix Always/1000docs (same C++ harness): v0.7.6 → 0.8.24 →
+TopN ≈ flat-or-better everywhere (WPS ~1360/8800, Qry ~21.5K,
+Agg ~76K); Par/Tx rows are bimodal noise, compare isolated runs only.
+
+## 13. Test-methodology issues (earned the hard way)
+
+- Wall-RPS moves ±20% run to run: compare bands across repeats, never
+  single runs. Parallel-profile rows are bimodal — rerun isolated.
+- `bench4` asserts HTTP 200 only, never content: an index speedup once
+  masked EMPTY results. Pair slow shapes with a doc-count check.
+- Index builds are async: queries issued immediately read empty/partial
+  indexes. Engine now falls back to full scan mid-build
+  (`index_query_ready`); bench probes readiness too. Same hazard exists
+  over plain HTTP right after `POST /api/indexes`.
+- Sequential curl loops measure TCP setup (~1ms), not handlers — use
+  keep-alive (the python scripts do) or multi-URL single curl.
+- RPS is throughput with N in flight; per-request latency ≈ workers/rps.
+- Sampling is 1/16 globally: per-shape wstats rows need volume (~64+
+  requests/shape for a few samples); un-sampled shapes read 0.0, not 0.
+- TTL wrapper shadows native aggregation in prod (correctness over
+  speed); native fires via the exact total−expired protocol.
+- Conformance had holes (order-by-id, subcollection pg, mysql
+  list_collections) — every live run since has closed one; keep
+  extending the shared suite, it is the arbiter.
+
+## 14. Per-driver optimization guide
+
+- **hako**: keep Interval (deployment default; Always only when every
+  write must survive power loss — 96% of single-write cost is fsync).
+  Declare indexes for every filtered/sorted field (single biggest lever,
+  2-6x measured). Batch hot writes (164K docs/s). `skip_read_before_write`
+  or `X-Hako-Skip-RBW` for owner-free PUT volume (~77us/hit).
+  `query_workers` = CPU count; jemalloc measured ~0% (kept for hygiene).
+  Next structural lever only: `group_commit_max_ops`/durability per
+  deployment, then faster disks.
+- **sqlite**: `SQLITE_SYNCHRONOUS=normal` opt-in (~2.3x, measured).
+  WAL + busy_timeout already on; temp sorts in MEMORY, 64MB mmap,
+  32MB WAL cap (new defaults). Declare indexes (expression DDL via the
+  driver). Raise page cache only past ~2MB working sets.
+- **postgres**: `shared_buffers` 25% RAM, `effective_cache_size` high,
+  `work_mem` for big sorts, pool max ≥ workers + margin (default 10
+  fits 8 bench workers). Prepared statements on by default. Declare
+  indexes (B-tree on sort/filter exprs via driver DDL). Watch jsonb
+  cross-type comparisons (500 vs contract-exclude on wild data).
+- **mysql**: `innodb_buffer_pool_size` 50–70% RAM — **docker default
+  128MB starves it; all mysql numbers above are pool-starved floors**.
+  Same index/pool advice as postgres; utf8mb4 everywhere. Eq-null and
+  Ne-non-scalar have narrow missing-field divergences (documented in
+  driver) — normalize those fields if aggregated.
+- **rethinkdb**: secondary indexes on every ordered/filtered field
+  (unindexed `order_by` sorts in memory, hard-capped at 100K docs —
+  over the cap it ERRORS, not slows). Shards for scale; no multi-doc
+  atomicity (emulated tx is best-effort); consider soft durability for
+  write volume. ReQL-vs-contract ordering on missing/mixed types is
+  unverified — keep order pushdown off until a parity study says otherwise.
+- **universal**: batch > single puts; indexes > code; measure with
+  `__benchmark` (driver) then `bench/*.py` (gateway) then wstats
+  (stages) — in that order, cheapest signal first.
