@@ -1,19 +1,16 @@
-//! hakobackend-policy: the `userrules.ts` replacement.
+//! hakobackend-policy: single-user policy file.
 //!
 //! Declarative rules in TOML, **hot-reloaded without restart** (hakobackend-server watches
 //! the file mtime). Parse failures / rule typos = fail-closed (deny) + error message,
 //! never fail-open.
 //!
-//! Core does NOT bind role or user-collection names — all of that is yours
-//! via `[identity]` (`users_collection`, `role_field`, `owner_field`).
-//! `role:<anything>` is free-form; core only compares strings.
+//! Three rules only: `public` (anyone, no auth), `auth` (any authenticated
+//! caller), `deny` (nobody). Owner/role rules were removed with the tenant
+//! system: per-user data control is the deployer's job (separate
+//! collections, or an external tenant layer). Admin access is a UID
+//! allowlist in server config, not a role.
 //!
 //! ```toml
-//! [identity]
-//! users_collection = "members"   # your user collection (default "users")
-//! role_field = "posisi"          # your role field (default "role")
-//! owner_field = "pemilikId"      # your owner field (default "ownerId")
-//!
 //! [defaults]
 //! read = "public"
 //! write = "deny"
@@ -21,21 +18,21 @@
 //! [collections.posts]
 //! read = "public"
 //! create = "auth"
-//! delete = "role:pengurus"       # free-form role, defined by you
+//! delete = "deny"
 //! ```
 
 use serde::Deserialize;
 use std::collections::HashMap;
 use hakobackend_core::{AuthContext, Doc, Method};
 
-/// One rule. From a TOML string: `public|auth|owner|deny|role:<name>`.
+/// One rule. From a TOML string: `public|auth|deny`.
+/// `owner` / `role:*` were removed (single-user backend): they fail LOUD
+/// at parse time so stale policies break visibly, never silently open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rule {
     Public,
     Auth,
-    Owner,
     Deny,
-    Role(String),
 }
 
 impl From<String> for Rule {
@@ -43,13 +40,8 @@ impl From<String> for Rule {
         match s.as_str() {
             "public" => Rule::Public,
             "auth" => Rule::Auth,
-            "owner" => Rule::Owner,
-            "deny" => Rule::Deny,
-            _ => match s.strip_prefix("role:") {
-                Some(name) if !name.is_empty() => Rule::Role(name.to_string()),
-                // ponytail: rule typo = deny (fail-closed), not a startup error.
-                _ => Rule::Deny,
-            },
+            // ponytail: unknown incl. removed owner/role = deny (fail-closed).
+            _ => Rule::Deny,
         }
     }
 }
@@ -63,7 +55,15 @@ impl Default for Rule {
 
 impl<'de> Deserialize<'de> for Rule {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Ok(Rule::from(String::deserialize(d)?))
+        let s = String::deserialize(d)?;
+        // Removed rules fail LOUD (not silent deny): a stale policy with
+        // owner/role must break visibly at load, never lock out silently.
+        if s == "owner" || s.starts_with("role:") {
+            return Err(serde::de::Error::custom(
+                "rule '".to_string() + &s + "' removed: single-user backend has public|auth|deny only",
+            ));
+        }
+        Ok(Rule::from(s))
     }
 }
 
@@ -74,54 +74,19 @@ fn deny_default() -> Rule {
 fn default_users_collection() -> String {
     "users".into()
 }
-fn default_role_field() -> String {
-    "role".into()
-}
-fn default_owner_field() -> String {
-    "ownerId".into()
-}
 
-/// Identity owned by the USER, not core. Answers: "which collection holds user docs,
-/// which field holds the role, which field holds the owner". Core only consumes
-/// these values (phase 2: the auth provider loads the user doc from `users_collection`
-/// and maps `role_field` into `AuthContext.roles`); core never
-/// assumes any particular collection/role name.
+/// Identity owned by the USER, not core: which collection holds user
+/// docs. Role/owner fields were removed with the tenant system.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Identity {
-    /// User-document collection. Free-form: `users`, `members`, `sc_users`, …
+    /// User-document collection. Free-form: `users`, `members`, …
     #[serde(default = "default_users_collection")]
     pub users_collection: String,
-    /// Role field on the user doc. Supports a single string (`"admin"`)
-    /// or an array (`["admin","staff"]`). Freely replaceable (`posisi`, `level`, …).
-    #[serde(default = "default_role_field")]
-    pub role_field: String,
-    /// Global default owner field; can be overridden per collection.
-    #[serde(default = "default_owner_field")]
-    pub owner_field: String,
 }
 
 impl Default for Identity {
     fn default() -> Self {
-        Self {
-            users_collection: default_users_collection(),
-            role_field: default_role_field(),
-            owner_field: default_owner_field(),
-        }
-    }
-}
-
-impl Identity {
-    /// Extract roles from a user doc (string or string array).
-    /// Ready-made helper for phase-2 auth providers and for tests.
-    pub fn roles_of(&self, user_doc: &Doc) -> Vec<String> {
-        match user_doc.data.get(&self.role_field) {
-            Some(serde_json::Value::String(s)) => vec![s.clone()],
-            Some(serde_json::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            _ => vec![],
-        }
+        Self { users_collection: default_users_collection() }
     }
 }
 
@@ -136,25 +101,22 @@ pub struct Defaults {
 /// Policy-level performance switches (all default off = legacy behavior).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct Performance {
-    /// Skip read-before-write on PUT when no Owner rule governs the write
-    /// (~115us saved per PUT: the `existing` lookup is pure overhead then).
-    /// Tradeoff: PUT-overwrite resets `createdAt` (no old doc to preserve
-    /// it from — use PATCH merge when that matters). PATCH merge always
-    /// reads (it needs the base); Owner-governed writes ignore this flag.
+    /// Skip read-before-write on PUT (~115us saved per PUT: the `existing`
+    /// lookup is pure overhead then). Tradeoff: PUT-overwrite resets
+    /// `createdAt` (no old doc to preserve it from — use PATCH merge when
+    /// that matters). PATCH merge always reads (it needs the base).
     #[serde(default)]
     pub skip_read_before_write: bool,
 }
-
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct CollectionPolicy {    pub get: Option<Rule>,
+pub struct CollectionPolicy {
+    pub get: Option<Rule>,
     pub list: Option<Rule>,
     pub create: Option<Rule>,
     pub update: Option<Rule>,
     pub delete: Option<Rule>,
     pub read: Option<Rule>,
     pub write: Option<Rule>,
-    /// Document owner field (default `ownerId`, fallback `uid`).
-    pub owner_field: Option<String>,
 }
 
 impl CollectionPolicy {
@@ -235,8 +197,8 @@ impl PolicyFile {
         None
     }
 
-    /// `resource` = existing doc (get/update/delete), incoming doc (create),
-    /// or each listed doc (called per-doc by the server).
+    /// `resource` is accepted for signature compatibility and ignored:
+    /// no remaining rule reads the document.
     pub fn allow(
         &self,
         auth: Option<&AuthContext>,
@@ -244,49 +206,32 @@ impl PolicyFile {
         method: Method,
         resource: Option<&Doc>,
     ) -> bool {
+        let _ = resource;
         let empty = CollectionPolicy::default();
         let policy = self.find(collection).unwrap_or(&empty);
         let rule = policy.slot(method, &self.defaults);
-        // owner_field: the per-collection override wins over the user's global default.
-        let owner_field = policy.owner_field.as_deref().unwrap_or(&self.identity.owner_field);
-        eval(rule, auth, Some(owner_field), resource)
+        eval(rule, auth)
     }
 
     /// True when a rule governing `method` on `collection` reads the
-    /// existing document. Today only `Owner` does; every other rule
-    /// decides on the auth context alone, so `allow` with `None` decides
-    /// identically and read-before-write is pure overhead.
-    pub fn needs_existing(&self, collection: &str, method: Method) -> bool {
-        let empty = CollectionPolicy::default();
-        let policy = self.find(collection).unwrap_or(&empty);
-        matches!(policy.slot(method, &self.defaults), Rule::Owner)
+    /// existing document. No remaining rule does (Owner did) — kept for
+    /// callers; always false.
+    pub fn needs_existing(&self, _collection: &str, _method: Method) -> bool {
+        false
     }
 
-    /// Policy-level read-before-write skip (perf, opt-in): true only when
-    /// the flag is set AND [`Self::needs_existing`] is false.
-    /// Owner-governed writes always return false (correctness first).
-    pub fn skip_read_before_write(&self, collection: &str, method: Method) -> bool {
-        self.performance.skip_read_before_write && !self.needs_existing(collection, method)
+    /// Policy-level read-before-write skip (perf, opt-in): true when the
+    /// flag is set. PATCH merge always reads (it needs the base).
+    pub fn skip_read_before_write(&self, _collection: &str, _method: Method) -> bool {
+        self.performance.skip_read_before_write
     }
 }
 
-fn eval(rule: &Rule, auth: Option<&AuthContext>, owner_field: Option<&str>, resource: Option<&Doc>) -> bool {
+fn eval(rule: &Rule, auth: Option<&AuthContext>) -> bool {
     match rule {
         Rule::Public => true,
         Rule::Deny => false,
         Rule::Auth => auth.is_some(),
-        Rule::Role(name) => auth.map(|a| a.roles.iter().any(|r| r == name)).unwrap_or(false),
-        Rule::Owner => match (auth, resource) {
-            (Some(a), Some(doc)) => {
-                let fields = [
-                    owner_field.unwrap_or("ownerId"),
-                    "ownerId",
-                    "uid",
-                ];
-                fields.iter().any(|f| doc.data.get(*f).and_then(|v| v.as_str()) == Some(a.uid.as_str()))
-            }
-            _ => false,
-        },
     }
 }
 
@@ -333,18 +278,12 @@ mod tests {
     }
 
     #[test]
-    fn owner_rule() {
-        let p = policy(
-            r#"
-            [collections.profiles]
-            read = "owner"
-            write = "owner"
-            "#,
-        );
-        let me = auth("u1");
-        assert!(p.allow(Some(&me), "profiles", Method::Get, Some(&doc("u1"))));
-        assert!(!p.allow(Some(&me), "profiles", Method::Get, Some(&doc("u2"))));
-        assert!(!p.allow(None, "profiles", Method::Get, Some(&doc("u1"))));
+    fn removed_rules_fail_loud() {
+        // owner/role were removed: stale policies break visibly at load,
+        // never silently open or silently lock.
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"owner\"\n").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"role:x\"\n").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"auth\"\n").is_ok());
     }
 
     #[test]
@@ -352,43 +291,24 @@ mod tests {
         // Off by default: legacy read-before-write everywhere.
         let p = policy("[defaults]\nread = \"public\"\nwrite = \"public\"\n");
         assert!(!p.skip_read_before_write("w", Method::Update));
-        // Opt-in with no Owner rules: skip allowed.
+        // Opt-in: skip allowed (no rule reads the document anymore).
         let p = policy(
             "[defaults]\nread = \"public\"\nwrite = \"public\"\n[performance]\nskip_read_before_write = true\n",
         );
         assert!(p.skip_read_before_write("w", Method::Update));
-        // Owner in defaults: flag ignored (correctness first).
-        let p = policy(
-            "[defaults]\nread = \"public\"\nwrite = \"owner\"\n[performance]\nskip_read_before_write = true\n",
-        );
-        assert!(!p.skip_read_before_write("w", Method::Update));
-        // Per-collection Owner override also blocks, other collections skip.
-        let p = policy(
-            "[defaults]\nread = \"public\"\nwrite = \"public\"\n[collections.mine]\nwrite = \"owner\"\n[performance]\nskip_read_before_write = true\n",
-        );
-        assert!(!p.skip_read_before_write("mine", Method::Update));
-        assert!(p.skip_read_before_write("w", Method::Update));
     }
 
     #[test]
-    fn role_rule_and_typo_fails_closed() {
+    fn typo_fails_closed() {
         let p = policy(
             r#"
             [collections.posts]
             read = "public"
-            delete = "role:maintainer"
             update = "rolee:maintainer"
             "#,
         );
-        let admin = AuthContext {
-            uid: "a".into(),
-            roles: vec!["maintainer".into()],
-            ..Default::default()
-        };
-        assert!(p.allow(Some(&admin), "posts", Method::Delete, None));
-        assert!(!p.allow(Some(&auth("u1")), "posts", Method::Delete, None));
         // typo -> Deny
-        assert!(!p.allow(Some(&admin), "posts", Method::Update, None));
+        assert!(!p.allow(Some(&auth("u1")), "posts", Method::Update, None));
     }
 
     #[test]
@@ -420,7 +340,8 @@ mod tests {
 
     #[test]
     fn identity_user_owned() {
-        // Free-form roles (not reserved names), custom users_collection & fields.
+        // Only users_collection survives; stale role/owner keys are
+        // ignored (serde default), never honored.
         let p: PolicyFile = toml::from_str(
             r#"
             [identity]
@@ -428,64 +349,12 @@ mod tests {
             role_field = "posisi"
             owner_field = "pemilikId"
             [collections.arsip]
-            read = "owner"
-            write = "role:pengurus"
+            read = "auth"
             "#,
         )
         .unwrap();
         assert_eq!(p.identity.users_collection, "members");
-
-        // roles_of: supports a single string or an array, via the custom field.
-        let single = Doc {
-            id: "u1".into(),
-            data: [("posisi".to_string(), json!("pengurus"))].into_iter().collect(),
-        };
-        let multi = Doc {
-            id: "u2".into(),
-            data: [("posisi".to_string(), json!(["pengurus", "penulis"]))].into_iter().collect(),
-        };
-        assert_eq!(p.identity.roles_of(&single), vec!["pengurus"]);
-        assert_eq!(p.identity.roles_of(&multi), vec!["pengurus", "penulis"]);
-
-        // owner uses the global pemilikId; the free-form "pengurus" role is honored.
-        let owner_doc = Doc {
-            id: "d".into(),
-            data: [("pemilikId".to_string(), json!("u1"))].into_iter().collect(),
-        };
-        let me = auth("u1");
-        assert!(p.allow(Some(&me), "arsip", Method::Get, Some(&owner_doc)));
-        assert!(!p.allow(Some(&auth("u9")), "arsip", Method::Get, Some(&owner_doc)));
-        let pengurus = AuthContext {
-            uid: "u1".into(),
-            roles: vec!["pengurus".into()],
-            ..Default::default()
-        };
-        assert!(p.allow(Some(&pengurus), "arsip", Method::Update, Some(&owner_doc)));
-    }
-
-    #[test]
-    fn owner_field_per_collection_beats_global() {
-        let p: PolicyFile = toml::from_str(
-            r#"
-            [identity]
-            owner_field = "pemilikId"
-            [collections.khusus]
-            read = "owner"
-            owner_field = "ownerUid"
-            "#,
-        )
-        .unwrap();
-        let me = auth("u1");
-        let via_global = Doc {
-            id: "d".into(),
-            data: [("pemilikId".to_string(), json!("u1"))].into_iter().collect(),
-        };
-        let via_override = Doc {
-            id: "d".into(),
-            data: [("ownerUid".to_string(), json!("u1"))].into_iter().collect(),
-        };
-        // "khusus" uses the override, not the global.
-        assert!(!p.allow(Some(&me), "khusus", Method::Get, Some(&via_global)));
-        assert!(p.allow(Some(&me), "khusus", Method::Get, Some(&via_override)));
+        assert!(p.allow(Some(&auth("u1")), "arsip", Method::Get, None));
+        assert!(!p.allow(None, "arsip", Method::Get, None));
     }
 }
