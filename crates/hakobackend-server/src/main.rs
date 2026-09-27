@@ -687,7 +687,21 @@ fn stored(logical: &str) -> String {
     logical.to_string()
 }
 
-/// Internal collections (`__*`, incl. `__tenants`) are never addressable
+/// Claim strips applied to final write data (anti-escalation without
+/// read-before-write). No-op unless a claim rule names strips.
+fn strip_write(
+    policy: &Arc<PolicyFile>,
+    collection: &str,
+    method: Method,
+    mut data: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    for f in policy.strip_fields(collection, method) {
+        data.remove(&f);
+    }
+    data
+}
+
+/// Internal collections (`__*`) are never addressable
 /// over HTTP — fail-closed even under an open policy (S1 audit).
 fn denied_internal(logical: &str) -> Option<Response> {
     if logical.split('/').next().is_some_and(|s| s.starts_with("__")) {
@@ -1331,8 +1345,13 @@ async fn create(
             // Atomics collapse (legacy parity) + createdAt/updatedAt stamping.
             let incoming = Doc {
                 id: incoming.id,
-                data: hakobackend_core::atomics::stamp_new(
-                    hakobackend_core::atomics::resolve_for_create(incoming.data),
+                data: strip_write(
+                    &policy,
+                    &collection,
+                    Method::Create,
+                    hakobackend_core::atomics::stamp_new(
+                        hakobackend_core::atomics::resolve_for_create(incoming.data),
+                    ),
                 ),
             };
             match db.insert(&stored, incoming).await {
@@ -1455,13 +1474,17 @@ async fn write_doc(
             // entry and ack now; the flusher stores once per window.
             // Atomics/dot-paths bypass (exactness, see coalesce.rs).
             if merge && s.coalesce_on {
-                if let Some(obj) = body.as_object() {
-                    let map: HashMap<String, serde_json::Value> =
-                        obj.clone().into_iter().collect();
-                    if coalesce::Coalescer::eligible(&body)
-                        && s.coalescer.merge(&stored, &id, map)
-                    {
-                        return Json(serde_json::json!({ "success": true })).into_response();
+                // No strip bypass: collections with claim strips skip the
+                // coalescer (its flusher stores without re-gating).
+                if policy.strip_fields(&collection, Method::Update).is_empty() {
+                    if let Some(obj) = body.as_object() {
+                        let map: HashMap<String, serde_json::Value> =
+                            obj.clone().into_iter().collect();
+                        if coalesce::Coalescer::eligible(&body)
+                            && s.coalescer.merge(&stored, &id, map)
+                        {
+                            return Json(serde_json::json!({ "success": true })).into_response();
+                        }
                     }
                 }
             }
@@ -1483,6 +1506,8 @@ async fn write_doc(
             } else {
                 hakobackend_core::atomics::stamp_update(data, created_at)
             };
+            // Claim strips (anti-escalation without read-before-write).
+            let data = strip_write(&policy, &collection, Method::Update, data);
             // Merge already applied above; store the final body as-is.
             if samp {
                 wstats::add(&wstats::W[3], ws_t.elapsed().as_nanos() as u64);
@@ -1687,6 +1712,7 @@ async fn run_ops(
         existed: bool,
         existing: Option<Doc>,
         stored: String,
+        method: Method,
     }
     let mut gated = Vec::with_capacity(ops.len());
     for op in ops {
@@ -1727,7 +1753,7 @@ async fn run_ops(
             ));
         }
         let _ = db.ensure_collection(&stored).await;
-        gated.push(Gated { body: op, id, existed, existing, stored });
+        gated.push(Gated { body: op, id, existed, existing, stored, method });
     }
     // Phase 2: one atomic transaction.
     if !db.capabilities().supports_transactions {
@@ -1769,6 +1795,12 @@ async fn run_ops(
             } else {
                 // Brand-new doc inside the batch: both stamps, like POST.
                 hakobackend_core::atomics::stamp_new(hakobackend_core::atomics::resolve_for_create(raw))
+            };
+            // Claim strips on final data (get/delete carry no data).
+            let data = if t == "get" || t == "delete" {
+                data
+            } else {
+                strip_write(&policy, &g.body.collection, g.method, data)
             };
             let kind = match t.as_str() {
                 "get" => TxOpKind::Read,
@@ -2616,9 +2648,108 @@ mod tests {
 
     /// Batch shapes + atomicity on sqlite: set/add/update/delete roundtrip,
     /// unknown-type-as-create, and must_exist abort rolling everything back.
+    /// Claim rules end to end: uid-self gates by doc id, role strips drop
+    /// without a read, claim:role matches token attrs. No RBW added.
     #[tokio::test]
-    async fn batch_end_to_end_sqlite() {
+    async fn claim_self_strip_role_sqlite() {
         use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_claim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::load_str(
+            "[collections.profiles]\nread = \"auth\"\nupdate = \"claim:uid=self !role\"\n",
+        ).unwrap());
+        let me = || {
+            Some(AuthContext { uid: "local:u1".into(), extra: Default::default() })
+        };
+        let other = || {
+            Some(AuthContext { uid: "local:u2".into(), extra: Default::default() })
+        };
+        // Seed own profile directly (setup, not policy-gated).
+        db.set("profiles", "local:u1", Doc {
+            id: "local:u1".into(),
+            data: [("nick".to_string(), serde_json::json!("u1"))].into_iter().collect(),
+        }, false).await.unwrap();
+        // Self update with an escalation attempt: allowed, role stripped.
+        let res = run_ops(
+            &db,
+            &policy,
+            me().as_ref(),
+            vec![batch_op("update", "profiles", "local:u1",
+                serde_json::json!({"nick": "uno", "role": "admin"}))],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(vals(res).iter().all(|r| r.get("success") == Some(&serde_json::json!(true))));
+        let doc = db.get("profiles", "local:u1").await.unwrap().unwrap();
+        assert_eq!(doc.data.get("nick").and_then(|v| v.as_str()), Some("uno"));
+        assert!(doc.data.get("role").is_none(), "escalation field stripped");
+        // Cross-user update: denied.
+        let denied = run_ops(
+            &db,
+            &policy,
+            other().as_ref(),
+            vec![batch_op("update", "profiles", "local:u1", serde_json::json!({"nick": "x"}))],
+            false,
+        )
+        .await;
+        assert!(denied.is_err());
+        // Anonymous: denied.
+        let denied = run_ops(
+            &db,
+            &policy,
+            None,
+            vec![batch_op("update", "profiles", "local:u1", serde_json::json!({"nick": "x"}))],
+            false,
+        )
+        .await;
+        assert!(denied.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// claim:role matches token attrs (minted at login, zero per-request reads).
+    #[tokio::test]
+    async fn claim_role_attrs_sqlite() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_claimrole_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db: Arc<dyn Database> =
+            Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::load_str(
+            "[collections.posts]\nread = \"public\"\ndelete = \"claim:role=maintainer\"\n",
+        ).unwrap());
+        let staff = || {
+            Some(AuthContext {
+                uid: "local:s".into(),
+                extra: [("role".to_string(), serde_json::json!("staf"))].into_iter().collect(),
+            })
+        };
+        let boss = || {
+            Some(AuthContext {
+                uid: "local:b".into(),
+                extra: [("role".to_string(), serde_json::json!(["staf", "maintainer"]))].into_iter().collect(),
+            })
+        };
+        db.set("posts", "p1", Doc {
+            id: "p1".into(),
+            data: [("t".to_string(), serde_json::json!(1))].into_iter().collect(),
+        }, false).await.unwrap();
+        // Staff without the role: denied.
+        assert!(run_ops(&db, &policy, staff().as_ref(),
+            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false).await.is_err());
+        // Maintainer (array member): allowed.
+        run_ops(&db, &policy, boss().as_ref(),
+            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false).await.unwrap();
+        assert!(db.get("posts", "p1").await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_end_to_end_sqlite() {        use hakobackend_db_sqlite::SqliteDb;
         let dir = std::env::temp_dir().join(format!("hakobackend_batch_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
