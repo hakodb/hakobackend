@@ -99,7 +99,10 @@ impl AuthChain {
             .map(|v| format!("{}:{v}", claims.provider))
             .unwrap_or_else(|| claims.namespaced());
         let email = field(&claims.extra, self.mapping.email_field.as_deref()).or_else(|| claims.email.clone());
-        let mut extra = HashMap::new();
+        // JWT-minted attrs ride through; reserved markers win on collision.
+        let mut extra = claims.extra.clone();
+        extra.remove("provider");
+        extra.remove("email");
         // Provider marker for DPoP enforcement in middleware (not for rules).
         extra.insert("provider".to_string(), serde_json::Value::String(claims.provider.into()));
         if let Some(e) = email {

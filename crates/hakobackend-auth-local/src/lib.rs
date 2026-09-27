@@ -131,9 +131,10 @@ impl LocalAuth {
         ctx_uid: &str,
         email: Option<String>,
         cnf: Option<String>,
+        attrs: HashMap<String, serde_json::Value>,
     ) -> Result<(SessionTokens, String), AppError> {
         let now = now_secs();
-        let access_jwt = self.mint_access(uid, email, cnf)?;
+        let access_jwt = self.mint_access(uid, email, cnf, attrs)?;
         let refresh_opaque = rand_hex(32);
         let session_id = rand_hex(16);
         let session = Doc {
@@ -153,13 +154,27 @@ impl LocalAuth {
     }
 
     fn ctx_of(&self, uid: &str, doc: &Doc) -> AuthContext {
-        AuthContext {
-            uid: uid.into(),
-            extra: match doc.data.get("email").and_then(|v| v.as_str()) {
-                Some(e) => [("email".to_string(), serde_json::Value::String(e.into()))].into_iter().collect(),
-                None => HashMap::new(),
-            },
+        let mut extra = Self::attrs_of(&self.identity, doc);
+        match doc.data.get("email").and_then(|v| v.as_str()) {
+            Some(e) => {
+                extra.insert("email".to_string(), serde_json::Value::String(e.into()));
+            }
+            None => {}
         }
+        AuthContext { uid: uid.into(), extra }
+    }
+
+    /// Allowlisted user-doc fields copied into token claims at issuance
+    /// (one read at login, zero per request). JWT stays small; sensitive
+    /// fields are never included unless listed in `[identity].attrs`.
+    fn attrs_of(identity: &Identity, doc: &Doc) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        for f in &identity.attrs {
+            if let Some(v) = doc.data.get(f) {
+                m.insert(f.clone(), v.clone());
+            }
+        }
+        m
     }
 
     /// Self-service registration: `password_hash` from the body is ALWAYS
@@ -223,7 +238,7 @@ impl LocalAuth {
         }
         let email = doc.data.get("email").and_then(|v| v.as_str()).map(str::to_string);
         let ctx_uid = format!("{NAME}:{}", doc.id);
-        let (tokens, _) = self.mint(&doc.id, &ctx_uid, email, self.bind_dpop(dpop)?).await?;
+        let (tokens, _) = self.mint(&doc.id, &ctx_uid, email, self.bind_dpop(dpop)?, Self::attrs_of(&self.identity, &doc)).await?;
         Ok((self.ctx_of(&ctx_uid, &doc), tokens))
     }
 
@@ -248,7 +263,7 @@ impl LocalAuth {
             self.db.set(SESSIONS_COLLECTION, &sess.id, Doc { id: sess.id.clone(), data }, true).await.map_err(internal)?;
             let doc = self.db.get(self.users(), &uid).await.map_err(internal)?.ok_or(AppError::PermissionDenied)?;
             let email = doc.data.get("email").and_then(|v| v.as_str()).map(str::to_string);
-            let access = self.mint_access(&uid, email, self.bind_dpop(dpop)?)?;
+            let access = self.mint_access(&uid, email, self.bind_dpop(dpop)?, Self::attrs_of(&self.identity, &doc))?;
             let ctx_uid = sess.data.get("ctx_uid").and_then(|v| v.as_str()).unwrap_or(&uid).to_string();
             return Ok((self.ctx_of(&ctx_uid, &doc), SessionTokens { access_jwt: access, refresh_opaque: new_refresh }));
         }
@@ -291,7 +306,7 @@ impl LocalAuth {
             }
         };
         let email = email.or_else(|| doc.data.get("email").and_then(|v| v.as_str()).map(str::to_string));
-        let (tokens, _) = self.mint(&doc.id, &doc.id, email, None).await?;
+        let (tokens, _) = self.mint(&doc.id, &doc.id, email, None, Self::attrs_of(&self.identity, &doc)).await?;
         Ok((self.ctx_of(&doc.id, &doc), tokens))
     }
 
@@ -319,7 +334,13 @@ impl LocalAuth {
         Ok(())
     }
 
-    fn mint_access(&self, uid: &str, email: Option<String>, cnf: Option<String>) -> Result<String, AppError> {
+    fn mint_access(
+        &self,
+        uid: &str,
+        email: Option<String>,
+        cnf: Option<String>,
+        attrs: HashMap<String, serde_json::Value>,
+    ) -> Result<String, AppError> {
         let now = now_secs();
         let access = AccessClaims {
             sub: uid.into(),
@@ -328,6 +349,7 @@ impl LocalAuth {
             exp: now + self.cfg.access_ttl_secs,
             iat: now,
             cnf: cnf.map(|jkt| Cnf { jkt }),
+            attrs: if attrs.is_empty() { None } else { Some(attrs) },
         };
         jsonwebtoken::encode(
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -402,6 +424,10 @@ struct AccessClaims {
     iat: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cnf: Option<Cnf>,
+    /// Allowlisted user-doc attrs (see `Identity.attrs`), surfaced to
+    /// `Claims.extra` on verify for `claim:` rules. Absent = global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attrs: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[async_trait::async_trait]
@@ -424,7 +450,7 @@ impl AuthProvider for LocalAuth {
             provider: NAME,
             uid: data.claims.sub,
             email: data.claims.email,
-            extra: HashMap::new(),
+            extra: data.claims.attrs.unwrap_or_default(),
         })
     }
 }
@@ -690,6 +716,40 @@ mod tests {
         // Second login: the document is reused (not duplicated/overwritten).
         let (ctx2, _) = a.login_external("github:7", None, HashMap::new()).await.unwrap();
         assert_eq!(ctx2.uid, "github:7");
+    }
+
+    #[tokio::test]
+    async fn attrs_minted_and_verified() {
+        let db: Arc<dyn Database> = Arc::new(FakeDb::new());
+        let a = {
+            let _g = ENV_LOCK.lock().unwrap();
+            std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+            let cfg = LocalConfig::from_env().unwrap();
+            std::env::remove_var("UB_LOCAL_JWT_SECRET");
+            Arc::new(LocalAuth {
+                cfg,
+                db,
+                identity: Identity {
+                    users_collection: "users".into(),
+                    attrs: vec!["role".into(), "unit".into()],
+                },
+                dpop_mode: std::sync::Mutex::new(DpopMode::Off),
+                dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+            })
+        };
+        let mut profile = HashMap::new();
+        profile.insert("role".into(), serde_json::Value::String("staf".into()));
+        profile.insert("secret".into(), serde_json::Value::String("x".into()));
+        a.register(Some("siti".into()), None, "rahasia123", profile).await.unwrap();
+        let (ctx, tokens) = a.login("siti", "rahasia123", None).await.unwrap();
+        // Direct ctx (login path) carries allowlisted attrs only.
+        assert_eq!(ctx.extra.get("role").and_then(|v| v.as_str()), Some("staf"));
+        assert!(ctx.extra.get("secret").is_none());
+        assert!(ctx.extra.get("unit").is_none());
+        // Verified token (per-request path) carries the same.
+        let claims = a.verify(&tokens.access_jwt).await.unwrap();
+        assert_eq!(claims.extra.get("role").and_then(|v| v.as_str()), Some("staf"));
+        assert!(claims.extra.get("secret").is_none());
     }
 
     #[test]
