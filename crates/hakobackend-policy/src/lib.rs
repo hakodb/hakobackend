@@ -25,7 +25,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use hakobackend_core::{AuthContext, Doc, Method};
 
-/// One rule. From a TOML string: `public|auth|deny`.
+/// One rule. From a TOML string: `public|auth|deny`,
+/// `claim:<field>=<v1>,<v2>[ !strip...]`, `claim:uid=self[ !strip...]`.
 /// `owner` / `role:*` were removed (single-user backend): they fail LOUD
 /// at parse time so stale policies break visibly, never silently open.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +34,46 @@ pub enum Rule {
     Public,
     Auth,
     Deny,
+    /// Caller attribute match: `auth.extra[field]` equals one of `values`
+    /// (string equality; arrays match on member). Attributes ride the
+    /// verified token (minted at login from allowlisted user-doc fields),
+    /// so evaluation is a map lookup — no DB read, ever.
+    Claim { field: String, values: Vec<String>, strip: Vec<String> },
+    /// Self rule: `auth.uid` equals the target doc id (no read: the id is
+    /// already in hand). Create with empty/absent id never matches
+    /// (fail-closed).
+    UidSelf { strip: Vec<String> },
+}
+
+impl Rule {
+    /// Parse a `claim:...` body. `None` = malformed (fail-closed Deny
+    /// in `From`, loud error in `Deserialize`).
+    fn parse_claim(body: &str) -> Option<Rule> {
+        let mut parts = body.split_whitespace();
+        let head = parts.next().filter(|h| !h.is_empty())?;
+        let mut strip = Vec::new();
+        for p in parts {
+            strip.push(p.strip_prefix('!')?.to_string());
+        }
+        if strip.iter().any(|s| s.is_empty()) {
+            return None;
+        }
+        if head == "uid=self" {
+            return Some(Rule::UidSelf { strip });
+        }
+        let (field, csv) = head.split_once('=')?;
+        if field.is_empty() || field == "uid" {
+            return None;
+        }
+        let values: Vec<String> =
+            csv.split(',').map(str::to_string).filter(|v| !v.is_empty()).collect();
+        // Values starting with `!` are almost certainly a misplaced strip
+        // (`claim:role=a,!x` — strips are space-separated): fail loud.
+        if values.is_empty() || values.iter().any(|v| v.starts_with('!')) {
+            return None;
+        }
+        Some(Rule::Claim { field: field.to_string(), values, strip })
+    }
 }
 
 impl From<String> for Rule {
@@ -40,8 +81,10 @@ impl From<String> for Rule {
         match s.as_str() {
             "public" => Rule::Public,
             "auth" => Rule::Auth,
-            // ponytail: unknown incl. removed owner/role = deny (fail-closed).
-            _ => Rule::Deny,
+            // ponytail: unknown incl. malformed claim = deny (fail-closed).
+            _ => s.strip_prefix("claim:")
+                .and_then(Rule::parse_claim)
+                .unwrap_or(Rule::Deny),
         }
     }
 }
@@ -60,8 +103,17 @@ impl<'de> Deserialize<'de> for Rule {
         // owner/role must break visibly at load, never lock out silently.
         if s == "owner" || s.starts_with("role:") {
             return Err(serde::de::Error::custom(
-                "rule '".to_string() + &s + "' removed: single-user backend has public|auth|deny only",
+                "rule '".to_string() + &s + "' removed: single-user backend has public|auth|deny|claim:… only",
             ));
+        }
+        // Malformed claim rules fail loud too (typos in values are silent
+        // Deny via From — same fail-closed class as before).
+        if let Some(body) = s.strip_prefix("claim:") {
+            if Rule::parse_claim(body).is_none() {
+                return Err(serde::de::Error::custom(
+                    "malformed claim rule '".to_string() + &s + "'",
+                ));
+            }
         }
         Ok(Rule::from(s))
     }
@@ -76,17 +128,24 @@ fn default_users_collection() -> String {
 }
 
 /// Identity owned by the USER, not core: which collection holds user
-/// docs. Role/owner fields were removed with the tenant system.
+/// docs, and which user-doc fields are copied into token claims at
+/// login (`attrs`, allowlist — JWT stays small, sensitive fields never
+/// ride tokens unless listed here).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Identity {
     /// User-document collection. Free-form: `users`, `members`, …
     #[serde(default = "default_users_collection")]
     pub users_collection: String,
+    /// User-doc fields minted into token claims at login (e.g.
+    /// `["role", "department"]`), visible to `claim:` rules as
+    /// `auth.extra[field]`.
+    #[serde(default)]
+    pub attrs: Vec<String>,
 }
 
 impl Default for Identity {
     fn default() -> Self {
-        Self { users_collection: default_users_collection() }
+        Self { users_collection: default_users_collection(), attrs: Vec::new() }
     }
 }
 
@@ -197,8 +256,8 @@ impl PolicyFile {
         None
     }
 
-    /// `resource` is accepted for signature compatibility and ignored:
-    /// no remaining rule reads the document.
+    /// `resource` is the target doc when one is in hand (existing for
+    /// update/delete/get, incoming for create); `UidSelf` matches its id.
     pub fn allow(
         &self,
         auth: Option<&AuthContext>,
@@ -206,11 +265,22 @@ impl PolicyFile {
         method: Method,
         resource: Option<&Doc>,
     ) -> bool {
-        let _ = resource;
         let empty = CollectionPolicy::default();
         let policy = self.find(collection).unwrap_or(&empty);
         let rule = policy.slot(method, &self.defaults);
-        eval(rule, auth)
+        eval(rule, auth, resource)
+    }
+
+    /// Fields stripped from writes governed by claim rules (anti-escalation
+    /// without read-before-write: dropped, not compared). Empty for all
+    /// other rules. The server applies this to final write data.
+    pub fn strip_fields(&self, collection: &str, method: Method) -> Vec<String> {
+        let empty = CollectionPolicy::default();
+        let policy = self.find(collection).unwrap_or(&empty);
+        match policy.slot(method, &self.defaults) {
+            Rule::Claim { strip, .. } | Rule::UidSelf { strip } => strip.clone(),
+            _ => Vec::new(),
+        }
     }
 
     /// True when a rule governing `method` on `collection` reads the
@@ -227,11 +297,30 @@ impl PolicyFile {
     }
 }
 
-fn eval(rule: &Rule, auth: Option<&AuthContext>) -> bool {
+fn eval(rule: &Rule, auth: Option<&AuthContext>, resource: Option<&Doc>) -> bool {
     match rule {
         Rule::Public => true,
         Rule::Deny => false,
         Rule::Auth => auth.is_some(),
+        Rule::Claim { field, values, .. } => match auth.and_then(|a| a.extra.get(field)) {
+            Some(serde_json::Value::String(s)) => values.iter().any(|v| v == s),
+            Some(serde_json::Value::Array(a)) => {
+                a.iter().filter_map(|v| v.as_str()).any(|s| values.iter().any(|v| v == s))
+            }
+            _ => false,
+        },
+        // ponytail: id-match only — full namespaced uid, plus the raw
+        // suffix for providers whose docs use raw ids (local registers).
+        // Mixed providers sharing one collection MUST use namespaced doc
+        // ids, else suffixes can collide across providers (deployer's
+        // modeling duty; separate collections avoid it entirely).
+        Rule::UidSelf { .. } => match (auth, resource) {
+            (Some(a), Some(doc)) if !doc.id.is_empty() => {
+                doc.id == a.uid
+                    || a.uid.split_once(':').is_some_and(|(_, raw)| !raw.is_empty() && doc.id == raw)
+            }
+            _ => false,
+        },
     }
 }
 
@@ -309,6 +398,69 @@ mod tests {
         );
         // typo -> Deny
         assert!(!p.allow(Some(&auth("u1")), "posts", Method::Update, None));
+    }
+
+    fn authed_extra(uid: &str, extra: &[(&str, serde_json::Value)]) -> AuthContext {
+        AuthContext {
+            uid: uid.into(),
+            extra: extra.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        }
+    }
+
+    #[test]
+    fn claim_rule_string_and_array() {
+        let p = policy(
+            r#"
+            [collections.posts]
+            read = "public"
+            delete = "claim:role=maintainer,admin"
+            "#,
+        );
+        let m = authed_extra("u1", &[("role", json!("maintainer"))]);
+        assert!(p.allow(Some(&m), "posts", Method::Delete, None));
+        let a = authed_extra("u2", &[("role", json!(["viewer", "admin"]))]);
+        assert!(p.allow(Some(&a), "posts", Method::Delete, None));
+        let v = authed_extra("u3", &[("role", json!("viewer"))]);
+        assert!(!p.allow(Some(&v), "posts", Method::Delete, None));
+        assert!(!p.allow(None, "posts", Method::Delete, None));
+        assert!(!p.allow(Some(&auth("u1")), "posts", Method::Delete, None));
+    }
+
+    #[test]
+    fn claim_malformed_fails_loud_or_closed() {
+        // Loud at load…
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"claim:\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"claim:role=\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"claim:role=a,!\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nread = \"claim:uid=abc\"").is_err());
+        // …fail-closed when built programmatically.
+        assert_eq!(Rule::from("claim:".to_string()), Rule::Deny);
+        assert_eq!(Rule::from("claim:role=".to_string()), Rule::Deny);
+    }
+
+    #[test]
+    fn uid_self_full_and_raw_suffix() {
+        let p = policy(
+            r#"
+            [collections.profiles]
+            read = "auth"
+            update = "claim:uid=self !role"
+            "#,
+        );
+        let me = || Doc { id: "local:u1".into(), data: Default::default() };
+        let raw = || Doc { id: "u1".into(), data: Default::default() };
+        let other = || Doc { id: "local:u2".into(), data: Default::default() };
+        let empty = || Doc { id: "".into(), data: Default::default() };
+        let a = auth("local:u1");
+        assert!(p.allow(Some(&a), "profiles", Method::Update, Some(&me())));
+        assert!(p.allow(Some(&a), "profiles", Method::Update, Some(&raw())));
+        assert!(!p.allow(Some(&a), "profiles", Method::Update, Some(&other())));
+        assert!(!p.allow(Some(&a), "profiles", Method::Update, Some(&empty())));
+        assert!(!p.allow(Some(&a), "profiles", Method::Update, None));
+        assert!(!p.allow(None, "profiles", Method::Update, Some(&me())));
+        // strip list rides the rule.
+        assert_eq!(p.strip_fields("profiles", Method::Update), vec!["role"]);
+        assert!(p.strip_fields("profiles", Method::Get).is_empty());
     }
 
     #[test]
