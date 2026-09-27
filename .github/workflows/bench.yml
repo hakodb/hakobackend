@@ -1,0 +1,56 @@
+# Gateway bench: wall-RPS per driver on ubuntu runners. Same hardware,
+# same harness, same shapes — or it means nothing (see PERFORMANCE_NOTE).
+# Manual dispatch + weekly (runners vary ±20%: compare bands, not singles).
+# hako + sqlite need no docker; pg/mysql stay on maintainer hardware
+# (docker services would work here too — add when needed).
+
+name: gateway-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "bench2 PER (ops per worker)"
+        default: "100"
+  schedule:
+    - cron: "0 3 * * 1"
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release --locked -p hakobackend-server
+
+      - name: bench hako + sqlite
+        run: |
+          BIN=./target/release/hakobackend-server
+          : > results.txt
+          for cfg in "hako /tmp/cmp-hako" "sqlite /tmp/cmp-sqlite.db"; do
+            set -- $cfg
+            echo "=== $1 ===" | tee -a results.txt
+            rm -rf /tmp/cmp-hako /tmp/cmp-sqlite.db
+            $BIN --driver $1 --data "$2" --port 3105 --auth off \
+              --limit-global 100000 --limit-global-burst 10000 > /tmp/bench-$1.log 2>&1 &
+            SRV=$!
+            sleep 5
+            python3 bench/bench2.py http://127.0.0.1:3105 put 8 ${{ inputs.n || '100' }} 2>&1 | tail -1 | tee -a results.txt
+            python3 bench/bench2.py http://127.0.0.1:3105 get 8 ${{ inputs.n || '100' }} 2>&1 | tail -1 | tee -a results.txt
+            python3 bench/bench4.py http://127.0.0.1:3105 8 50 2>&1 | tail -5 | tee -a results.txt
+            kill $SRV
+            wait 2>/dev/null || true
+          done
+          cat results.txt
+
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-bench-${{ github.run_number }}
+          path: results.txt
