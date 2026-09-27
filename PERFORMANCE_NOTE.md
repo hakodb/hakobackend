@@ -340,6 +340,22 @@ reviewed: keep-alive, hyper NODELAY defaults, no extra layers —
 nothing left to turn. Higher RPS needs bigger payloads (batch does
 25K docs/s), better CPUs, or kernel bypass (out of scope).
 
+## 12f. Tenant removal dividend (VPS, ab -k, hako, LTO build)
+
+Tenants/modes/roles/portal gone; collections pass through unmapped;
+policy is one global file; admin = UID allowlist. Same hardware,
+same client, LTO both sides:
+
+| shape | before | after | Δ |
+|---|---|---|---|
+| hello /api/health | 39,595 | 40,193 | +1.5% (noise) |
+| GET doc | 29,713 | **34,727** | **+17%** |
+| PUT doc | 10,599 | **11,939** | **+13%** |
+
+Removed per-request work: `stored()` prefix alloc, `effective_tenant`
+clone, per-tenant policy overlay lookup, hint parsing, TenantDb hops.
+-2,519 lines for +17% on the money path.
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
