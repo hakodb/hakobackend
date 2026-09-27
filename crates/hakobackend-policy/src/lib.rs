@@ -29,7 +29,7 @@ use hakobackend_core::{AuthContext, Doc, Method};
 /// `claim:<field>=<v1>,<v2>[ !strip...]`, `claim:uid=self[ !strip...]`.
 /// `owner` / `role:*` were removed (single-user backend): they fail LOUD
 /// at parse time so stale policies break visibly, never silently open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Rule {
     Public,
     Auth,
@@ -43,13 +43,27 @@ pub enum Rule {
     /// already in hand). Create with empty/absent id never matches
     /// (fail-closed).
     UidSelf { strip: Vec<String> },
+    /// Field conditionals on the NEW data (incoming for create/PUT-full,
+    /// merged for PATCH/batch): all must hold (AND), else deny. Never
+    /// reads the old doc — change-detection stays with strip (or a read).
+    Fields { conds: Vec<FieldCond>, strip: Vec<String> },
+}
+
+/// One field condition. Literals parse int → float → bool → string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldCond {
+    /// `field=auth.attr`: new-data field equals caller attr (JSON equality).
+    EqAuth { field: String, attr: String },
+    /// `field=literal`: new-data field equals a literal.
+    EqLit { field: String, value: serde_json::Value },
+    /// `field=int:min..max`: new-data field is an int in range (inclusive).
+    IntRange { field: String, min: i64, max: i64 },
 }
 
 impl Rule {
     /// Parse a `claim:...` body. `None` = malformed (fail-closed Deny
     /// in `From`, loud error in `Deserialize`).
-    fn parse_claim(body: &str) -> Option<Rule> {
-        let mut parts = body.split_whitespace();
+    fn parse_claim(body: &str) -> Option<Rule> {        let mut parts = body.split_whitespace();
         let head = parts.next().filter(|h| !h.is_empty())?;
         let mut strip = Vec::new();
         for p in parts {
@@ -74,6 +88,66 @@ impl Rule {
         }
         Some(Rule::Claim { field: field.to_string(), values, strip })
     }
+
+    /// Parse a `fields:...` body: comma-separated conditions (AND), with
+    /// optional space-separated `!strip` tail. `None` = malformed.
+    /// Items: `f=auth.a` (caller-attr equality), `f=int:min..max` (range),
+    /// `f=literal` (int→float→bool→string equality).
+    fn parse_fields(body: &str) -> Option<Rule> {
+        let mut parts = body.split_whitespace();
+        let head = parts.next().filter(|h| !h.is_empty())?;
+        let mut strip = Vec::new();
+        for p in parts {
+            strip.push(p.strip_prefix('!')?.to_string());
+        }
+        if strip.iter().any(|s| s.is_empty()) {
+            return None;
+        }
+        let mut conds = Vec::new();
+        for item in head.split(',') {
+            let (field, rhs) = item.split_once('=')?;
+            if field.is_empty() {
+                return None;
+            }
+            if let Some(attr) = rhs.strip_prefix("auth.") {
+                if attr.is_empty() {
+                    return None;
+                }
+                conds.push(FieldCond::EqAuth { field: field.to_string(), attr: attr.to_string() });
+            } else if let Some(rest) = rhs.strip_prefix("int:") {
+                let (lo, hi) = rest.split_once("..")?;
+                let (min, max): (i64, i64) = (lo.parse().ok()?, hi.parse().ok()?);
+                if min > max {
+                    return None;
+                }
+                conds.push(FieldCond::IntRange { field: field.to_string(), min, max });
+            } else {
+                conds.push(FieldCond::EqLit { field: field.to_string(), value: parse_lit(rhs) });
+            }
+        }
+        if conds.is_empty() {
+            return None;
+        }
+        Some(Rule::Fields { conds, strip })
+    }
+}
+
+/// Literal parser for field conditions: int → float → bool → string.
+fn parse_lit(raw: &str) -> serde_json::Value {
+    if let Ok(i) = raw.parse::<i64>() {
+        return serde_json::Value::from(i);
+    }
+    if let Ok(f) = raw.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return serde_json::Value::Number(n);
+        }
+    }
+    match raw {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        _ => serde_json::Value::String(raw.to_string()),
+    }
 }
 
 impl From<String> for Rule {
@@ -81,9 +155,11 @@ impl From<String> for Rule {
         match s.as_str() {
             "public" => Rule::Public,
             "auth" => Rule::Auth,
-            // ponytail: unknown incl. malformed claim = deny (fail-closed).
-            _ => s.strip_prefix("claim:")
+            // ponytail: unknown incl. malformed claim/fields = deny (fail-closed).
+            _ => s
+                .strip_prefix("claim:")
                 .and_then(Rule::parse_claim)
+                .or_else(|| s.strip_prefix("fields:").and_then(Rule::parse_fields))
                 .unwrap_or(Rule::Deny),
         }
     }
@@ -106,12 +182,19 @@ impl<'de> Deserialize<'de> for Rule {
                 "rule '".to_string() + &s + "' removed: single-user backend has public|auth|deny|claim:… only",
             ));
         }
-        // Malformed claim rules fail loud too (typos in values are silent
+        // Malformed claim/fields rules fail loud too (typos in values are silent
         // Deny via From — same fail-closed class as before).
         if let Some(body) = s.strip_prefix("claim:") {
             if Rule::parse_claim(body).is_none() {
                 return Err(serde::de::Error::custom(
                     "malformed claim rule '".to_string() + &s + "'",
+                ));
+            }
+        }
+        if let Some(body) = s.strip_prefix("fields:") {
+            if Rule::parse_fields(body).is_none() {
+                return Err(serde::de::Error::custom(
+                    "malformed fields rule '".to_string() + &s + "'",
                 ));
             }
         }
@@ -278,8 +361,28 @@ impl PolicyFile {
         let empty = CollectionPolicy::default();
         let policy = self.find(collection).unwrap_or(&empty);
         match policy.slot(method, &self.defaults) {
-            Rule::Claim { strip, .. } | Rule::UidSelf { strip } => strip.clone(),
+            Rule::Claim { strip, .. } | Rule::UidSelf { strip } | Rule::Fields { strip, .. } => {
+                strip.clone()
+            }
             _ => Vec::new(),
+        }
+    }
+
+    /// Field gate on NEW data (incoming for create/PUT-full, merged for
+    /// PATCH/batch): true unless the governing rule is `Fields` and a
+    /// condition fails. Ownership/public/auth/claim rules ignore the data.
+    pub fn allow_fields(
+        &self,
+        auth: Option<&AuthContext>,
+        collection: &str,
+        method: Method,
+        data: &HashMap<String, serde_json::Value>,
+    ) -> bool {
+        let empty = CollectionPolicy::default();
+        let policy = self.find(collection).unwrap_or(&empty);
+        match policy.slot(method, &self.defaults) {
+            Rule::Fields { conds, .. } => eval_conds(conds, auth, data),
+            _ => true,
         }
     }
 
@@ -321,7 +424,32 @@ fn eval(rule: &Rule, auth: Option<&AuthContext>, resource: Option<&Doc>) -> bool
             }
             _ => false,
         },
+        Rule::Fields { .. } => {
+            // Deferred: field conditionals evaluate on final write data via
+            // allow_fields() (incoming/merged — always in hand there).
+            // allow() alone passes; a Fields rule on a read slot is a
+            // meaningless config that passes (documented).
+            true
+        }
     }
+}
+
+/// Shared field-condition evaluation over new-data fields (no reads).
+fn eval_conds(
+    conds: &[FieldCond],
+    auth: Option<&AuthContext>,
+    data: &HashMap<String, serde_json::Value>,
+) -> bool {
+    conds.iter().all(|c| match c {
+        FieldCond::EqAuth { field, attr } => match (data.get(field), auth.and_then(|a| a.extra.get(attr))) {
+            (Some(v), Some(w)) => v == w,
+            _ => false,
+        },
+        FieldCond::EqLit { field, value } => data.get(field).is_some_and(|v| v == value),
+        FieldCond::IntRange { field, min, max } => {
+            data.get(field).and_then(|v| v.as_i64()).is_some_and(|n| n >= *min && n <= *max)
+        }
+    })
 }
 
 #[cfg(test)]
@@ -398,6 +526,63 @@ mod tests {
         );
         // typo -> Deny
         assert!(!p.allow(Some(&auth("u1")), "posts", Method::Update, None));
+    }
+
+    fn map(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn fields_auth_literal_range() {
+        let p = policy(
+            r#"
+            [collections.templates]
+            read = "public"
+            update = "fields:unit=auth.unit,score=int:0..100,status=draft"
+            "#,
+        );
+        let staff = || {
+            Some(AuthContext {
+                uid: "local:s".into(),
+                extra: [("unit".to_string(), json!("ops"))].into_iter().collect(),
+            })
+        };
+        let good = map(&[
+            ("unit", json!("ops")),
+            ("score", json!(42)),
+            ("status", json!("draft")),
+        ]);
+        assert!(p.allow_fields(staff().as_ref(), "templates", Method::Update, &good));
+        // Wrong unit.
+        let mut bad = good.clone();
+        bad.insert("unit".into(), json!("hr"));
+        assert!(!p.allow_fields(staff().as_ref(), "templates", Method::Update, &bad));
+        // Out of range.
+        let mut bad = good.clone();
+        bad.insert("score".into(), json!(101));
+        assert!(!p.allow_fields(staff().as_ref(), "templates", Method::Update, &bad));
+        // Wrong literal / missing field.
+        let mut bad = good.clone();
+        bad.insert("status".into(), json!("published"));
+        assert!(!p.allow_fields(staff().as_ref(), "templates", Method::Update, &bad));
+        let mut bad = good.clone();
+        bad.remove("score");
+        assert!(!p.allow_fields(staff().as_ref(), "templates", Method::Update, &bad));
+        // Anonymous: auth.* unresolvable.
+        assert!(!p.allow_fields(None, "templates", Method::Update, &good));
+        // Non-fields rules ignore data.
+        assert!(p.allow_fields(staff().as_ref(), "templates", Method::Get, &good));
+    }
+
+    #[test]
+    fn fields_malformed_loud() {
+        assert!(PolicyFile::load_str("[collections.p]\nupdate = \"fields:\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nupdate = \"fields:noeq\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nupdate = \"fields:a=auth.\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nupdate = \"fields:a=int:5..1\"").is_err());
+        assert!(PolicyFile::load_str("[collections.p]\nupdate = \"fields:a=int:x..1\"").is_err());
+        // Programmatic typos fail closed.
+        assert_eq!(Rule::from("fields:".to_string()), Rule::Deny);
     }
 
     fn authed_extra(uid: &str, extra: &[(&str, serde_json::Value)]) -> AuthContext {

@@ -1354,6 +1354,9 @@ async fn create(
                     ),
                 ),
             };
+            if !policy.allow_fields(auth.as_ref(), &collection, Method::Create, &incoming.data) {
+                return forbidden();
+            }
             match db.insert(&stored, incoming).await {
                 Ok(doc) => {
                     // Gateway bus (instant lane; poller reconciles foreign writes).
@@ -1508,6 +1511,10 @@ async fn write_doc(
             };
             // Claim strips (anti-escalation without read-before-write).
             let data = strip_write(&policy, &collection, Method::Update, data);
+            // Field conditionals on the final data (incoming/merged — no read).
+            if !policy.allow_fields(auth.as_ref(), &collection, Method::Update, &data) {
+                return forbidden();
+            }
             // Merge already applied above; store the final body as-is.
             if samp {
                 wstats::add(&wstats::W[3], ws_t.elapsed().as_nanos() as u64);
@@ -1766,10 +1773,11 @@ async fn run_ops(
     // Phase 2: one atomic transaction. Put bodies are preprocessed first
     // (atomics + stamps, same as the single-write paths), so drivers store
     // exactly what they receive — no second merge inside the tx.
-    let tx_ops: Vec<TxOp> = gated
-        .iter()
-        .map(|g| {
-            let t = g.body.op_type.to_ascii_lowercase();
+    // Field gates need the final data, so this loop is fallible (403
+    // aborts the batch before anything is written).
+    let mut tx_ops: Vec<TxOp> = Vec::with_capacity(gated.len());
+    for g in &gated {
+        let t = g.body.op_type.to_ascii_lowercase();
             let merge = match t.as_str() {
                 "add" | "update" => true,
                 "set" => g.body.options.as_ref().is_some_and(|o| o.merge),
@@ -1802,6 +1810,16 @@ async fn run_ops(
             } else {
                 strip_write(&policy, &g.body.collection, g.method, data)
             };
+            // Field conditionals on final data (no read); fail-closed 403.
+            if t != "get" && t != "delete"
+                && !policy.allow_fields(auth, &g.body.collection, g.method, &data)
+            {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    format!("Permission denied: fields on {}/{}", g.body.collection, g.id),
+                    "permission-denied",
+                ));
+            }
             let kind = match t.as_str() {
                 "get" => TxOpKind::Read,
                 "delete" => TxOpKind::Delete,
@@ -1809,14 +1827,13 @@ async fn run_ops(
                 _ if is_tx && g.existed && t != "set" && t != "add" => TxOpKind::Put { merge: false, must_exist: true },
                 _ => TxOpKind::Put { merge: false, must_exist: false },
             };
-            TxOp {
+            tx_ops.push(TxOp {
                 collection: g.stored.clone(),
                 id: g.id.clone(),
                 kind,
                 doc: Some(Doc { id: g.id.clone(), data }),
-            }
-        })
-        .collect();
+            });
+        }
     // Reads resolve against the batch's own writes (driver overlay/tx reads).
     // (Cloned: the emit walk below reuses the preprocessed bodies.)
     let outs = db
@@ -2939,6 +2956,47 @@ mod tests {
         );
         assert_eq!(code(None, "{\"a\":1}").await, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(code(Some("application/json"), "{nope").await, StatusCode::BAD_REQUEST);
+    }
+
+    /// Field conditionals end to end (no extra reads): PUT evaluates the
+    /// incoming body, PATCH the merged doc; violations deny.
+    #[tokio::test]
+    async fn fields_gate_write_paths() {
+        let (st, db) = rbw_state(
+            "[collections.docs]\nread = \"public\"\ncreate = \"fields:unit=auth.unit,score=int:0..100\"\nupdate = \"fields:unit=auth.unit,score=int:0..100\"\n",
+            "fields",
+        )
+        .await;
+        let staff = || {
+            Some(AuthContext {
+                uid: "local:s".into(),
+                extra: [("unit".to_string(), serde_json::json!("ops"))].into_iter().collect(),
+            })
+        };
+        // PUT-create with matching fields: allowed.
+        ok_put(
+            write_doc(st.clone(), staff(), "docs/d1".into(),
+                serde_json::json!({"unit": "ops", "score": 10}), false, false).await,
+        );
+        // PUT-create with wrong unit: denied.
+        let r = write_doc(st.clone(), staff(), "docs/d2".into(),
+            serde_json::json!({"unit": "hr", "score": 10}), false, false).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(db.get("docs", "d2").await.unwrap().is_none());
+        // PATCH merged eval: patch only score, unit comes from the base.
+        let r = write_doc(st.clone(), staff(), "docs/d1".into(),
+            serde_json::json!({"score": 99}), true, false).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        // PATCH breaking the range: denied, stored doc untouched.
+        let r = write_doc(st.clone(), staff(), "docs/d1".into(),
+            serde_json::json!({"score": 101}), true, false).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let d1 = db.get("docs", "d1").await.unwrap().unwrap();
+        assert_eq!(d1.data.get("score").and_then(|v| v.as_i64()), Some(99));
+        // Anonymous: auth.* unresolvable → denied.
+        let r = write_doc(st.clone(), None, "docs/d3".into(),
+            serde_json::json!({"unit": "ops", "score": 1}), false, false).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
     /// Raw fragments splice verbatim; all-small takes the Json fast path.

@@ -1,10 +1,13 @@
 # policy.standard.toml — reference TEMPLATE, not binding rules.
 # Copy to policy.toml then adjust per app.
-# Rules: public | auth | deny (owner/role removed with the tenant system).
+# Rules: public | auth | deny | claim:<field>=<v1>,<v2> | claim:uid=self
+#   | fields:... (see policy.example.toml for shapes).
 
-# Your identity: which user collection holds login docs.
+# Your identity: which user collection holds login docs, and which of
+# their fields ride token claims for `claim:` / `fields:` rules.
 [identity]
 users_collection = "users"
+attrs = ["role", "department"]
 
 [defaults]
 read = "deny"

@@ -50,8 +50,16 @@ no owner checks, no tenant claims anywhere in the stack.
 | Public-read | `read = "public"`, `write = "deny"` | `posts`, `pages`, `sc_configs` |
 | Authenticated-write | `create/update = "auth"` | `media`, `tags` |
 | Authenticated-only | `read/write = "auth"` | `profiles`, user notifications |
+| Claim-gated | `claim:role=maintainer`, `claim:uid=self !role` | self-edit, role writes |
+| Field-validated | `fields:unit=auth.unit,score=int:0..100` | scoped + typed writes |
 | Admin-only | `deny` + UID allowlist (`admin_uids`) | `ai_configs`, credentials |
 | Internal collections | `__` prefix **not exposed** over HTTP (unless explicit) | `__users` (refresh tokens), audit |
+
+Claim/fields cost contract: attribute match, id-match, strips, and field
+conditionals evaluate on in-hand data (token claims + incoming/merged doc)
+— no DB read is ever added by a rule. Ownership of *existing* docs needs
+no read either (id-match); only true change-detection would, and strip
+replaces it. `wstats allow` row must stay ~1µs class.
 
 ## 5. Document conventions (working defaults, all replaceable)
 

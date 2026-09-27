@@ -1,7 +1,15 @@
 # policy.toml — endpoint rules. EDIT WHILE THE SERVER RUNS, applies immediately.
-# Rule values: public | auth | deny
+# Rule values: public | auth | deny | claim:<field>=<v1>,<v2> | claim:uid=self | fields:...
 # Per-collection slots: get list create update delete (optional), read/write fallback,
 # final fallback [defaults]. Typo = deny (fail-closed).
+#
+# claim:<field>=<v1>,<v2> — caller token attribute match (attributes minted
+#   at login from [identity].attrs; no DB read per request).
+# claim:uid=self — caller uid equals target doc id (no read).
+# fields:<cond>,... — new-data conditionals (incoming/merged, no read):
+#   f=auth.attr (caller-attr equality), f=int:min..max (range),
+#   f=literal (int/float/bool/string equality). All must hold (AND).
+# Trailing " !field" strips fields from writes (anti-escalation, no read).
 
 [defaults]
 read = "public"
@@ -15,7 +23,12 @@ delete = "auth"
 
 [collections.profiles]
 read = "auth"
-write = "auth"
+update = "claim:uid=self !role"
+
+[collections.templates]
+read = "public"
+create = "fields:unit=auth.unit"
+update = "fields:unit=auth.unit,score=int:0..100"
 
 [collections.ai_configs]
 read = "deny"
