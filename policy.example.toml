@@ -11,6 +11,11 @@
 #   f=literal (int/float/bool/string equality). All must hold (AND).
 # Trailing " !field" strips fields from writes (anti-escalation, no read).
 
+[identity]
+users_collection = "users"
+# User-doc fields minted into token claims for claim:/fields: rules.
+# attrs = ["role", "department"]
+
 [defaults]
 read = "public"
 write = "deny"

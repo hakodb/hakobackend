@@ -98,7 +98,7 @@ native drivers translate, the rest emulate with the same helpers
 
 `Authorization: Bearer …` else `__Host-ub_at` cookie → `Extension<Option<AuthContext>>`.
 No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_CONTRACT).
-`/api/admin/reload` is locked behind `--admin-role`.
+`/api/admin/reload` is locked behind `admin_uids` (UID allowlist).
 `/api/auth/*` see AUTH_CONTRACT (local BFF, GitHub OAuth, DPoP).
 
 ## 7. Realtime (WS + SSE)
@@ -109,8 +109,8 @@ event wins, lanes converge idempotently — no duplicates):
 - **Bus (fastest):** every committed gateway write emits after commit
   (legacy `triggerLocalChange` pattern — zero DB cost). External or
   foreign writes are invisible here by design. Covers single writes,
-  batch/transaction ops, user creates/role changes (auth + portal),
-  and coalescer flushes (full doc, never partial bodies).
+  batch/transaction ops, user creates (auth), and coalescer flushes
+  (full doc, never partial bodies).
 - **Driver push:** hako watch / rethinkdb changefeeds, one per
   collection shared by all watchers; lagged receivers resync.
 - **Poll (always on):** one `list` per collection per 2 s tick shared by

@@ -23,6 +23,10 @@ data = "./data/hako.ub"
 # /api/auth/register|login|refresh|logout|me endpoints go live automatically.
 # auth = "off"
 
+# Admin UIDs for /api/admin/* (repeatable; UIDs like "local:root").
+# Empty = nobody (reload 403s). No roles in single-user backend.
+# admin_uids = ["local:root"]
+
 # Endpoint rules file. EDIT WHILE THE SERVER RUNS — applies immediately (hot-reload).
 # Leave empty (= open dev mode) only for local development.
 rules = "./policy.toml"

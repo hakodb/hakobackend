@@ -38,6 +38,11 @@ Names that are not available (phases B/C) **fail fast at startup**, never bypass
 2. Final `uid` is **namespaced** (`github:123`, `local:abc`) — no collisions
    across providers; also the user-doc lookup key.
 3. Optional `uid_field`/`email_field` pull from the claim `extra`.
+4. Token attrs: allowlisted user-doc fields (`[identity].attrs`, e.g.
+   `["role", "department"]`) are copied into the JWT at login/refresh
+   and surface in `Claims.extra` on verify — the fuel for `claim:` and
+   `fields:` policy rules. One read at issuance, zero per request.
+   Reserved `provider`/`email` markers always win on collision.
 
 ## 4. Declarative mapping file (`--auth ./custom.toml`)
 
