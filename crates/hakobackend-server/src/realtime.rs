@@ -254,41 +254,35 @@ fn logical_name<'a>(map: &'a HashMap<String, String>, stored: &'a str) -> &'a st
 }
 
 /// Open subscription: List gate → snapshot → per-collection watch/poll source.
-/// Tenant-aware: gates and group matching run on LOGICAL names; storage and
-/// snapshot keys use STORED (prefixed) names. Tenantless callers keep the
-/// legacy unprefixed namespace.
+/// Single-user backend: collection names pass through (no tenant prefix).
 pub async fn subscribe(
     db: Arc<dyn Database>,
     policy: Arc<PolicyFile>,
     auth: Option<AuthContext>,
     spec: SubSpec,
 ) -> Result<Subscription, AppError> {
-    use hakobackend_core::tenant;
     if !hakobackend_core::valid_collection_path(&spec.collection) {
         return Err(AppError::BadRequest("invalid collection name".into()));
     }
-    let owned_tenant = tenant::tenant_of(auth.as_ref());
-    let tenant = owned_tenant.as_deref();
     if !policy.allow(auth.as_ref(), &spec.collection, Method::List, None) {
         return Err(AppError::PermissionDenied);
     }
     // (stored, logical) pairs downstream; policy always sees logical.
+    // Identical here (no prefix); kept as pairs for the snapshot keys.
     let pairs: Vec<(String, String)> = if spec.group {
         let all = db.list_collections().await?;
-        tenant::visible_collections(all, tenant)
-            .into_iter()
-            .filter(|(_, logical)| matches_group(logical, &spec.collection))
+        all.into_iter()
+            .filter(|c| matches_group(c, &spec.collection))
+            .map(|c| (c.clone(), c))
             .collect()
     } else {
-        let stored = tenant::resolve_collection(tenant, &spec.collection);
-        vec![(stored, spec.collection.clone())]
+        vec![(spec.collection.clone(), spec.collection.clone())]
     };
     let mut collections: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
     let mut logical_of: HashMap<String, String> = pairs.into_iter().collect();
     if collections.is_empty() {
-        let stored = tenant::resolve_collection(tenant, &spec.collection);
-        logical_of.insert(stored.clone(), spec.collection.clone());
-        collections.push(stored);
+        logical_of.insert(spec.collection.clone(), spec.collection.clone());
+        collections.push(spec.collection.clone());
     }
     // Initial snapshot (no burst to client — client GETs first like legacy).
     let snap_q = snapshot_options(&spec.options);
