@@ -1,5 +1,5 @@
 # custom.example.toml — `--auth ./custom.toml` template.
-# Provider chain + claim-to-role mapping for your own free-form roles. No code.
+# Provider chain + uid/email claim mapping. No code.
 # Copy then adjust. See AUTH_CONTRACT.md §4.
 
 providers = ["github", "local"]
@@ -10,14 +10,3 @@ providers = ["github", "local"]
 [mapping]
 # uid_field = "sub"
 # email_field = "email"
-
-# Claim → role: matches when a string claim == equals or an array contains it.
-[[rules]]
-claim = "groups"
-equals = "ops"
-role = "pengurus"
-
-# [[rules]]
-# claim = "hd"
-# equals = "sekolah.id"
-# role = "guru"

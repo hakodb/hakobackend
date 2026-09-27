@@ -1,8 +1,7 @@
 # policy.toml — endpoint rules. EDIT WHILE THE SERVER RUNS, applies immediately.
-# Rule values: public | auth | owner | deny | role:<name>
+# Rule values: public | auth | deny
 # Per-collection slots: get list create update delete (optional), read/write fallback,
 # final fallback [defaults]. Typo = deny (fail-closed).
-# The `owner` slot checks the owner_field (default ownerId, fallback uid).
 
 [defaults]
 read = "public"
@@ -12,13 +11,12 @@ write = "deny"
 read = "public"
 create = "auth"
 update = "auth"
-delete = "role:maintainer"
+delete = "auth"
 
 [collections.profiles]
-read = "owner"
-write = "owner"
-owner_field = "ownerId"
+read = "auth"
+write = "auth"
 
 [collections.ai_configs]
-read = "role:admin"
-write = "role:admin"
+read = "deny"
+write = "deny"

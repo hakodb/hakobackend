@@ -9,10 +9,10 @@ Implementation: `crates/hakobackend-policy` + `policy.toml` (hot-reload). Ready-
 
 1. **Default-deny.** No allowing rule → reject. Without `policy_file`
    (dev mode) the server is OPEN + must log WARN — never for production.
-2. **Fail-closed.** Rule typo, parse failure, unknown auth, missing document
-   for an `owner` rule → reject. Never fail open.
+2. **Fail-closed.** Rule typo, parse failure, unknown auth → reject.
+   Removed rules (`owner`, `role:*`) fail LOUD at policy load. Never fail open.
 3. **Uniform auth.** Any provider (internal/firebase/oidc) only fills
-   `AuthContext{uid, roles, tenant}`; rules never know which provider.
+   `AuthContext{uid, extra}`; rules never know which provider.
 4. **No reason leakage.** Responses are always `403 Permission denied by policy`
    — never saying which rule failed (distinguishing user-exists/not-exists
    is an enumeration hole).
@@ -30,26 +30,18 @@ falls back to `posts`, then defaults. There is deliberately NO last-segment
 fallback: a permissive generic rule must never silently cover hierarchies
 (S3 audit) — name the full path or the root.
 
-## 3. Roles & user collections: user-owned, not core
+## 3. Identity: user-owned user collection, not core
 
-Core binds **neither** role names **nor** the user collection. Users define everything
-in `[identity]` in `policy.toml`:
+Core binds **neither** admin names **nor** the user collection. Users define
+the user collection in `[identity]` in `policy.toml`:
 
 ```toml
 [identity]
 users_collection = "members"  # default "users"; free choice: sc_users, members, …
-role_field = "posisi"         # default "role"; single string or array
-owner_field = "pemilikId"     # default "ownerId"; per-collection override allowed
 ```
 
-- `role:<anything>` is free-form — core only compares the user document's role string
-  (loaded from `users_collection` via `role_field`, string or array) against
-  the name in the rule. No reserved role names.
-- Role examples in this document (`admin`, `maintainer`, `pengurus`) are just
-  **ready-made templates**, not requirements. Rename freely.
-- The global `owner_field` can be overridden per collection (`collections.X.owner_field`).
-  `owner` evaluation uses the configured field, with `ownerId`/`uid`
-  compatibility fallback for legacy data.
+Admin access = caller UID in server `admin_uids` (config/flag). No roles,
+no owner checks, no tenant claims anywhere in the stack.
 
 ## 4. Standard endpoint access classes
 
@@ -57,17 +49,14 @@ owner_field = "pemilikId"     # default "ownerId"; per-collection override allow
 |---|---|---|
 | Public-read | `read = "public"`, `write = "deny"` | `posts`, `pages`, `sc_configs` |
 | Authenticated-write | `create/update = "auth"` | `media`, `tags` |
-| Owner-only | `read/write = "owner"` (+ `owner_field`) | `profiles`, user notifications |
-| Admin-only | `read/write = "role:admin"` | `ai_configs`, credentials |
+| Authenticated-only | `read/write = "auth"` | `profiles`, user notifications |
+| Admin-only | `deny` + UID allowlist (`admin_uids`) | `ai_configs`, credentials |
 | Internal collections | `__` prefix **not exposed** over HTTP (unless explicit) | `__users` (refresh tokens), audit |
 
 ## 5. Document conventions (working defaults, all replaceable)
 
-- Default owner field `ownerId` (fallback `uid`); change via `[identity].owner_field`
-  or per collection. An `owner` rule on a document lacking the matched field → reject.
-- Privilege-escalation fields (`role`, `status`, …) must **not** be
-  self-service writable — escalation guards like the legacy backend's
-  `isModifyingRestrictedFields` land in phase-2 policy (`immutable_fields`, `owner_only_fields`).
+- Per-user data separation is the deployer's data modeling (separate
+  collections) or an external tenant layer — not rules.
 
 ## 6. Performance switches (all default off = legacy behavior)
 
@@ -87,10 +76,7 @@ skip_read_before_write = true  # PUT skips the old-doc lookup (~115us saved)
   for every non-`owner` rule, and `owner`-governed writes ignore it (still
   read, stranger still 403). Header (any API caller) was chosen over cookie:
   BFF cookies are browser-only, and a server-set cookie would add state for
-  zero extra trust — the hint is client-asserted either way and harmless by
-  the argument above. This matches the gateway's hint discipline (`X-Tenant`
-  is distrusted for routing; this hint is safe because it cannot change any
-  allow decision).
+  zero extra trust.
 - Future: rule-based bypass via header/cookie intercepted at the gateway
   (so hot callers can opt out per request instead of per policy file).
 
@@ -109,10 +95,11 @@ skip_read_before_write = true  # PUT skips the old-doc lookup (~115us saved)
 - Dual-token BFF pattern: 5–15 min access JWT + rotating opaque refresh on every use
   (hash in `__sessions` DB, `__Host-` cookies HttpOnly+Secure+SameSite=Strict Path=/).
 - Refresh reuse (an old token showing up again) → revoke ALL user sessions + reject.
-- Register drops `role`/`password_hash` from the body (anti self-escalation);
+- Register drops `password_hash` from the body; profile fields pass
+  through as plain data (no role concept remains to escalate into);
   wrong login/email is disguised (anti enumeration).
 - Tradeoff: stateless access JWT — logout revokes refresh, access lives until
   expiry (hence short TTL). No `mock-user` bypass.
 - DPoP (RFC 9449, local tokens): `off|accept|require` via `UB_LOCAL_DPOP`/`dpop`
   in custom.toml; a stolen token without the private key is unusable; replays rejected.
-- `/api/admin/reload` locked behind `--admin-role` (default `admin`, name is free choice).
+- `/api/admin/reload` locked behind `admin_uids` (UID allowlist).

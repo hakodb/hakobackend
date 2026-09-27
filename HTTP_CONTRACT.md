@@ -15,10 +15,6 @@ must produce exactly the same behavior.
 | `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
 | `GET /api/collections` | — (ungated) | `list_collections` | 200 |
 | `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
-| `POST /api/tenants {slug}` | admin role | `insert` into `__tenants` (conflict = taken) | 200 / 400 / 403 |
-| `GET /api/tenants` | admin role | list `__tenants` ids | 200 / 403 |
-| `PUT /api/tenants/{slug}/policy {policy_toml}` | admin role | validate + version bump in `__tenant_policies` | 200 / 400 / 403 |
-| `GET /api/tenants/{slug}/policy` | admin role | raw doc | 200 / 403 / 404 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
@@ -152,76 +148,31 @@ follow automatically. Neither = plain http. Port/listen changes need a restart
 - Ctrl+C / SIGTERM drains in-flight requests before sockets close
   (TLS and plain paths alike); subscriptions abort with their tasks.
 
-## 10. Tenants (prefix design)
-One backend serves many consumers: tenant `acme` reads/writes `users`,
-stored as `acme__users`. The prefix comes ONLY from the authenticated
-identity (`AuthContext.tenant`, e.g. the `tenant` field on local user
-docs) — never from client input; no tenant = legacy unprefixed namespace.
+## 10. Single user (no tenants)
 
-- Slugs: `^[a-z0-9][a-z0-9-]{0,62}$` (no underscore, so `__` unambiguously
-  marks scoped names). Provision via `POST /api/tenants` (admin);
-  uniqueness is structural (`insert` conflicts when taken).
-- Policy is evaluated on LOGICAL names: one file serves all tenants.
-  Applies uniformly to CRUD, batch/transaction, indexes, aggregates,
-  collection groups, and WS/SSE subscriptions.
-- A tenant with a doc in `__tenant_policies/{slug}` uses it INSTEAD of the
-  global file (replace, never merge); without one the global applies.
-  Docs carry `{policy_toml, version}`; broken TOML is rejected on write
-  and keeps the last good copy on read. Refresh ≤5 s everywhere.
-- Internal `__*` collections (incl. `__tenants`) are never addressable
-  over HTTP, even under an open policy.
-- Scaling note: collections multiply by tenant count (lazy-created, no
-  per-collection background work). Comfortable into the low thousands;
-  beyond that, split backends per tenant.
+One backend serves one namespace: collection names pass through unchanged.
+Policy is one global file evaluated on those names for CRUD,
+batch/transaction, indexes, aggregates, collection groups, and WS/SSE
+subscriptions. Multi-tenancy (if ever needed) lives OUTSIDE this backend.
 
-## 12. Service modes + tenant admins (phase B)
+- Internal `__*` collections are never addressable over HTTP, even
+  under an open policy.
+- Admin endpoints (`/api/admin/*`) require a UID in `admin_uids`
+  (config/flag, repeatable) — UIDs, not roles.
 
-`--mode managed` (default): tenants are admin-provisioned
-(`POST /api/tenants`, `GET /api/tenants`); tenantless callers keep the
-legacy global namespace. `--mode open` adds public self-service:
-`POST /api/tenants/register {slug, id|email, password}` creates the
-tenant + an owned local profile + the first user (stamped with
-`--tenant-admin-role`, default `tenant-admin`) + a starter policy
-granting that role full reign; slug taken → 400; partial failure rolls
-back. `--mode single --tenant <slug>` pins one tenant: client hints are
-ignored, `/api/tenants*` + `/api/auth-profiles*` return 403, the tenant
-+ owned local profile are ensured at boot, and every caller (even
-anonymous) is scoped to it. Mode/tenant/role need a restart
-(reload covers DB/auth/policy/limits/indexes, not these).
+## 12. Auth model (single-user)
 
-- Tenant admins: a caller passes for `{slug}` endpoints when it holds the
-  global admin role OR its verified JWT claim binds it to `{slug}` with
-  the tenant-admin role (claim, never the request hint). Scoped:
-  `PUT/GET /api/tenants/{slug}/policy`, `GET /api/tenants/{slug}`,
-  own `PUT /api/auth-profiles/{id}` (`owner_tenant` must equal the claim),
-  `GET /api/auth-profiles` (own + org-global, still redacted).
-- Claim adoption: a hintless tenant token is re-resolved through its own
-  bundle, so roles come from `{tenant}__users` on HTTP, WS upgrade,
-  WS `auth`/per-subscribe tokens, and SSE alike. Single-mode operators
-  stamp roles directly in `{tenant}__users` (no registry to do it).
-- Tenant `list_collections` shows logical names only; stored names
-  (`acme__users`) and tenanted internals (`acme____sessions`) are never
-  addressable nor listed (double-prefix reads 404 by design).
+- Callers are anonymous or carry a verified token (`AuthContext.uid`,
+  e.g. `local:root`). Policy rules: `public` (anyone), `auth` (any
+  authenticated caller), `deny` (nobody).
+- Admin: `is_admin` = caller UID in `admin_uids`. No roles, no owner
+  checks, no tenant claims anywhere in the stack.
 
-## 13. Browser portal (phase C)
+## 13. Browser portal (removed)
 
-Server-rendered HTML over the same JSON core (no JS framework, no new
-deps): plain forms + session cookies (BFF — tokens never reach the
-browser). Cookie POSTs are Origin-checked by the middleware; every
-interpolated value is escaped; credential POSTs (`/portal/login`,
-`/portal/register`) sit under the strict auth limiter like `/api/auth/*`.
-
-- `/portal` routes by role (org admin → `/portal/admin`, tenant admin →
-  `/portal/tenant`, else login); `/portal/status` is public (mode +
-  provider flags, no secrets); `/portal/register` exists in open mode.
-- Org admin: tenants list/create, auth profiles list/create-edit
-  (config values never shown), tenant policy editor (validated before
-  store, broken TOML rejected).
-- Tenant admin (claim-bound): user list/create/delete/roles in
-  `{tenant}__users` (delete drops the doc; live sessions expire on
-  their own), own policy editor, own (+org-global) profiles.
-- Denied pages carry real statuses (403 guards, 401 bad login, 400 bad
-  input) with a back link, not redirects.
+The server-rendered portal was deleted with the tenant system. The
+JSON API is the only interface; policy is managed via file +
+`/api/admin/reload`.
 
 ## 11. TTL + unique + coalescing
 

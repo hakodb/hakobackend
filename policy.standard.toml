@@ -1,46 +1,44 @@
-# policy.standard.toml — reference TEMPLATE for SECURITY_RULES.md, not binding rules.
-# The role & collection names below are examples; change them freely via [identity].
+# policy.standard.toml — reference TEMPLATE, not binding rules.
 # Copy to policy.toml then adjust per app.
+# Rules: public | auth | deny (owner/role removed with the tenant system).
 
-# Your identity: which user collection, which role/owner fields.
+# Your identity: which user collection holds login docs.
 [identity]
 users_collection = "users"
-role_field = "role"
-owner_field = "ownerId"
 
 [defaults]
 read = "deny"
 write = "deny"
 
-# Public content: free reads, maintainer-role writes (role names are just examples).
+# Public content: free reads, authenticated writes.
 [collections.posts]
 read = "public"
-create = "role:maintainer"
-update = "role:maintainer"
-delete = "role:admin"
+create = "auth"
+update = "auth"
+delete = "auth"
 
 [collections.pages]
 read = "public"
-write = "role:maintainer"
+write = "auth"
 
 # Authenticated user uploads.
 [collections.media]
 read = "public"
 create = "auth"
-delete = "role:maintainer"
+delete = "auth"
 
-# Profiles: owners only.
+# Private data: authenticated callers only (per-user separation is the
+# deployer's data modeling, or an external tenant layer).
 [collections.profiles]
-read = "owner"
-write = "owner"
-owner_field = "ownerId"
+read = "auth"
+write = "auth"
 
-# Provider credentials / config: admins only (SECURITY_RULES §4).
+# Provider credentials / config: deny by default; open explicitly per app.
 [collections.ai_configs]
-read = "role:admin"
-write = "role:admin"
+read = "deny"
+write = "deny"
 
-# Internal (__*) collections are not exposed over HTTP (enforced by the phase-2 server);
+# Internal (__*) collections are not exposed over HTTP (enforced by the server);
 # listed here to stay explicit should an audit ever need it.
 [collections.__users]
 read = "deny"

@@ -50,12 +50,14 @@ batch amortizes it: 25.7K docs/s ÷ 50 ≈ same 2ms/call as single PUT).
 So: packet → worker task → (blocking pool for hako ops) → inline emit
 → response, all on the request's task except engine sync ops.
 
-## 4. Multi-tenant scaling (hako, open mode, per-tenant JWTs)
+## 4. Multi-tenant scaling (RETIRED with the tenant system)
 
 - 10 tenants: 2054 rps, fairness 50/50/50, 0 fail
-- 50 tenants × 50 workers: 2027 rps, fairness 40/40/40, 0 fail
+- 50 tenants x 50 workers: 2027 rps, fairness 40/40/40, 0 fail
 - Tenant overhead vs single-tenant baseline ≈ **zero**
   (claim clone + prefix format + cache lookups).
+- Historical record only: tenants/modes/roles were removed (single-user
+  backend); the per-request prefix+lookup tax they measured is gone too.
 
 ## 5. What the numbers are NOT
 

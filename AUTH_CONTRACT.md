@@ -4,7 +4,7 @@ Mirrors `DRIVER_CONTRACT.md`: **no auth provider is bound to
 core except through this contract**. The backend is only a *verifier* for external providers;
 only `local` is an *issuer* (manages sessions/tokens).
 
-## 1. Two roles (in `hakobackend_core`)
+## 1. Two traits (in `hakobackend_core`)
 
 ```rust
 trait AuthProvider: Send + Sync {
@@ -37,10 +37,7 @@ Names that are not available (phases B/C) **fail fast at startup**, never bypass
 1. `verify` per provider until one succeeds (all fail → anonymous).
 2. Final `uid` is **namespaced** (`github:123`, `local:abc`) — no collisions
    across providers; also the user-doc lookup key.
-3. Roles = **union** (deduped): roles from claim mapping (§4) + roles from the user document
-   (`[identity].users_collection` via `[identity].role_field`, string/array).
-   No DB / no document → claim roles only (pure verifier).
-4. Optional `uid_field`/`email_field` pull from the claim `extra`.
+3. Optional `uid_field`/`email_field` pull from the claim `extra`.
 
 ## 4. Declarative mapping file (`--auth ./custom.toml`)
 
@@ -49,14 +46,7 @@ providers = ["github", "local"]   # builtins to chain
 [mapping]
 uid_field = "sub"                 # default: provider-native uid
 email_field = "email"
-[[rules]]                         # claim → user-owned free roles
-claim = "groups"
-equals = "ops"
-role = "pengurus"
 ```
-
-Matches when the string claim == `equals` or the claim array contains it.
-Copy-ready example: `custom.example.toml`.
 
 ## 5. Middleware (`hakobackend-server`)
 
@@ -90,7 +80,7 @@ Provider secrets/params via env (never in config files): `UB_FIREBASE_PROJECT`,
 `UB_FIREBASE_JWKS_URL` (test override), `UB_GITHUB_API` (test override),
 `UB_OIDC_ISSUER`, `UB_OIDC_AUDIENCE`, `UB_OIDC_JWKS_URL` (test override),
 `UB_LOCAL_JWT_SECRET` (required, min 32 chars), `UB_LOCAL_USERS` (default `users`),
-`UB_LOCAL_DEFAULT_ROLE`, `UB_LOCAL_ACCESS_TTL` (seconds, default 600),
+`UB_LOCAL_ACCESS_TTL` (seconds, default 600),
 `UB_LOCAL_REFRESH_TTL` (seconds, default 30 days).
 
 GitHub OAuth (phase E): `UB_GITHUB_CLIENT_ID` (present = feature on) +
@@ -99,10 +89,11 @@ GitHub OAuth (phase E): `UB_GITHUB_CLIENT_ID` (present = feature on) +
 `UB_GITHUB_TOKEN_URL`, `UB_GITHUB_AUTHORIZE_URL`. Pending state+PKCE in
 `__oauth_pending` (single-use, 10 min). OAuth login issues a local session
 (via `LocalAuth::login_external`, requires `local` in the chain); users are provisioned
-with NO roles, no email auto-merge.
+without email auto-merge.
 
 `local` endpoints (active when the chain includes it): `POST /api/auth/register`,
-`/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`, `GET /api/auth/me`.
+`/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`, `GET /api/auth/me`
+(`me` returns `{uid}` plus provider/email markers).
 Two `__Host-` cookies (HttpOnly+Secure+SameSite=Strict, Path=/). Documented
 tradeoff: stateless access JWT (logout revokes refresh; access lives out
 its TTL) — hence short TTL + refresh rotation + reuse detection.
