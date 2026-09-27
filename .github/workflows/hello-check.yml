@@ -1,0 +1,52 @@
+# Hello check: can this tree serve 40K hello-world rps on a GH runner?
+# Lean by design (the full gateway bench lives on maintainer hardware):
+# build release, serve hako+sqlite, ab -k hello. Manual + weekly.
+# Runners vary: compare bands across runs, never single runs.
+
+name: hello-check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+
+jobs:
+  hello:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build
+        run: cargo build --release --locked -p hakobackend-server
+
+      - name: install ab
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils
+
+      - name: hello hako + sqlite
+        run: |
+          BIN=./target/release/hakobackend-server
+          : > hello.txt
+          for cfg in "hako /tmp/hi-hako" "sqlite /tmp/hi-sqlite.db"; do
+            set -- $cfg
+            echo "=== $1 ===" | tee -a hello.txt
+            rm -rf /tmp/hi-hako /tmp/hi-sqlite.db
+            $BIN --driver $1 --data "$2" --port 3105 --auth off \
+              --limit-global 100000 --limit-global-burst 10000 > /tmp/hi-$1.log 2>&1 &
+            SRV=$!
+            sleep 5
+            ab -n 5000 -c 50 -k http://127.0.0.1:3105/api/health 2>&1 | grep -E "Requests per second|Failed" | tee -a hello.txt
+            kill $SRV
+            wait 2>/dev/null || true
+          done
+          cat hello.txt
+
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: hello-check-${{ github.run_number }}
+          path: hello.txt
