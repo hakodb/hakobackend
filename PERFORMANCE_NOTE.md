@@ -366,6 +366,13 @@ Runner hardware differs from VPS/EL8 — compare only within CI:
 | hako | 5709 | 8400 | 3861 | 4081 | 3290 | 2967 |
 | sqlite | 1733 | 7265 | 1561 | 1538 | 1144 | 1498 |
 
+## 12h. Hello in CI (ubuntu runner answers the 40K question)
+
+`hello-check.yml` (ab -k, hako+sqlite): **hako 75,526 / sqlite 74,702 rps**.
+40K was the VPS box (2× 2GHz laptop cores), never the code — same
+binary does 75K on runner hardware with hako≈sqlite (handler cost
+identical, as designed). New invariant for CI: hello must stay green.
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
