@@ -356,6 +356,16 @@ Removed per-request work: `stored()` prefix alloc, `effective_tenant`
 clone, per-tenant policy overlay lookup, hint parsing, TenantDb hops.
 -2,519 lines for +17% on the money path.
 
+## 12g. Gateway CI baseline (ubuntu runner, bench.yml)
+
+First green run (0.2.0, hako 0.8.29, bench2 8×100 + bench4 8×50).
+Runner hardware differs from VPS/EL8 — compare only within CI:
+
+| driver | PUT | GET | eq | eq+order | order-only | biglist |
+|---|---|---|---|---|---|---|
+| hako | 5709 | 8400 | 3861 | 4081 | 3290 | 2967 |
+| sqlite | 1733 | 7265 | 1561 | 1538 | 1144 | 1498 |
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
