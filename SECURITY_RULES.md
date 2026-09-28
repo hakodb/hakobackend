@@ -103,9 +103,11 @@ skip_read_before_write = true  # PUT skips the old-doc lookup (~115us saved)
 - Dual-token BFF pattern: 5–15 min access JWT + rotating opaque refresh on every use
   (hash in `__sessions` DB, `__Host-` cookies HttpOnly+Secure+SameSite=Strict Path=/).
 - Refresh reuse (an old token showing up again) → revoke ALL user sessions + reject.
-- Register drops `password_hash` from the body; profile fields pass
-  through as plain data (no role concept remains to escalate into);
-  wrong login/email is disguised (anti enumeration).
+- Register drops `password_hash` from the body AND strips claim-bound fields
+  (`[identity].attrs`): profile is caller-controlled, attrs become JWT claims
+  at login, so accepting them = self-mint (e.g. `role=service`). Privileged
+  fields are set later via the update path, never at signup.
+  Wrong login/email is disguised (anti enumeration).
 - Tradeoff: stateless access JWT — logout revokes refresh, access lives until
   expiry (hence short TTL). No `mock-user` bypass.
 - DPoP (RFC 9449, local tokens): `off|accept|require` via `UB_LOCAL_DPOP`/`dpop`

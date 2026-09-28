@@ -75,7 +75,6 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub benchmark: bool,
 }
-
 /// Final result after merge (the only one the server uses).
 #[derive(Debug, Clone)]
 pub struct UbConfig {
@@ -100,8 +99,38 @@ pub struct UbConfig {
     /// Ready-to-use index declarations (created at startup + reload — legacy
     /// autoCreateTablesFromRules pattern, extended to indexes).
     pub indexes: Vec<IndexDecl>,
+    /// Loopback service keys (raw hex from `[service]` + `UB_SVC_KEYS` env,
+    /// validated). Empty = feature off (zero behavior change).
+    pub service_keys: Vec<String>,
+    /// Service scope slots (`collection:read|write`, validated).
+    pub service_allow: Vec<String>,
     /// Which file it came from (for /api/admin/reload); "" when pure default+flags.
     pub source: String,
+}
+
+/// Loopback service key for co-hosted consumers (no user identity):
+/// static Bearer, socket-peer must be loopback, scope copied from config.
+/// Fail-closed: no keys = the whole feature is off.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ServiceSection {
+    #[serde(default)]
+    keys: Vec<String>,
+    #[serde(default)]
+    allow: Vec<String>,
+}
+
+/// Key hygiene: hex, ≥128 bit. Malformed keys fail fast (boot/validate),
+/// never silently ignored.
+pub fn valid_svc_key(k: &str) -> bool {
+    k.len() >= 32 && k.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Scope slot shape: `collection:read|write` (`read` = Get+List).
+pub fn parse_svc_scope(s: &str) -> bool {
+    match s.split_once(':') {
+        Some((c, "read")) | Some((c, "write")) => !c.is_empty(),
+        _ => false,
+    }
 }
 
 /// One `[[indexes]]` declaration: `collection` + `fields[]` (+options).
@@ -178,6 +207,9 @@ struct FileConfig {
     benchmark: bool,
     #[serde(default)]
     indexes: Vec<IndexDecl>,
+    /// Loopback service keys (see `[service]`).
+    #[serde(default)]
+    service: ServiceSection,
     #[serde(default)]
     server: LegacyServer,
     #[serde(default)]
@@ -303,6 +335,27 @@ pub fn resolve(args: &Args) -> UbConfig {
         tls_cert: args.tls_cert.clone().or(file.tls_cert),
         tls_key: args.tls_key.clone().or(file.tls_key),
         indexes: file.indexes,
+        service_keys: {
+            let mut keys = file.service.keys;
+            // Rotation-friendly secret path: env appends, never logged.
+            if let Ok(env) = std::env::var("UB_SVC_KEYS") {
+                keys.extend(env.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()));
+            }
+            for k in &keys {
+                if !valid_svc_key(k) {
+                    panic!("[ub] [service] key rejected (need hex, >= 32 chars)");
+                }
+            }
+            keys
+        },
+        service_allow: {
+            for s in &file.service.allow {
+                if !parse_svc_scope(s) {
+                    panic!("[ub] [service] allow slot `{s}` malformed (want `collection:read|write`)");
+                }
+            }
+            file.service.allow
+        },
         source: path.unwrap_or_default(),
     }
 }
@@ -386,6 +439,14 @@ limit_auth_burst = 5
 # TLS (both required; empty = plain http). DPoP scheme + Secure cookies follow automatically.
 # tls_cert = "./cert.pem"
 # tls_key = "./key.pem"
+
+# Loopback service key for a co-hosted consumer without user identity
+# (e.g. sibling service reading ai_configs). Static Bearer, accepted ONLY
+# from 127.0.0.1/::1 (socket peer, not X-Forwarded-For). Empty = off.
+# Keys rotate without restart: edit + POST /api/admin/reload.
+# [service]
+# keys = ["<64-hex>"]            # or UB_SVC_KEYS env (comma-separated)
+# allow = ["ai_configs:read"]    # slots "collection:read|write"; read=Get+List
 "#;
 
 #[cfg(test)]

@@ -50,3 +50,13 @@ limit_global_burst = 100
 limit_auth = 20
 limit_auth_burst = 5
 # trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
+
+# Loopback service key: co-hosted consumer without user identity (e.g. a
+# sibling service reading ai_configs under deny/deny). Static Bearer honored
+# ONLY from 127.0.0.1/::1 (socket peer — spoof-proof behind nginx).
+# Scope slots "collection:read|write" (read = Get+List), copied from here —
+# the client cannot request scope. policy.toml stays untouched.
+# Rotate without restart: add new key, POST /api/admin/reload, drop old.
+# [service]
+# keys = ["<64-hex>"]            # or UB_SVC_KEYS env (comma-separated)
+# allow = ["ai_configs:read"]

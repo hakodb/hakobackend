@@ -61,6 +61,14 @@ No token / failed DPoP = anonymous; **policy rules decide**, not the middleware
 (401 vs 403: 401 = a token was present but verified against no provider —
 enforced in phase B; currently an unknown token = anonymous + policy speaks).
 
+Service key (co-hosted consumer, no user identity): Bearer matching a
+`[service]` key hex (sha256 + constant-time) AND socket peer loopback
+(`ConnectInfo`, never XFF/Host) = server-minted `svc:loopback` context
+carrying config-copied scope (`svc:scope` = `["coll:read|write"]`), skipping
+resolve/DPoP/CSRF. Policy arm allows on scope hit; policy.toml untouched
+(`deny/deny` stays denying for everyone else). Empty keys = off.
+Rotation: add key, `POST /api/admin/reload`, drop old.
+
 ## 6. DPoP (RFC 9449, `local` tokens)
 
 A stolen token is unusable without the private key. Mode via env `UB_LOCAL_DPOP`

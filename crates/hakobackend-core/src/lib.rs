@@ -222,6 +222,14 @@ pub struct AuthContext {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// Loopback service-key identity (hakobackend-server `[service]`): minted
+/// server-side only, never from a token provider. The policy arm requires
+/// BOTH this uid prefix AND the scope key below.
+pub const SVC_UID_PREFIX: &str = "svc:";
+/// `extra` key carrying the service scope list (`["coll:read", ...]`,
+/// copied from server config — the client cannot request scope).
+pub const SVC_SCOPE: &str = "svc:scope";
+
 /// Raw token-verification result from one provider, before role mapping + union.
 #[derive(Debug, Clone, Default)]
 pub struct Claims {

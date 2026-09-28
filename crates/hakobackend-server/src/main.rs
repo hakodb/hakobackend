@@ -38,6 +38,7 @@ use hakobackend_db_mysql::MysqlDb;
 use hakobackend_db_rethinkdb::RethinkDb;
 use hakobackend_policy::{Identity, PolicyFile};
 use hakobackend_ratelimit::{Limiter, Quota};
+use sha2::{Digest, Sha256};
 use tower_http::compression::predicate::Predicate;
 
 // Profiling showed allocator churn (malloc/free/memmove) as the top
@@ -73,6 +74,63 @@ struct AppState {
     coalescer: Arc<coalesce::Coalescer>,
     /// Whether the coalescer accepts merges (snapshot of the flag at boot).
     coalesce_on: bool,
+    /// Loopback service keys (hot-reload via /api/admin/reload for rotation).
+    service: Arc<tokio::sync::RwLock<Arc<ServiceAuth>>>,
+}
+
+/// Loopback service-key state: sha256 hashes (keys never compared raw) +
+/// scope slots copied from config. Empty hashes = feature off.
+#[derive(Clone, Default)]
+struct ServiceAuth {
+    hashes: Vec<[u8; 32]>,
+    scopes: Vec<String>,
+}
+
+impl ServiceAuth {
+    fn build(keys: &[String], allow: &[String]) -> Arc<Self> {
+        Arc::new(Self {
+            hashes: keys.iter().map(|k| hash_key(k)).collect(),
+            scopes: allow.to_vec(),
+        })
+    }
+}
+
+fn hash_key(k: &str) -> [u8; 32] {
+    Sha256::digest(k.trim().as_bytes()).into()
+}
+
+/// Constant-time match (XOR fold — no early exit, no length oracle beyond
+/// the fixed 32-byte digest). High-entropy keys make this belt-and-braces.
+fn svc_key_match(hashes: &[[u8; 32]], token: &str) -> bool {
+    let cand = hash_key(token);
+    let mut hit = false;
+    for h in hashes {
+        let mut diff = 0u8;
+        for (a, b) in h.iter().zip(cand.iter()) {
+            diff |= a ^ b;
+        }
+        hit |= diff == 0;
+    }
+    hit
+}
+
+/// Loopback = socket peer (ConnectInfo), NEVER Host/X-Forwarded-For.
+/// Behind nginx on the same host the peer is 127.0.0.1; a remote key
+/// thief still fails this check.
+fn loopback_peer(req: &Request) -> bool {
+    req.extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback())
+}
+
+/// Service identity for the policy arm (uid prefix + config-copied scope).
+fn svc_context(scopes: &[String]) -> AuthContext {
+    AuthContext {
+        uid: "svc:loopback".into(),
+        extra: [(hakobackend_core::SVC_SCOPE.into(), serde_json::json!(scopes))]
+            .into_iter()
+            .collect(),
+    }
 }
 
 impl AppState {
@@ -250,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli,
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
+        service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&cfg.service_keys, &cfg.service_allow))),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -564,6 +623,16 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     let ws_t0 = std::time::Instant::now();
     let from_cookie = read_cookie(req.headers(), ACCESS_COOKIE);
     let token = bearer(req.headers()).or_else(|| from_cookie.clone());
+    // Service key BEFORE the chain: loopback + key match = server-minted
+    // svc context (skips resolve/DPoP/CSRF — none apply to a static key).
+    // Anything else falls through to the normal paths, unchanged.
+    if let Some(t) = &token {
+        let svc = s.service.read().await.clone();
+        if !svc.hashes.is_empty() && loopback_peer(&req) && svc_key_match(&svc.hashes, t) {
+            req.extensions_mut().insert(Some(svc_context(&svc.scopes)));
+            return next.run(req).await;
+        }
+    }
     // ponytail: anonymous fast path — no credentials means no resolution,
     // DPoP, or CSRF work. Policy decides public/deny downstream from the
     // None context (identical outcome); skips 2 String allocs + async hop
@@ -795,6 +864,8 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // Rate-limit numbers + auto-provision hot-reload too (no restart).
     s.limits.global.set_quota(Quota::per_minute(cfg.limit_global.0, cfg.limit_global.1));
     s.limits.auth.set_quota(Quota::per_minute(cfg.limit_auth.0, cfg.limit_auth.1));
+    // Service keys rotate the same way (add new, reload, drop old).
+    *s.service.write().await = ServiceAuth::build(&cfg.service_keys, &cfg.service_allow);
     auto_provision(&s.db.read().await.clone(), &s.policy.get().await, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
@@ -2616,6 +2687,51 @@ mod tests {
     }
 
     #[test]
+    fn svc_key_match_and_loopback() {
+        use std::net::SocketAddr;
+        let key = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let svc = ServiceAuth::build(&[key.into()], &["ai_configs:read".into()]);
+        assert!(svc_key_match(&svc.hashes, key));
+        assert!(!svc_key_match(&svc.hashes, "wrong"));
+        assert!(!svc_key_match(&[], key), "no keys = feature off");
+        // Loopback reads the socket peer, never headers.
+        let mut spoof = HeaderMap::new();
+        spoof.insert("x-forwarded-for", "127.0.0.1".parse().unwrap());
+        spoof.insert(header::HOST, "127.0.0.1".parse().unwrap());
+        let mut req = Request::builder().uri("/").body(axum::body::Body::empty()).unwrap();
+        assert!(!loopback_peer(&req), "no peer info = deny");
+        req.extensions_mut().insert(ConnectInfo("10.0.0.1:5".parse::<SocketAddr>().unwrap()));
+        assert!(!loopback_peer(&req), "remote + spoofed headers = deny");
+        req.extensions_mut().insert(ConnectInfo("127.0.0.1:5".parse::<SocketAddr>().unwrap()));
+        assert!(loopback_peer(&req));
+        req.extensions_mut().insert(ConnectInfo("[::1]:5".parse::<SocketAddr>().unwrap()));
+        assert!(loopback_peer(&req));
+    }
+
+    #[test]
+    fn svc_scope_arm_beats_deny() {
+        let pol = PolicyFile::load_str("[collections.ai_configs]\nread = \"deny\"\nwrite = \"deny\"\n").unwrap();
+        let ctx = svc_context(&["ai_configs:read".to_string()]);
+        assert!(pol.allow(Some(&ctx), "ai_configs", Method::Get, None));
+        assert!(pol.allow(Some(&ctx), "ai_configs", Method::List, None));
+        assert!(!pol.allow(Some(&ctx), "ai_configs", Method::Update, None), "read != write");
+        assert!(!pol.allow(Some(&ctx), "other", Method::Get, None), "scope is per-collection");
+        assert!(!pol.allow(None, "ai_configs", Method::Get, None), "anon still denied");
+    }
+
+    #[test]
+    fn svc_config_validation() {
+        assert!(config::valid_svc_key(&"ab".repeat(32)));
+        assert!(!config::valid_svc_key("short"));
+        assert!(!config::valid_svc_key(&"zz".repeat(32)));
+        assert!(config::parse_svc_scope("ai_configs:read"));
+        assert!(config::parse_svc_scope("ai_configs:write"));
+        assert!(!config::parse_svc_scope("ai_configs"));
+        assert!(!config::parse_svc_scope("ai_configs:admin"));
+        assert!(!config::parse_svc_scope(":read"));
+    }
+
+    #[test]
     fn rate_limit_key() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         let peer: SocketAddr = (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1234).into();
@@ -2888,6 +3004,7 @@ mod tests {
             },
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,
+            service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&[], &[]))),
         };
         (st, raw)
     }

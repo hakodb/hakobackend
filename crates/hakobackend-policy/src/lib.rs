@@ -296,6 +296,28 @@ pub struct PolicyFile {
     pub performance: Performance,
 }
 
+/// Loopback service-key scope hit: `extra["svc:scope"]` holds config-copied
+/// `"collection:read|write"` slots (`read` = Get+List). One string scan —
+/// ns-scale, no policy-file involvement.
+fn svc_scope_hit(
+    extra: &HashMap<String, serde_json::Value>,
+    collection: &str,
+    method: Method,
+) -> bool {
+    let class = match method {
+        Method::Get | Method::List => "read",
+        _ => "write",
+    };
+    extra
+        .get(hakobackend_core::SVC_SCOPE)
+        .and_then(|v| v.as_array())
+        .is_some_and(|scopes| {
+            scopes.iter().filter_map(|v| v.as_str()).any(|s| {
+                s.split_once(':').is_some_and(|(c, op)| op == class && c == collection)
+            })
+        })
+}
+
 impl PolicyFile {
     /// Without a policy file (dev mode): everything public + the server must log WARN.
     pub fn open() -> Self {
@@ -348,6 +370,16 @@ impl PolicyFile {
         method: Method,
         resource: Option<&Doc>,
     ) -> bool {
+        // Loopback service key (server-minted `svc:` uid + config scope):
+        // explicit allow, policy file untouched. No match = fall through
+        // to the normal rules (deny/deny stays denying).
+        if let Some(a) = auth {
+            if a.uid.starts_with(hakobackend_core::SVC_UID_PREFIX)
+                && svc_scope_hit(&a.extra, collection, method)
+            {
+                return true;
+            }
+        }
         let empty = CollectionPolicy::default();
         let policy = self.find(collection).unwrap_or(&empty);
         let rule = policy.slot(method, &self.defaults);

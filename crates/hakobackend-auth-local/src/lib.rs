@@ -178,8 +178,10 @@ impl LocalAuth {
     }
 
     /// Self-service registration: `password_hash` from the body is ALWAYS
-    /// discarded (never store plaintext). Profile fields otherwise pass
-    /// through as plain data — no role concept remains to escalate into.
+    /// discarded (never store plaintext). Claim-bound fields (`[identity].attrs`)
+    /// are ALSO stripped: profile is caller-controlled, attrs become JWT
+    /// claims at login, so accepting them here = self-mint (e.g. `role=service`).
+    /// Privileged fields are set later via the update path, never at signup.
     pub async fn register(
         &self,
         id: Option<String>,
@@ -218,6 +220,11 @@ impl LocalAuth {
         let hash = hash_password(password.to_string()).await?;
         let mut data = profile;
         data.remove(PASSWORD_FIELD);
+        // ponytail: one loop, not a per-field policy — claim fields are
+        // server-minted, never self-assigned at signup.
+        for f in &self.identity.attrs {
+            data.remove(f);
+        }
         data.insert(PASSWORD_FIELD.into(), serde_json::Value::String(hash));
         if let Some(e) = email {
             data.insert("email".into(), serde_json::Value::String(e));
@@ -652,6 +659,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_strips_claim_fields() {
+        // attrs-bound fields are server-minted: signup cannot self-assign them.
+        let db: Arc<dyn Database> = Arc::new(FakeDb::new());
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        let cfg = LocalConfig::from_env().unwrap();
+        std::env::remove_var("UB_LOCAL_JWT_SECRET");
+        drop(_g);
+        let a = Arc::new(LocalAuth {
+            cfg,
+            db,
+            identity: Identity { attrs: vec!["role".into(), "status".into()], ..Default::default() },
+            dpop_mode: std::sync::Mutex::new(DpopMode::Off),
+            dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+        });
+        let mut profile = HashMap::new();
+        profile.insert("nick".into(), serde_json::Value::String("svc".into()));
+        profile.insert("role".into(), serde_json::Value::String("service".into()));
+        let doc = a.register(Some("svc".into()), None, "rahasia123", profile).await.unwrap();
+        assert_eq!(doc.data.get("nick").unwrap(), "svc");
+        assert!(doc.data.get("role").is_none(), "self-minted claim field stored");
+        let (ctx, _) = a.login("svc", "rahasia123", None).await.unwrap();
+        assert!(ctx.extra.get("role").is_none(), "self-minted claim reachable");
+    }
+
+    #[tokio::test]
     async fn register_login_verify() {
         let db: Arc<dyn Database> = Arc::new(FakeDb::new());
         let a = local(db);
@@ -741,6 +774,11 @@ mod tests {
         profile.insert("role".into(), serde_json::Value::String("staf".into()));
         profile.insert("secret".into(), serde_json::Value::String("x".into()));
         a.register(Some("siti".into()), None, "rahasia123", profile).await.unwrap();
+        // Signup cannot self-assign claim fields (stripped); a privileged
+        // update sets them afterwards — login then mints from the stored doc.
+        let mut data = a.db.get("users", "siti").await.unwrap().unwrap().data;
+        data.insert("role".into(), serde_json::Value::String("staf".into()));
+        a.db.set("users", "siti", hakobackend_core::Doc { id: "siti".into(), data }, true).await.unwrap();
         let (ctx, tokens) = a.login("siti", "rahasia123", None).await.unwrap();
         // Direct ctx (login path) carries allowlisted attrs only.
         assert_eq!(ctx.extra.get("role").and_then(|v| v.as_str()), Some("staf"));
