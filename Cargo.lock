@@ -1472,9 +1472,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.8.29"
+version = "0.8.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa26d8ae9506e4f4d20bb68430bd2634c4d39630c05f2598669e776d8d4ca30f"
+checksum = "8d42030fd3660cf0948bdec0a26a213bd592f0477f5a3ae24aaf43b47008d72b"
 dependencies = [
  "bincode",
  "cbindgen",
