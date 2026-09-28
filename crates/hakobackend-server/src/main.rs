@@ -393,8 +393,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Graceful drain on Ctrl+C / SIGTERM: in-flight requests finish, then
     // sockets close. Subscriptions abort with their tasks (client resubscribes).
+    // SIGTERM matters: it is what systemd sends, and without this arm the
+    // process dies instantly — Hako's Drop (WAL snapshot rewrite + flush)
+    // never runs and Interval-mode buffered writes die with it (data loss
+    // on every `systemctl restart`; see insiden-hako-wal-20260928).
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(unix)]
+        {
+            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler installs");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = term.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         eprintln!("[ub] shutdown: draining connections");
     };
     // ConnectInfo required so the rate-limit key = real peer IP.
