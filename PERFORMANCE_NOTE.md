@@ -373,6 +373,23 @@ Runner hardware differs from VPS/EL8 — compare only within CI:
 binary does 75K on runner hardware with hako≈sqlite (handler cost
 identical, as designed). New invariant for CI: hello must stay green.
 
+## 12i. Unix socket + hot-path diet (VPS, oha, hako)
+
+- `40K` direct-TCP was the loopback pps cap (~70-80K pps), never hardware:
+  same box does **56.8k via unix socket** (no TCP stack), **66→70.2k**
+  after static health/ack bodies + Arc AppState heavies + sharded limiter.
+- Framework ceiling on this box (bare axum): **132.5k socket / 47.7k TCP**.
+  App at 53% of it; rest is spread (flat perf profile: middleware +
+  routing + h1, no single hotspot) — not chased further (would trade
+  architecture for single percents).
+- Real API path (limiter+auth+policy+hako read+serialize): **55.9k**.
+- Via nginx https prod: **15.4-15.7k** (TLS record crypto ~40% + 2 TCP
+  hops; unix upstream +15% over TCP upstream). Real traffic 100× below.
+- Correction to an old claim: unix works, but `tokio::net::unix` is
+  Unix-only — Windows builds fail closed on `sock` (flag parses, bind
+  refused). AF_UNIX-on-Windows exists in Winsock but tokio doesn't
+  expose it; no new dep was worth it.
+
 ## 13. Test-methodology issues (earned the hard way)
 
 - Wall-RPS moves ±20% run to run: compare bands across repeats, never
