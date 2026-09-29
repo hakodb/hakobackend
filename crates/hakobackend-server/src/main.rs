@@ -72,10 +72,13 @@ struct AppState {
     /// TLS enabled (https scheme for DPoP htu + HSTS).
     tls: bool,
     /// Admin UIDs allowed to call /api/admin/* (single-user backend: UIDs,
-    /// not roles — see tenant-removal notes).
-    admin_uids: Vec<String>,
-    /// CLI flags for reload (file re-read, flags still win).
-    cli: Args,
+    /// not roles — see tenant-removal notes). Arc: AppState clones per
+    /// accepted connection (2.9% of bench profile); the list itself never
+    /// changes at runtime, so don't copy it per connection.
+    admin_uids: Arc<Vec<String>>,
+    /// CLI flags for reload (file re-read, flags still win). Arc for the
+    /// same per-connection clone reason as admin_uids.
+    cli: Arc<Args>,
     /// PATCH coalescer (active only with --coalesce-writes).
     coalescer: Arc<coalesce::Coalescer>,
     /// Whether the coalescer accepts merges (snapshot of the flag at boot).
@@ -383,8 +386,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local: Arc::new(tokio::sync::RwLock::new(local)),        github: Arc::new(tokio::sync::RwLock::new(github)),
         limits: limits.clone(),
         tls,
-        admin_uids: cfg.admin_uids.clone(),
-        cli,
+        admin_uids: Arc::new(cfg.admin_uids.clone()),
+        cli: Arc::new(cli),
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
         service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&cfg.service_keys, &cfg.service_allow))),
@@ -926,7 +929,13 @@ fn valid_names(collection: &str, id: Option<&str>) -> Option<Response> {
 }
 
 async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok", "db": "hakodb" }))
+    // ponytail: pre-serialized static bytes — this endpoint is the LB +
+    // bench hot path; building + serializing a Value per request was pure
+    // malloc/memmove with zero information. Bytes identical to before.
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"db":"hakodb","status":"ok"}"#,
+    )
 }
 
 /// Readiness (LBs/K8s): the driver answers, not just the socket.
@@ -3133,8 +3142,8 @@ mod tests {
                 trust_proxy: false,
             }),
             tls: false,
-            admin_uids: vec![],
-            cli: Args {
+            admin_uids: Arc::new(vec![]),
+            cli: Arc::new(Args {
                 config: None, driver: None, data: None, rules: None, auth: None,
                 host: None, port: None, admin_uids: vec![],
                 public_url: None, limit_global: None,
@@ -3142,7 +3151,7 @@ mod tests {
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
                 wstats: false, benchmark: false, sock: None,
-            },
+            }),
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,
             service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&[], &[]))),
