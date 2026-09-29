@@ -51,6 +51,13 @@ limit_auth = 20
 limit_auth_burst = 5
 # trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
 
+# Unix-domain socket: extra local-only listener next to TCP (absent = TCP
+# only). Same app; nginx: `proxy_pass http://unix:/run/hakobackend/hako.sock;`
+# (upstream keepalive works over it). Bypasses the TCP loopback pps cap that
+# bounds the proxy path. Created mode 777 (nginx user must write).
+# Unix-only: a Windows build refuses to start with sock set.
+# sock = "/run/hakobackend/hako.sock"
+
 # Loopback service key: co-hosted consumer without user identity (e.g. a
 # sibling service reading ai_configs under deny/deny). Static Bearer honored
 # ONLY from 127.0.0.1/::1 (socket peer — spoof-proof behind nginx).

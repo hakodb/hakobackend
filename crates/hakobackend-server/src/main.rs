@@ -22,6 +22,12 @@ use axum::{
     routing::{get, post},
 };
 use axum::extract::{ConnectInfo, Request, ws};
+// Unix-listener plumbing only (no tokio UDS on Windows; the flag
+// fail-closes there instead).
+#[cfg(unix)]
+use axum::extract::connect_info::Connected;
+#[cfg(unix)]
+use axum::serve::{IncomingStream, Listener};
 use clap::Parser;
 use config::{Args, DEFAULT_CONFIG_TEMPLATE, resolve, validate};
 use std::collections::HashMap;
@@ -86,6 +92,73 @@ struct ServiceAuth {
     scopes: Vec<String>,
 }
 
+/// Unix-domain socket marker: inserted as ConnectInfo by the uds listener
+/// (axum has no SocketAddr there). Local by construction. Unix-only
+/// (tokio:net::unix is cfg(unix); Windows has no AF_UNIX there).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct UnixPeer;
+
+#[cfg(unix)]
+impl Connected<IncomingStream<'_, UdsListener>> for UnixPeer {
+    fn connect_info(_: IncomingStream<'_, UdsListener>) -> Self {
+        Self
+    }
+}
+
+/// Unix listener newtype: axum's own `Listener for UnixListener` is
+/// cfg(unix)-gated, which would fork the flag per OS. This delegates
+/// straight through, so --sock behaves identically on Windows (where
+/// AF_UNIX exists since 1809; only the chmod step stays cfg(unix)).
+#[cfg(unix)]
+struct UdsListener(tokio::net::UnixListener);
+
+#[cfg(unix)]
+impl Listener for UdsListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok(tup) => return tup,
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset => {}
+                    _ => {
+                        eprintln!("[ub] uds accept error: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                },
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
+/// Shared shutdown trigger (Ctrl+C / SIGTERM): one instance per server
+/// so the TCP and unix listeners drain on the same signal independently.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installs");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    eprintln!("[ub] shutdown: draining connections");
+}
+
 impl ServiceAuth {
     fn build(keys: &[String], allow: &[String]) -> Arc<Self> {
         Arc::new(Self {
@@ -118,6 +191,12 @@ fn svc_key_match(hashes: &[[u8; 32]], token: &str) -> bool {
 /// Behind nginx on the same host the peer is 127.0.0.1; a remote key
 /// thief still fails this check.
 fn loopback_peer(req: &Request) -> bool {
+    // Unix-socket arrivals carry the marker instead of a TCP peer —
+    // local by construction (stronger than loopback: filesystem, not IP).
+    #[cfg(unix)]
+    if req.extensions().get::<ConnectInfo<UnixPeer>>().is_some() {
+        return true;
+    }
     req.extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
         .is_some_and(|ConnectInfo(peer)| peer.ip().is_loopback())
@@ -391,6 +470,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wstats::set_enabled(true);
         eprintln!("[ub] wstats on: GET /api/__wstats (1/16 sampling)");
     }
+    // Optional unix-domain socket: same app, local-only, next to TCP.
+    // Absent = TCP only (yesterday's behavior, byte for byte). Listener
+    // shape is boot-time (hot-reload ignores it); the socket file from a
+    // crash would bind AddrInUse, so clear it best-effort first.
+    // Unix-only: tokio has no net::unix on Windows, so a Windows build
+    // fails closed here instead of silently ignoring the flag.
+    #[cfg(unix)]
+    let uds_handle: Option<tokio::task::JoinHandle<()>> = if let Some(sock) = cfg.sock.clone() {
+        let _ = std::fs::remove_file(&sock);
+        let uds = tokio::net::UnixListener::bind(&sock)
+            .map_err(|e| format!("[ub] cannot bind unix socket {sock}: {e}"))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o777))
+                .map_err(|e| format!("[ub] cannot chmod unix socket {sock}: {e}"))?;
+        }
+        println!("[ub] listening (unix) on {sock}");
+        let uds_svc = app.clone().into_make_service_with_connect_info::<UnixPeer>();
+        Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(UdsListener(uds), uds_svc)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+            {
+                eprintln!("[ub] unix socket serve error: {e}");
+            }
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let uds_handle: Option<tokio::task::JoinHandle<()>> = if cfg.sock.is_some() {
+        return Err("[ub] sock listener is Unix-only (this Windows build ignores it — refusing to start half-configured)".into());
+    } else {
+        None
+    };
     // Graceful drain on Ctrl+C / SIGTERM: in-flight requests finish, then
     // sockets close. Subscriptions abort with their tasks (client resubscribes).
     // SIGTERM matters: it is what systemd sends, and without this arm the
@@ -398,20 +512,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // never runs and Interval-mode buffered writes die with it (data loss
     // on every `systemctl restart`; see insiden-hako-wal-20260928).
     let shutdown = async {
-        #[cfg(unix)]
-        {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler installs");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = term.recv() => {},
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-        eprintln!("[ub] shutdown: draining connections");
+        shutdown_signal().await;
     };
     // ConnectInfo required so the rate-limit key = real peer IP.
     let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -438,6 +539,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         println!("[ub] listening on http://{addr}");
         axum::serve(listener, svc).with_graceful_shutdown(shutdown).await?;
+    }
+    // Both listeners drain on the same signal; the unix task ends with its
+    // own graceful drain, so await it instead of orphaning in-flight locals.
+    if let Some(h) = uds_handle {
+        let _ = h.await;
     }
     Ok(())
 }
@@ -468,12 +574,20 @@ fn client_key(headers: &HeaderMap, peer: std::net::SocketAddr, trust_proxy: bool
 
 async fn limit_mw(
     State(s): State<LimitScope>,
-    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
     let ws_t0 = std::time::Instant::now();
-    match s.limiter.check(&client_key(req.headers(), peer, s.trust_proxy)) {
+    // Peer from extensions by hand (not the ConnectInfo extractor): unix
+    // arrivals carry UnixPeer instead of a TCP peer, and the extractor
+    // would 500-reject them. Unix = one shared local bucket (all of it is
+    // loopback-equivalent by construction).
+    let key = req
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(p)| client_key(req.headers(), *p, s.trust_proxy))
+        .unwrap_or_else(|| "unix".to_string());
+    match s.limiter.check(&key) {
         Ok(()) => {
             if WSAMP.try_get().unwrap_or(false) {
                 wstats::add(&wstats::F[2], ws_t0.elapsed().as_nanos() as u64);
@@ -2747,6 +2861,17 @@ mod tests {
         assert!(!config::parse_svc_scope(":read"));
     }
 
+    // Unix arrivals carry UnixPeer instead of a TCP peer: loopback_peer
+    // must accept the marker (unix-only: type exists only there).
+    #[cfg(unix)]
+    #[test]
+    fn uds_marker_counts_as_loopback() {
+        let mut req = Request::builder().uri("/").body(axum::body::Body::empty()).unwrap();
+        assert!(!loopback_peer(&req));
+        req.extensions_mut().insert(ConnectInfo(UnixPeer));
+        assert!(loopback_peer(&req));
+    }
+
     #[test]
     fn rate_limit_key() {
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -3016,7 +3141,7 @@ mod tests {
                 limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
-                wstats: false, benchmark: false,
+                wstats: false, benchmark: false, sock: None,
             },
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,

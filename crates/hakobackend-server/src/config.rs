@@ -31,6 +31,11 @@ pub struct Args {
     pub host: Option<String>,
     #[arg(long)]
     pub port: Option<u16>,
+    /// Unix-domain socket path (extra listener next to TCP; absent = TCP
+    /// only). Same app, local-only. Nginx: `proxy_pass http://unix:/path`.
+    /// Unix-only: a Windows build fails closed when it is set.
+    #[arg(long)]
+    pub sock: Option<String>,
     /// Admin UIDs allowed to call /api/admin/* (repeatable flag;
     /// single-user backend uses UIDs, not roles).
     #[arg(long)]
@@ -85,6 +90,9 @@ pub struct UbConfig {
     pub rules: Option<String>,
     pub auth: Option<String>,
     pub admin_uids: Vec<String>,
+    /// Unix socket path (None = TCP only). Hot-reload ignores it (listener
+    /// shape is boot-time; changing it needs a restart, unlike rules/auth).
+    pub sock: Option<String>,
     pub public_url: Option<String>,
     pub limit_global: (u32, u32),
     pub limit_auth: (u32, u32),
@@ -187,6 +195,7 @@ struct FileConfig {
     data: Option<String>,
     rules: Option<String>,
     auth: Option<String>,
+    sock: Option<String>,
     #[serde(default)]
     admin_uids: Vec<String>,
     public_url: Option<String>,
@@ -314,6 +323,7 @@ pub fn resolve(args: &Args) -> UbConfig {
             .or(file.database.rules)
             .or(file.database.policy_file),
         auth: args.auth.clone().or(file.auth),
+        sock: args.sock.clone().or(file.sock),
         admin_uids: {
             let mut v = file.admin_uids;
             v.extend(args.admin_uids.clone());
@@ -440,6 +450,14 @@ limit_auth_burst = 5
 # tls_cert = "./cert.pem"
 # tls_key = "./key.pem"
 
+# Unix-domain socket: extra local-only listener next to TCP (absent = TCP
+# only). Same app; nginx: `proxy_pass http://unix:/run/hakobackend/hako.sock;`
+# (upstream keepalive works over it). Bypasses the TCP loopback pps cap that
+# bounds the proxy path. Created mode 777 (nginx user must write). Unix-only:
+# a Windows build refuses to start with sock set (no silent half-config).
+# Changing it needs a restart (not hot-reloaded).
+# sock = "/run/hakobackend/hako.sock"
+
 # Loopback service key for a co-hosted consumer without user identity
 # (e.g. sibling service reading ai_configs). Static Bearer, accepted ONLY
 # from 127.0.0.1/::1 (socket peer, not X-Forwarded-For). Empty = off.
@@ -471,6 +489,7 @@ mod tests {
             trust_proxy: false,
             tls_cert: None,
             tls_key: None,
+            sock: None,
             validate: false,
             print_default_config: false,
             coalesce_writes: false,
@@ -510,6 +529,21 @@ mod tests {
         assert_eq!(cfg.listen(), "127.0.0.1:4040");
         assert_eq!(cfg.data, "./x.ub");
         assert_eq!(cfg.rules.as_deref(), Some("./r.toml"));
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn sock_opsional_file_dan_flag() {
+        // Absent = TCP only (yesterday's default).
+        assert_eq!(resolve(&args()).sock, None);
+        // File sets it.
+        let f = write_tmp("hakobackend_sock_test.toml", "sock = \"/tmp/hako-test.sock\"\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert_eq!(resolve(&a).sock.as_deref(), Some("/tmp/hako-test.sock"));
+        // Flag wins over file.
+        a.sock = Some("/tmp/hako-flag.sock".into());
+        assert_eq!(resolve(&a).sock.as_deref(), Some("/tmp/hako-flag.sock"));
         let _ = std::fs::remove_file(f);
     }
 
