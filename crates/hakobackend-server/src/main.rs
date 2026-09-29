@@ -852,11 +852,19 @@ fn base_uri(tls: bool, headers: &HeaderMap, path: &str) -> String {
 }
 
 fn forbidden() -> Response {
-    err(StatusCode::FORBIDDEN, "Permission denied by policy")
+    (
+        StatusCode::FORBIDDEN,
+        static_json(r#"{"error":"Permission denied by policy"}"#),
+    )
+        .into_response()
 }
 
 fn unauthorized() -> Response {
-    err(StatusCode::UNAUTHORIZED, "authentication required")
+    (
+        StatusCode::UNAUTHORIZED,
+        static_json(r#"{"error":"authentication required"}"#),
+    )
+        .into_response()
 }
 
 /// Legacy wire shape: every failure is JSON `{error}` (writes add `code`).
@@ -868,7 +876,24 @@ fn err(status: StatusCode, msg: impl ToString) -> Response {
 /// unauthenticated prober must never see (S3 audit). Validation messages
 /// stay specific; only the opaque Internal variant is scrubbed here.
 fn err_internal() -> Response {
-    err(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        static_json(r#"{"error":"internal error"}"#),
+    )
+        .into_response()
+}
+
+/// Constant JSON bodies, pre-serialized (see health): `serde_json` emits
+/// these byte-identical (compact, sorted keys), so skip the Value build +
+/// serialize per response. Only for bodies that NEVER vary — dynamic
+/// payloads (docs, errors with details) keep the normal path.
+fn static_json(body: &'static str) -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/json")], body)
+}
+
+/// Every write ack on the wire (`{"success":true}`).
+fn ok_true() -> Response {
+    static_json(r#"{"success":true}"#).into_response()
 }
 
 fn err_code(status: StatusCode, msg: impl ToString, code: &str) -> Response {
@@ -1040,7 +1065,7 @@ async fn create_collection(
         return forbidden();
     }
     match s.db.read().await.ensure_collection(&stored(&name)).await {
-        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Ok(()) => ok_true(),
                 Err(_) => err_internal(),
     }
 }
@@ -1514,7 +1539,7 @@ async fn index_drop(
         return forbidden();
     }
     match s.db.read().await.drop_index(&stored(&collection), &name).await {
-        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Ok(()) => ok_true(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
@@ -1696,7 +1721,7 @@ async fn write_doc(
                         if coalesce::Coalescer::eligible(&body)
                             && s.coalescer.merge(&stored, &id, map)
                         {
-                            return Json(serde_json::json!({ "success": true })).into_response();
+                            return ok_true();
                         }
                     }
                 }
@@ -1753,7 +1778,7 @@ async fn write_doc(
                         wstats::add(&wstats::W[5], ws_t.elapsed().as_nanos() as u64);
                         ws_t = std::time::Instant::now();
                     }
-                    let r = Json(serde_json::json!({ "success": true })).into_response();
+                    let r = ok_true();
                     if samp {
                         wstats::add(&wstats::W[6], ws_t.elapsed().as_nanos() as u64);
                     }
@@ -1804,7 +1829,7 @@ async fn remove(
                             new: None,
                         },
                     );
-                    Json(serde_json::json!({ "success": true })).into_response()
+                    ok_true()
                 }
                 Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
             }

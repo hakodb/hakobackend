@@ -31,12 +31,28 @@ struct Bucket {
 pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 use std::sync::Arc;
 
+/// Shard count for the bucket map: one global Mutex per check() serializes
+/// all 4+ workers at 60K+ RPS. 16 shards divide contention with zero
+/// semantic change (buckets are per-key independent; the memory cap splits
+/// evenly — a bound, not a contract).
+const SHARDS: usize = 16;
+
 pub struct Limiter {
     quota: std::sync::RwLock<Quota>,
-    buckets: std::sync::Mutex<HashMap<String, Bucket>>,
+    shards: [std::sync::Mutex<HashMap<String, Bucket>>; SHARDS],
     clock: Clock,
-    /// Memory bound: maximum number of distinct keys.
+    /// Memory bound: maximum number of distinct keys (split over shards).
     cap: usize,
+}
+
+fn shard(key: &str) -> usize {
+    // FNV-1a/64, std-only: placement must be cheap, not cryptographic.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h as usize % SHARDS
 }
 
 impl Limiter {
@@ -45,7 +61,12 @@ impl Limiter {
     }
 
     pub fn with_clock(quota: Quota, clock: Clock) -> Self {
-        Self { quota: std::sync::RwLock::new(quota), buckets: std::sync::Mutex::new(HashMap::new()), clock, cap: 50_000 }
+        Self {
+            quota: std::sync::RwLock::new(quota),
+            shards: std::array::from_fn(|_| std::sync::Mutex::new(HashMap::new())),
+            clock,
+            cap: 50_000,
+        }
     }
 
     /// Hot-reload the numbers without restart (used by /api/admin/reload).
@@ -57,12 +78,20 @@ impl Limiter {
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let quota = *self.quota.read().unwrap();
         let now = (self.clock)();
-        let mut g = self.buckets.lock().unwrap();
+        let mut g = self.shards[shard(key)].lock().unwrap();
         // Lazy eviction: keys idle > 10 min are dropped when a newcomer arrives.
-        if !g.contains_key(key) && g.len() >= self.cap {
+        if !g.contains_key(key) && g.len() >= (self.cap / SHARDS).max(1) {
             g.retain(|_, b| now.duration_since(b.last) < Duration::from_secs(600));
         }
-        let b = g.entry(key.to_string()).or_insert(Bucket { tokens: quota.burst, last: now });
+        // Borrowed lookup first: the hot path (existing key) skips the
+        // String alloc that `entry(key.to_string())` paid unconditionally.
+        let b = match g.get_mut(key) {
+            Some(b) => b,
+            None => {
+                g.insert(key.to_string(), Bucket { tokens: quota.burst, last: now });
+                g.get_mut(key).expect("just inserted")
+            }
+        };
         let elapsed = now.duration_since(b.last).as_secs_f64().max(0.0);
         b.tokens = (b.tokens + elapsed * quota.rate_per_sec).min(quota.burst);
         b.last = now;
