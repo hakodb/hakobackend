@@ -61,6 +61,11 @@ pub struct Args {
     pub tls_cert: Option<String>,
     #[arg(long)]
     pub tls_key: Option<String>,
+    /// Plain-TCP HTTP/2 (h2c, prior knowledge). Default h1 (yesterday's
+    /// behavior). Ignored with a warning under TLS (ALPN already serves
+    /// h2 there). Multiplexing + HPACK for header-heavy API traffic.
+    #[arg(long, default_value_t = false)]
+    pub http2: bool,
     /// Check config + rules + auth without starting the server.
     #[arg(long)]
     pub validate: bool,
@@ -104,6 +109,8 @@ pub struct UbConfig {
     pub benchmark: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    /// Plain-TCP HTTP/2 (boot-time like listeners; hot-reload ignores it).
+    pub http2: bool,
     /// Ready-to-use index declarations (created at startup + reload — legacy
     /// autoCreateTablesFromRules pattern, extended to indexes).
     pub indexes: Vec<IndexDecl>,
@@ -206,6 +213,9 @@ struct FileConfig {
     trust_proxy: Option<bool>,
     tls_cert: Option<String>,
     tls_key: Option<String>,
+    /// Plain-TCP HTTP/2 (flag `--http2` wins when set).
+    #[serde(default)]
+    http2: bool,
     #[serde(default)]
     coalesce_writes: bool,
     /// Stage profiler (flag `--wstats` wins when set).
@@ -344,6 +354,7 @@ pub fn resolve(args: &Args) -> UbConfig {
         benchmark: args.benchmark || file.benchmark,
         tls_cert: args.tls_cert.clone().or(file.tls_cert),
         tls_key: args.tls_key.clone().or(file.tls_key),
+        http2: args.http2 || file.http2,
         indexes: file.indexes,
         service_keys: {
             let mut keys = file.service.keys;
@@ -458,6 +469,11 @@ limit_auth_burst = 5
 # Changing it needs a restart (not hot-reloaded).
 # sock = "/run/hakobackend/hako.sock"
 
+# Plain-TCP HTTP/2 (h2c, prior knowledge; default h1 = unchanged). Same app;
+# multiplexing + HPACK helps header-heavy API traffic (Bearer JWTs). Ignored
+# under TLS (ALPN already serves h2 there). Changing it needs a restart.
+# http2 = false
+
 # Loopback service key for a co-hosted consumer without user identity
 # (e.g. sibling service reading ai_configs). Static Bearer, accepted ONLY
 # from 127.0.0.1/::1 (socket peer, not X-Forwarded-For). Empty = off.
@@ -490,6 +506,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             sock: None,
+            http2: false,
             validate: false,
             print_default_config: false,
             coalesce_writes: false,
@@ -544,6 +561,17 @@ mod tests {
         // Flag wins over file.
         a.sock = Some("/tmp/hako-flag.sock".into());
         assert_eq!(resolve(&a).sock.as_deref(), Some("/tmp/hako-flag.sock"));
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn http2_opsional_default_h1() {
+        // Absent = h1 (zero behavior change).
+        assert!(!resolve(&args()).http2);
+        let f = write_tmp("hakobackend_h2_test.toml", "http2 = true\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert!(resolve(&a).http2);
         let _ = std::fs::remove_file(f);
     }
 

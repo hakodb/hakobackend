@@ -58,6 +58,12 @@ limit_auth_burst = 5
 # Unix-only: a Windows build refuses to start with sock set.
 # sock = "/run/hakobackend/hako.sock"
 
+# Plain-TCP HTTP/2 (h2c, prior knowledge; default h1 = unchanged). Same app;
+# multiplexing + HPACK helps header-heavy API traffic (Bearer JWTs). Ignored
+# under TLS (ALPN already serves h2 there). Unix-only? No — works on Windows
+# too (pure TCP). Changing it needs a restart.
+# http2 = false
+
 # Loopback service key: co-hosted consumer without user identity (e.g. a
 # sibling service reading ai_configs under deny/deny). Static Bearer honored
 # ONLY from 127.0.0.1/::1 (socket peer — spoof-proof behind nginx).

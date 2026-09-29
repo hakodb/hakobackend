@@ -1,6 +1,6 @@
 [package]
 name = "hakobackend-server"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 
 [dependencies]
@@ -27,6 +27,12 @@ clap = { workspace = true }
 sha2 = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
+# h2c only (plain-TCP HTTP/2): hyper speaks the frames, a 25-line glue
+# adapts Incoming to the Router (no hyper-util service glue needed).
+# Same versions as the tree — feature unification only.
+hyper = { version = "1", default-features = false, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio-stream = { workspace = true }
 mime = { workspace = true }
 

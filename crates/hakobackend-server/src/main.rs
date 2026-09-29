@@ -143,6 +143,65 @@ impl Listener for UdsListener {
     }
 }
 
+/// h2c glue: hyper speaks `Request<Incoming>`, the Router wants
+/// `Request<axum Body>`. One map step (plus the ConnectInfo insert the
+/// axum path gets from into_make_service_with_connect_info).
+#[derive(Clone)]
+struct H2Svc {
+    inner: Router,
+    peer: std::net::SocketAddr,
+}
+
+impl hyper::service::Service<Request<hyper::body::Incoming>> for H2Svc {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
+        let inner = self.inner.clone();
+        let peer = self.peer;
+        Box::pin(async move {
+            let (mut parts, body) = req.into_parts();
+            parts.extensions.insert(ConnectInfo(peer));
+            let req = Request::from_parts(parts, axum::body::Body::new(body));
+            tower::ServiceExt::oneshot(inner, req).await
+        })
+    }
+}
+
+/// Plain-TCP HTTP/2 (h2c, prior knowledge): accept loop + one h2
+/// connection task per socket, drained on shutdown like the other
+/// listeners. Same Router (same middleware, policy, auth) — only the
+/// framing changes, so responses are byte-identical to h1.
+async fn serve_h2c(
+    listener: tokio::net::TcpListener,
+    app: Router,
+) -> Result<(), String> {
+    let mut conns = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_signal() => break,
+            res = listener.accept() => {
+                let (stream, peer) = res.map_err(|e| format!("[ub] h2c accept: {e}"))?;
+                let svc = H2Svc { inner: app.clone(), peer };
+                conns.spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        }
+    }
+    while conns.join_next().await.is_some() {}
+    Ok(())
+}
+
 /// Shared shutdown trigger (Ctrl+C / SIGTERM): one instance per server
 /// so the TCP and unix listeners drain on the same signal independently.
 async fn shutdown_signal() {
@@ -518,8 +577,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_signal().await;
     };
     // ConnectInfo required so the rate-limit key = real peer IP.
-    let svc = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // (One boot-time clone: the h2c branch below needs the Router itself.)
+    let svc = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
     if tls {
+        if cfg.http2 {
+            eprintln!("[ub] WARN: http2 flag ignored under TLS (ALPN already serves h2 there)");
+        }
         // rustls 0.23 + two providers in the tree (aws-lc + ring) = ambiguous;
         // pin aws-lc explicitly once at startup (idempotent).
         let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
@@ -540,8 +603,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     } else {
         let listener = tokio::net::TcpListener::bind(&addr).await?;
-        println!("[ub] listening on http://{addr}");
-        axum::serve(listener, svc).with_graceful_shutdown(shutdown).await?;
+        if cfg.http2 {
+            println!("[ub] listening (h2c) on http://{addr}");
+            serve_h2c(listener, app).await?;
+        } else {
+            println!("[ub] listening on http://{addr}");
+            axum::serve(listener, svc).with_graceful_shutdown(shutdown).await?;
+        }
     }
     // Both listeners drain on the same signal; the unix task ends with its
     // own graceful drain, so await it instead of orphaning in-flight locals.
@@ -3175,7 +3243,7 @@ mod tests {
                 limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
-                wstats: false, benchmark: false, sock: None,
+                wstats: false, benchmark: false, sock: None, http2: false,
             }),
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,
