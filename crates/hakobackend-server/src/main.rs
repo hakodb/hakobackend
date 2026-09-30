@@ -1491,11 +1491,27 @@ async fn get_or_list(
 }
 
 fn incoming_doc(id: &str, body: serde_json::Value) -> Doc {
-    let data = match body {
+    let mut data: std::collections::HashMap<String, serde_json::Value> = match body {
         serde_json::Value::Object(m) => m.into_iter().collect(),
         _ => HashMap::new(),
     };
-    Doc { id: id.to_string(), data }
+    // ponytail: honor an explicit body id on create (id == "") — same
+    // validity rule as URL ids — and remove it from data so stored JSON
+    // never carries duplicate id keys (POST storms with one id used to
+    // multiply docs instead of conflicting). Non-empty id (PUT/batch
+    // paths) keeps existing behavior: URL id wins, body untouched.
+    let doc_id = if id.is_empty() {
+        match data.get("id").and_then(|v| v.as_str()).map(|s| s.to_string()) {
+            Some(bid) if hakobackend_core::valid_doc_id(&bid) => {
+                data.remove("id");
+                bid
+            }
+            _ => id.to_string(),
+        }
+    } else {
+        id.to_string()
+    };
+    Doc { id: doc_id, data }
 }
 
 // --- Index (HTTP_CONTRACT.md §index): manage simple/composite/FTS ---
@@ -2908,8 +2924,23 @@ mod tests {
     }
 
     #[test]
-    fn shim_legacy_index() {        assert_eq!(legacy_index_collection("posts/index").as_deref(), Some("posts"));
-        assert_eq!(
+    fn incoming_doc_honors_explicit_body_id() {
+        // create() passes "": a valid body id becomes the primary id and
+        // leaves data (no duplicate id keys downstream).
+        let d = incoming_doc("", serde_json::json!({"id": "k1", "v": 1}));
+        assert_eq!(d.id, "k1");
+        assert!(!d.data.contains_key("id"));
+        // Invalid body id: fall back to generated (lenient, no new 400).
+        let d = incoming_doc("", serde_json::json!({"id": "", "v": 1}));
+        assert!(d.id.is_empty());
+        // Non-empty id (PUT/batch paths): body id never overrides.
+        let d = incoming_doc("url-id", serde_json::json!({"id": "body-id"}));
+        assert_eq!(d.id, "url-id");
+    }
+
+    #[test]
+    fn shim_legacy_index() {
+        assert_eq!(legacy_index_collection("posts/index").as_deref(), Some("posts"));        assert_eq!(
             legacy_index_collection("/posts/p1/revisions/index/").as_deref(),
             Some("posts/p1/revisions")
         );
