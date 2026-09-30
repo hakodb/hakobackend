@@ -1111,7 +1111,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         assert!(found.is_some(), "replica converges");
-        assert_eq!(b.sync_peer_count(), 2);
+        // One connection, counted on both sides (dialer + accepter).
+        for _ in 0..100 {
+            if a.sync_peer_count() + b.sync_peer_count() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(a.sync_peer_count() + b.sync_peer_count(), 2);
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&sockdir);
