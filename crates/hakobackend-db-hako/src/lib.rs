@@ -154,6 +154,13 @@ impl HakoDb {
                     match sync_clone.dial(&path).await {
                         Ok(_) => {
                             logged = false;
+                            // ponytail: dial returns after spawning the
+                            // handler, BEFORE the Hello registers the peer.
+                            // Re-checking immediately would stack duplicate
+                            // connections on slow peers — wait one steady
+                            // tick first (a transient double is echo-safe,
+                            // a tight loop is not).
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                         Err(e) => {
                             // Log the first failure per outage only — a
