@@ -58,6 +58,17 @@ impl HakoDb {
         Ok(this)
     }
 
+    /// Flush all shards to disk (WAL + segments). Sync engine call —
+    /// run off the async worker like the other driver ops.
+    pub async fn flush(&self) -> Result<(), AppError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            inner.flush().map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
     /// Socket_sync peering (hako driver only, unix only). Serve this
     /// instance and/or dial peers; dials retry in the background until
     /// peered, so boot order doesn't matter and peer restarts self-heal
