@@ -1091,7 +1091,10 @@ mod tests {
 
         let a = HakoDb::open(dir_a.to_string_lossy().as_ref()).unwrap();
         let b = HakoDb::open(dir_b.to_string_lossy().as_ref()).unwrap();
-        a.enable_socket_sync(Some(sa.clone()), vec![sb.clone()]).await.unwrap();
+        // One dial direction only (b -> a): traffic is bidirectional per
+        // connection, and b's retry loop self-heals boot order plus either
+        // side restarting. Mutual dialing would just double the streams.
+        a.enable_socket_sync(Some(sa.clone()), vec![]).await.unwrap();
         b.enable_socket_sync(Some(sb.clone()), vec![sa.clone()]).await.unwrap();
 
         a.set("c", "k1", hakobackend_core::Doc { id: "k1".into(), data: Default::default() }, false)
