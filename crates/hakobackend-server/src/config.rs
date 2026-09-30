@@ -36,6 +36,16 @@ pub struct Args {
     /// Unix-only: a Windows build fails closed when it is set.
     #[arg(long)]
     pub sock: Option<String>,
+    /// Hako socket_sync: serve this instance on a unix socket so peers can
+    /// replicate from it (absent = no serving). Unix-only: fails closed at
+    /// startup when set on other platforms.
+    #[arg(long)]
+    pub sync_serve: Option<String>,
+    /// Hako socket_sync peers to dial (repeatable flag; appended to the
+    /// file list). Dial retries in the background until peered — boot
+    /// order independent, and self-heals across peer restarts.
+    #[arg(long)]
+    pub sync_peer: Vec<String>,
     /// Admin UIDs allowed to call /api/admin/* (repeatable flag;
     /// single-user backend uses UIDs, not roles).
     #[arg(long)]
@@ -98,6 +108,10 @@ pub struct UbConfig {
     /// Unix socket path (None = TCP only). Hot-reload ignores it (listener
     /// shape is boot-time; changing it needs a restart, unlike rules/auth).
     pub sock: Option<String>,
+    /// Socket_sync serve path (None = not serving). Boot-time like sock.
+    pub sync_serve: Option<String>,
+    /// Socket_sync dial peers (empty = dial none; pure serve is valid).
+    pub sync_peer: Vec<String>,
     pub public_url: Option<String>,
     pub limit_global: (u32, u32),
     pub limit_auth: (u32, u32),
@@ -203,6 +217,9 @@ struct FileConfig {
     rules: Option<String>,
     auth: Option<String>,
     sock: Option<String>,
+    sync_serve: Option<String>,
+    #[serde(default)]
+    sync_peer: Vec<String>,
     #[serde(default)]
     admin_uids: Vec<String>,
     public_url: Option<String>,
@@ -334,6 +351,14 @@ pub fn resolve(args: &Args) -> UbConfig {
             .or(file.database.policy_file),
         auth: args.auth.clone().or(file.auth),
         sock: args.sock.clone().or(file.sock),
+        sync_serve: args.sync_serve.clone().or(file.sync_serve),
+        sync_peer: {
+            // ponytail: peers append (file base + flag extras), serve
+            // replaces — you dial a SET but serve ONE socket.
+            let mut v = file.sync_peer;
+            v.extend(args.sync_peer.clone());
+            v
+        },
         admin_uids: {
             let mut v = file.admin_uids;
             v.extend(args.admin_uids.clone());
@@ -469,6 +494,15 @@ limit_auth_burst = 5
 # Changing it needs a restart (not hot-reloaded).
 # sock = "/run/hakobackend/hako.sock"
 
+# Hako socket_sync peering (hako driver ONLY; other drivers refuse these
+# keys at startup). Serve this instance and/or dial peers over unix
+# sockets so N backends hold identical data (LWW converge, echo-safe).
+# Dials retry in the background: boot order free, peer restarts self-heal.
+# Absent = standalone (yesterday's default). Unix-only: a Windows build
+# refuses to start with either set. Changing needs a restart.
+# sync_serve = "/run/hakobackend/sync1.sock"
+# sync_peer = ["/run/hakobackend/sync2.sock"]
+
 # Plain-TCP HTTP/2 (h2c, prior knowledge; default h1 = unchanged). Same app;
 # multiplexing + HPACK helps header-heavy API traffic (Bearer JWTs). Ignored
 # under TLS (ALPN already serves h2 there). Changing it needs a restart.
@@ -506,6 +540,8 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             sock: None,
+            sync_serve: None,
+            sync_peer: vec![],
             http2: false,
             validate: false,
             print_default_config: false,

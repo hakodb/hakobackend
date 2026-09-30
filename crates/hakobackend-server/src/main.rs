@@ -356,17 +356,40 @@ fn mtime(path: &str) -> Option<SystemTime> {
 
 /// The only place that knows the driver list. New driver = 1 new arm.
 /// Unimplemented drivers return a clear message, not a panic.
-async fn open_driver(driver: &str, path: &str) -> Result<Arc<dyn Database>, String> {
+async fn open_driver(
+    driver: &str,
+    path: &str,
+    sync_serve: Option<String>,
+    sync_peer: Vec<String>,
+) -> Result<Arc<dyn Database>, String> {
     use hakobackend_core::ttl::TtlDb;
     // Every driver is wrapped once: TTL expiry filters uniformly, and the
     // sweeper below owns the wrapped handle (reload swaps it too).
     let db: Arc<dyn Database> = match driver {
-        "hako" => HakoDb::open(path).map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
-        "postgres" => PgDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
-        "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
-        "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
-        // Spike: compiles + maps the trait; live conformance pending a server.
-        "rethinkdb" => RethinkDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+        "hako" => {
+            // ponytail: socket_sync lives ONLY in the hako arm (sync is
+            // per hako driver — other drivers fail closed below). A
+            // hakocluster driver comes later; it does not belong here.
+            let hako = HakoDb::open(path).map_err(|e| e.to_string())?;
+            hako
+                .enable_socket_sync(sync_serve, sync_peer)
+                .await
+                .map_err(|e| e.to_string())?;
+            Arc::new(TtlDb::new(hako)) as Arc<dyn Database>
+        }
+        "postgres" | "sqlite" | "mysql" | "rethinkdb" => {
+            if sync_serve.is_some() || !sync_peer.is_empty() {
+                return Err("sync_serve/sync_peer need driver `hako`".into());
+            }
+            match driver {
+                "postgres" => PgDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+                "sqlite" => SqliteDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+                "mysql" => MysqlDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+                // Spike: compiles + maps the trait; live conformance pending a server.
+                "rethinkdb" => RethinkDb::open(path).await.map(|db| Arc::new(TtlDb::new(db)) as Arc<dyn Database>).map_err(|e| e.to_string())?,
+                _ => unreachable!("outer match guards driver names"),
+            }
+        }
         other => {
             return Err(format!(
                 "driver `{other}` not available yet. Available choices: {}.",
@@ -397,7 +420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => Err(e.into()),
         };
     }
-    let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data).await.expect("open database");
+    let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await.expect("open database");
     println!("[ub] driver={} data={} config={}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source });
     // Flags are read here: `cli` moves into AppState below.
     let wstats_flag = cli.wstats;
@@ -1052,7 +1075,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
             std::env::set_var("UB_PUBLIC_URL", p);
         }
     }
-    let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data).await {
+    let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await {
         Ok(db) => db,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
@@ -3275,6 +3298,7 @@ mod tests {
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
                 wstats: false, benchmark: false, sock: None, http2: false,
+                sync_serve: None, sync_peer: vec![],
             }),
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,

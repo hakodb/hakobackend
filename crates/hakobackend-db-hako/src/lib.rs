@@ -15,6 +15,10 @@ pub struct HakoDb {
     /// Unique-enforced fields per collection (from `create_index(unique)`).
     /// std mutex: read inside spawn_blocking threads where await is illegal.
     unique: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Socket_sync peering (hako driver only): held so serve/dial tasks
+    /// outlive enablement. None = yesterday's standalone default.
+    #[cfg(unix)]
+    sync: std::sync::Mutex<Option<std::sync::Arc<hakodb::socket_sync::SocketSync>>>,
 }
 
 /// Schema registry + unique shadows live here (covered by the `__*` HTTP
@@ -47,9 +51,114 @@ impl HakoDb {
             inner: Arc::new(db),
             channels: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             unique: std::sync::Mutex::new(std::collections::HashMap::new()),
+            #[cfg(unix)]
+            sync: std::sync::Mutex::new(None),
         };
         this.load_unique_registry();
         Ok(this)
+    }
+
+    /// Socket_sync peering (hako driver only, unix only). Serve this
+    /// instance and/or dial peers; dials retry in the background until
+    /// peered, so boot order doesn't matter and peer restarts self-heal
+    /// (snapshot on connect covers the gap via LWW). No serve + no peers
+    /// = Ok no-op. Non-unix with any sync config = Err (fail closed).
+    pub async fn enable_socket_sync(
+        &self,
+        serve: Option<String>,
+        peers: Vec<String>,
+    ) -> Result<(), AppError> {
+        #[cfg(not(unix))]
+        {
+            let _ = serve;
+            let _ = peers;
+            if serve.is_some() || !peers.is_empty() {
+                return Err(AppError::Internal("socket_sync is unix-only".into()));
+            }
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            self.enable_socket_sync_unix(serve, peers).await
+        }
+    }
+
+    /// Live socket peering count (0 when disabled or off-unix).
+    pub fn sync_peer_count(&self) -> usize {
+        #[cfg(unix)]
+        {
+            return self
+                .sync
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| s.peer_count())
+                .unwrap_or(0);
+        }
+        #[cfg(not(unix))]
+        {
+            return 0;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn enable_socket_sync_unix(
+        &self,
+        serve: Option<String>,
+        peers: Vec<String>,
+    ) -> Result<(), AppError> {
+        use hakodb::socket_sync::SocketSync;
+        // Swap semantics: stop a previous peering before replacing (reload
+        // calls enable again — no duplicate dial tasks).
+        if let Some(old) = self.sync.lock().unwrap().take() {
+            old.stop();
+        }
+        if serve.is_none() && peers.is_empty() {
+            return Ok(());
+        }
+        let sync = std::sync::Arc::new(SocketSync::new(self.inner.clone(), vec![]));
+        if let Some(path) = serve.as_deref() {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| AppError::Internal(format!("sync_serve dir: {e}")))?;
+                }
+            }
+            sync.serve(path)
+                .map_err(|e| AppError::Internal(format!("sync_serve {path}: {e}")))?;
+        }
+        for peer in &peers {
+            let sync_clone = sync.clone();
+            let path = peer.clone();
+            // ponytail: background retry, not boot-blocking. Snapshot on
+            // connect backfills any gap; the loop also heals peer restarts
+            // (peer_count 0 = dial again every 5s).
+            tokio::spawn(async move {
+                let mut logged = false;
+                loop {
+                    if sync_clone.peer_count() > 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    match sync_clone.dial(&path).await {
+                        Ok(_) => {
+                            logged = false;
+                        }
+                        Err(e) => {
+                            // Log the first failure per outage only — a
+                            // typo'd path still surfaces, without spam.
+                            if !logged {
+                                eprintln!("[ub] socket_sync dial {path} failed: {e} (retrying)");
+                                logged = true;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+        }
+        *self.sync.lock().unwrap() = Some(sync);
+        Ok(())
     }
 
     /// Best-effort load of persisted unique declarations (fresh DB: none).
