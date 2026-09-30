@@ -565,6 +565,34 @@ mod tests {
     }
 
     #[test]
+    fn sync_opsional_file_dan_flag() {
+        // Absent = no peering (yesterday's default).
+        let cfg = resolve(&args());
+        assert_eq!(cfg.sync_serve, None);
+        assert!(cfg.sync_peer.is_empty());
+        // File sets both.
+        let f = write_tmp(
+            "hakobackend_sync_test.toml",
+            "sync_serve = \"/tmp/s1.sock\"\nsync_peer = [\"/tmp/s2.sock\"]\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert_eq!(cfg.sync_serve.as_deref(), Some("/tmp/s1.sock"));
+        assert_eq!(cfg.sync_peer, vec!["/tmp/s2.sock".to_string()]);
+        // Flags win over file (peers append).
+        a.sync_serve = Some("/tmp/flag.sock".into());
+        a.sync_peer = vec!["/tmp/s3.sock".into()];
+        let cfg = resolve(&a);
+        assert_eq!(cfg.sync_serve.as_deref(), Some("/tmp/flag.sock"));
+        assert_eq!(
+            cfg.sync_peer,
+            vec!["/tmp/s2.sock".to_string(), "/tmp/s3.sock".to_string()]
+        );
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
     fn http2_opsional_default_h1() {
         // Absent = h1 (zero behavior change).
         assert!(!resolve(&args()).http2);

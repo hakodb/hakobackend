@@ -940,4 +940,57 @@ mod tests {
         hakobackend_core::conformance::run_index_suite(&db).await;
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// No-op contract: no serve path + no peers = Ok everywhere (yesterday's
+    /// default; peering is strictly opt-in).
+    #[tokio::test]
+    async fn socket_sync_noop_without_config() {
+        let dir = std::env::temp_dir().join(format!("hakobackend_snoop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        db.enable_socket_sync(None, vec![]).await.unwrap();
+        assert_eq!(db.sync_peer_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Driver-level peering (unix-only): serve + dial over socket_sync,
+    /// write on one side, read on the other. Mirrors the engine guarantee
+    /// at the driver boundary (put/get, not internals).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_sync_peers_two_drivers() {
+        let dir_a = std::env::temp_dir().join(format!("hakobackend_sA_{}", std::process::id()));
+        let dir_b = std::env::temp_dir().join(format!("hakobackend_sB_{}", std::process::id()));
+        let sockdir = std::env::temp_dir().join(format!("hakobackend_ss_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&sockdir);
+        std::fs::create_dir_all(&sockdir).unwrap();
+        let sa = sockdir.join("a.sock").to_string_lossy().into_owned();
+        let sb = sockdir.join("b.sock").to_string_lossy().into_owned();
+
+        let a = HakoDb::open(dir_a.to_string_lossy().as_ref()).unwrap();
+        let b = HakoDb::open(dir_b.to_string_lossy().as_ref()).unwrap();
+        a.enable_socket_sync(Some(sa.clone()), vec![sb.clone()]).await.unwrap();
+        b.enable_socket_sync(Some(sb.clone()), vec![sa.clone()]).await.unwrap();
+
+        a.set("c", "k1", hakobackend_core::Doc { id: "k1".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        a.flush().await.unwrap();
+        // Snapshot/live tail converges (replica trails by <= tail interval).
+        let mut found = None;
+        for _ in 0..100 {
+            if let Ok(Some(doc)) = b.get("c", "k1").await {
+                found = Some(doc);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(found.is_some(), "replica converges");
+        assert_eq!(b.sync_peer_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+        let _ = std::fs::remove_dir_all(&sockdir);
+    }
 }
