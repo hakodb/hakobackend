@@ -1475,9 +1475,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.8.30"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d42030fd3660cf0948bdec0a26a213bd592f0477f5a3ae24aaf43b47008d72b"
+checksum = "2d4c3455d45b8147f3deaa27885bf154968148116015f6a3a79b1b38d464cf42"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -1488,6 +1488,7 @@ dependencies = [
  "fxhash",
  "gethostname",
  "hashbrown 0.14.5",
+ "itoa",
  "local-ip-address",
  "mdns-sd",
  "memmap2",
