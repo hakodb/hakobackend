@@ -222,6 +222,9 @@ impl IndexDecl {
 }
 
 impl UbConfig {
+    /// First listen address, for display/diagnostics.
+    /// (Serving binds every resolved address — see resolve_bind_ips.)
+    #[cfg(test)]
     pub fn listen(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
