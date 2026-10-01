@@ -888,16 +888,22 @@ fn host_allowed(allowed: &[String], host: Option<&str>) -> bool {
     }
 }
 
+/// Host source that works on both transports: h1 carries a Host header,
+/// h2 carries :authority (hyper does NOT synthesize a Host header for
+/// h2 — headers alone would 421 every h2 request).
+fn request_host(req: &Request) -> Option<&str> {
+    req.headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| req.uri().authority().map(|a| a.as_str()))
+}
+
 async fn host_mw(
     State(allowed): State<Arc<Vec<String>>>,
     req: Request,
     next: Next,
 ) -> Response {
-    let host = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok());
-    if host_allowed(&allowed, host) {
+    if host_allowed(&allowed, request_host(&req)) {
         next.run(req).await
     } else {
         // ponytail: cheapest correct refusal — empty 421 + close, no JSON
@@ -3092,6 +3098,29 @@ mod tests {
         assert!(!host_allowed(&allowed, Some("evil.example")));
         assert!(!host_allowed(&allowed, Some("other.internal:9")));
         assert!(!host_allowed(&allowed, None));
+    }
+
+    #[test]
+    fn request_host_prefers_header_falls_back_to_authority() {
+        // h1 shape: Host header wins.
+        let req = Request::builder()
+            .uri("https://127.0.0.1:3005/api/ready")
+            .header(header::HOST, "evil.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&req), Some("evil.example"));
+        // h2 shape: no Host header, :authority from the URI.
+        let req = Request::builder()
+            .uri("https://api.chemedu.site:3005/api/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&req), Some("api.chemedu.site:3005"));
+        // Neither: refuse path (host_allowed handles).
+        let req = Request::builder()
+            .uri("/api/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(request_host(&req), None);
     }
 
     #[test]
