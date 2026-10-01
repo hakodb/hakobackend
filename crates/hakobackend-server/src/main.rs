@@ -516,12 +516,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/health", get(health))
         .route("/api/ready", get(ready));
     // ponytail: host gate wraps api + auth only (health/ready in `open`
-    // stay ungated). Layered after merge = runs before limit/auth, so
-    // off-domain traffic dies before any accounting.
+    // stay ungated). host_mw is outermost (added last): off-domain
+    // traffic dies before CORS/limit/auth do any work. Legit preflights
+    // pass the gate, then cors_mw attaches headers / short-circuits 204.
     let hosts = Arc::new(cfg.allowed_hosts.clone());
     let gated = Router::new()
         .merge(api)
         .merge(auth_routes)
+        .layer(middleware::from_fn(cors_mw))
         .layer(middleware::from_fn_with_state(hosts, host_mw));
     let mut app = Router::new()
         .route("/api/__wstats", get(wstats_dump))
@@ -909,6 +911,61 @@ async fn host_mw(
         )
             .into_response()
     }
+}
+
+/// CORS parity with the nginx edge this replaces (map $http_origin):
+/// echo any http(s) Origin + credentials. Pure + tested; the middleware
+/// applies it to responses and short-circuits preflights with 204.
+fn cors_headers(origin: Option<&str>) -> Option<HeaderMap> {
+    let o = origin?;
+    if !(o.starts_with("http://") || o.starts_with("https://")) {
+        return None;
+    }
+    let mut h = HeaderMap::new();
+    // ponytail: typed insertions (no parse() fallibility); origin is
+    // echoed verbatim like nginx did — validated prefix above is the
+    // whole check, same as the nginx map.
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        header::HeaderValue::from_str(o).ok()?,
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        header::HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS, PATCH"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        header::HeaderValue::from_static("Authorization, Content-Type, Accept, Origin, X-Requested-With"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        header::HeaderValue::from_static("true"),
+    );
+    // Strictly better than the nginx edge (which omitted it): caches must
+    // key on Origin or one site's CORS headers poison another's.
+    h.insert(header::VARY, header::HeaderValue::from_static("Origin"));
+    Some(h)
+}
+
+async fn cors_mw(req: Request, next: Next) -> Response {
+    let headers = cors_headers(
+        req.headers()
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+    );
+    if req.method() == axum::http::Method::OPTIONS {
+        // Preflight short-circuit (nginx returned 204 the same way).
+        let mut resp = StatusCode::NO_CONTENT.into_response();
+        if let Some(h) = headers {
+            resp.headers_mut().extend(h);
+        }
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    if let Some(h) = headers {
+        resp.headers_mut().extend(h);
+    }
+    resp
 }
 
 /// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
@@ -3035,6 +3092,26 @@ mod tests {
         assert!(!host_allowed(&allowed, Some("evil.example")));
         assert!(!host_allowed(&allowed, Some("other.internal:9")));
         assert!(!host_allowed(&allowed, None));
+    }
+
+    #[test]
+    fn cors_echoes_http_origins_only() {
+        // Mirrors the nginx map it replaces: echo any http(s) Origin.
+        let h = cors_headers(Some("https://app.chemedu.site")).unwrap();
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
+            "https://app.chemedu.site"
+        );
+        assert_eq!(
+            h.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(),
+            "true"
+        );
+        assert!(h.contains_key(header::VARY));
+        assert!(cors_headers(Some("http://localhost:3000")).is_some());
+        // Non-http, null, missing = no CORS headers.
+        assert!(cors_headers(Some("ftp://x")).is_none());
+        assert!(cors_headers(Some("null")).is_none());
+        assert!(cors_headers(None).is_none());
     }
 
     #[test]
