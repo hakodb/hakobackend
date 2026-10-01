@@ -114,6 +114,10 @@ pub struct UbConfig {
     /// Unix socket path (None = TCP only). Hot-reload ignores it (listener
     /// shape is boot-time; changing it needs a restart, unlike rules/auth).
     pub sock: Option<String>,
+    /// Plain-HTTP loopback companion (file-only, no flag): with TLS on and
+    /// the TLS bind outside loopback, also serve plaintext on
+    /// 127.0.0.1:<same port>. Default true. Boot-time like listeners.
+    pub plain_loopback: bool,
     /// Host allowlist, same semantics as the flag. Set in config like
     /// listen/bind (file base + flag extras). Empty = off.
     pub allowed_hosts: Vec<String>,
@@ -144,6 +148,11 @@ pub struct UbConfig {
     pub service_allow: Vec<String>,
     /// Which file it came from (for /api/admin/reload); "" when pure default+flags.
     pub source: String,
+}
+
+/// Default for `plain_loopback` (serde default fn): on unless opted out.
+fn default_plain_loopback() -> bool {
+    true
 }
 
 /// Loopback service key for co-hosted consumers (no user identity):
@@ -227,6 +236,9 @@ struct FileConfig {
     rules: Option<String>,
     auth: Option<String>,
     sock: Option<String>,
+    /// Plain-HTTP loopback companion (default true when absent).
+    #[serde(default = "default_plain_loopback")]
+    plain_loopback: bool,
     #[serde(default)]
     allowed_hosts: Vec<String>,
     sync_serve: Option<String>,
@@ -363,6 +375,7 @@ pub fn resolve(args: &Args) -> UbConfig {
             .or(file.database.policy_file),
         auth: args.auth.clone().or(file.auth),
         sock: args.sock.clone().or(file.sock),
+        plain_loopback: file.plain_loopback,
         allowed_hosts: {
             // File base + flag extras (same append idiom as peers).
             let mut v = file.allowed_hosts;
@@ -511,6 +524,13 @@ limit_auth_burst = 5
 # a Windows build refuses to start with sock set (no silent half-config).
 # Changing it needs a restart (not hot-reloaded).
 # sock = "/run/hakobackend/hako.sock"
+
+# Plain-HTTP loopback companion (file-only, default true): with TLS on and
+# the TLS bind outside loopback, plaintext is also served on
+# 127.0.0.1:<same port> — testing, debugging, local microservices and
+# reverse proxies with no cert flags. Loopback-only by construction, same
+# app and gates. `plain_loopback = false` disables.
+# plain_loopback = true
 
 # Domain designation: serve ONLY these Host values (plus loopback, which
 # always passes). Anything else is refused with 421 before limiter/auth.

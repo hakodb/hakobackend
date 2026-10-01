@@ -611,6 +611,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ConnectInfo required so the rate-limit key = real peer IP.
     // (One boot-time clone: the h2c branch below needs the Router itself.)
     let svc = app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // Plain-loopback companion handle (spawned in the TLS branch below,
+    // joined with uds at the end).
+    let mut plain_handle: Option<tokio::task::JoinHandle<()>> = None;
     if tls {
         if cfg.http2 {
             eprintln!("[ub] WARN: http2 flag ignored under TLS (ALPN already serves h2 there)");
@@ -623,6 +626,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map_err(|e| format!("[ub] TLS failed to load: {e}"))?;
         println!("[ub] listening (TLS) on https://{addr}");
+        // Plain-HTTP loopback companion (see plain_companion_addr): same
+        // app, loopback-only, same graceful drain. Spawned (not awaited)
+        // so both listeners run together; joined with uds below.
+        plain_handle =
+            if let Some(paddr) = plain_companion_addr(true, cfg.plain_loopback, &cfg.host, cfg.port) {
+                let plistener = tokio::net::TcpListener::bind(paddr).await.map_err(|e| {
+                    format!("[ub] cannot bind plain loopback {paddr}: {e}")
+                })?;
+                println!("[ub] listening (plain loopback) on http://{paddr}");
+                let plain_svc =
+                    app.clone().into_make_service_with_connect_info::<std::net::SocketAddr>();
+                Some(tokio::spawn(async move {
+                    if let Err(e) = axum::serve(plistener, plain_svc)
+                        .with_graceful_shutdown(shutdown_signal())
+                        .await
+                    {
+                        eprintln!("[ub] plain loopback serve error: {e}");
+                    }
+                }))
+            } else {
+                None
+            };
         let handle = axum_server::Handle::new();
         let drain = handle.clone();
         tokio::spawn(async move {
@@ -646,6 +671,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Both listeners drain on the same signal; the unix task ends with its
     // own graceful drain, so await it instead of orphaning in-flight locals.
     if let Some(h) = uds_handle {
+        let _ = h.await;
+    }
+    if let Some(h) = plain_handle {
         let _ = h.await;
     }
     Ok(())
@@ -972,6 +1000,28 @@ async fn cors_mw(req: Request, next: Next) -> Response {
         resp.headers_mut().extend(h);
     }
     resp
+}
+
+/// Plain-HTTP loopback companion address: when TLS is on and the TLS
+/// bind does NOT already cover loopback, also serve plaintext on
+/// 127.0.0.1:<same port> (testing, debugging, local microservices and
+/// reverse proxies — no cert flags needed on loopback). None = no
+/// companion: TLS off already serves plain wherever it binds, a
+/// loopback-covering TLS bind would conflict, or plain_loopback = false.
+/// Loopback-only by construction (never 0.0.0.0), same app + same gates.
+fn plain_companion_addr(
+    tls: bool,
+    plain_loopback: bool,
+    host: &str,
+    port: u16,
+) -> Option<std::net::SocketAddr> {
+    if !tls || !plain_loopback {
+        return None;
+    }
+    match host {
+        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0" | "::" => None,
+        _ => format!("127.0.0.1:{port}").parse().ok(),
+    }
 }
 
 /// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
@@ -3121,6 +3171,28 @@ mod tests {
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(request_host(&req), None);
+    }
+
+    #[test]
+    fn plain_companion_only_when_tls_leaves_loopback_plain() {
+        use std::net::SocketAddr;
+        // TLS off: plain is already served wherever it binds — no companion.
+        assert_eq!(plain_companion_addr(false, true, "0.0.0.0", 3005), None);
+        // Opted out: none even with TLS on a public IP.
+        assert_eq!(
+            plain_companion_addr(true, false, "203.24.51.237", 3005),
+            None
+        );
+        // TLS bind covers loopback (wildcard/loopback hosts): companion
+        // would conflict or duplicate — none, with no error.
+        for h in ["0.0.0.0", "::", "127.0.0.1", "localhost", "::1"] {
+            assert_eq!(plain_companion_addr(true, true, h, 3005), None, "host={h}");
+        }
+        // TLS on a public IP: plain companion on loopback, same port.
+        assert_eq!(
+            plain_companion_addr(true, true, "203.24.51.237", 3010),
+            Some("127.0.0.1:3010".parse::<SocketAddr>().unwrap())
+        );
     }
 
     #[test]
