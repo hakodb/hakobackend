@@ -565,9 +565,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("[ub] {e}"))?;
     let mut listeners = Vec::with_capacity(bind_ips.len());
     for ip in &bind_ips {
-        let a: std::net::SocketAddr = format!("{ip}:{}", cfg.port)
-            .parse()
-            .map_err(|e| format!("[ub] invalid listen address: {e}"))?;
+        // ponytail: SocketAddr::new, not string formatting — v6 needs
+        // brackets ("[::1]:3999") and format! gets it wrong.
+        let a = std::net::SocketAddr::new(*ip, cfg.port);
         // Pre-bind every address up front: a typo'd IP or occupied port
         // fails boot loudly instead of surfacing inside a spawned task.
         listeners.push(
