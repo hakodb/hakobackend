@@ -141,6 +141,7 @@ pub struct UbConfig {
 /// static Bearer, socket-peer must be loopback, scope copied from config.
 /// Fail-closed: no keys = the whole feature is off.
 #[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ServiceSection {
     #[serde(default)]
     keys: Vec<String>,
@@ -625,6 +626,21 @@ mod tests {
             cfg.sync_peer,
             vec!["/tmp/s2.sock".to_string(), "/tmp/s3.sock".to_string()]
         );
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to parse")]
+    fn unknown_service_key_fails_loud_not_silent() {
+        // Regression: a misplaced key inside [service] (e.g. sync_serve
+        // appended at EOF) used to vanish silently. Explicit configs panic.
+        let f = write_tmp(
+            "hakobackend_svc_typo_test.toml",
+            "[service]\nallow = []\nsync_serve = \"/tmp/x.sock\"\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let _ = resolve(&a);
         let _ = std::fs::remove_file(f);
     }
 

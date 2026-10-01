@@ -370,7 +370,6 @@ async fn open_driver(
             // ponytail: socket_sync lives ONLY in the hako arm (sync is
             // per hako driver — other drivers fail closed below). A
             // hakocluster driver comes later; it does not belong here.
-            eprintln!("[ub] sync config: serve={:?} peers={:?}", sync_serve, sync_peer);
             let hako = HakoDb::open(path).map_err(|e| e.to_string())?;
             hako
                 .enable_socket_sync(sync_serve, sync_peer)
