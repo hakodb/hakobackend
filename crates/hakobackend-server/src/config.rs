@@ -484,6 +484,9 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# universalbackend — config template (see --help for CLI flags).
 # CLI flags always win over this file.
+# host: IP literal binds as-is; a hostname resolves via DNS at startup
+# (unknown names refuse to boot). "0.0.0.0", "127.0.0.1",
+# "api.chemedu.site" all work — generic listen like any other service.
 host = "0.0.0.0"
 port = 3000
 

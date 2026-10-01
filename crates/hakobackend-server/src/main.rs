@@ -555,7 +555,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
-    let addr = cfg.listen();
+    // Hostnames resolve here (IPs bind as-is): generic listen like any
+    // other service — `host` accepts "0.0.0.0", "127.0.0.1",
+    // "api.chemedu.site", ...; DNS failure fails boot, loudly.
+    // Multi-bind: comma-separated hosts (IPs or DNS names), one listener
+    // per resolved address. Fail-closed before serving anything.
+    let bind_ips = resolve_bind_ips(&cfg.host)
+        .await
+        .map_err(|e| format!("[ub] {e}"))?;
+    let mut listeners = Vec::with_capacity(bind_ips.len());
+    for ip in &bind_ips {
+        let a: std::net::SocketAddr = format!("{ip}:{}", cfg.port)
+            .parse()
+            .map_err(|e| format!("[ub] invalid listen address: {e}"))?;
+        // Pre-bind every address up front: a typo'd IP or occupied port
+        // fails boot loudly instead of surfacing inside a spawned task.
+        listeners.push(
+            tokio::net::TcpListener::bind(a)
+                .await
+                .map_err(|e| format!("[ub] cannot bind {a}: {e}"))?,
+        );
+    }
     // Stage profiler: flag/config/env (any one wins), restart to toggle.
     if wstats_flag
         || cfg.wstats
@@ -625,12 +645,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rustls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
             .await
             .map_err(|e| format!("[ub] TLS failed to load: {e}"))?;
-        println!("[ub] listening (TLS) on https://{addr}");
-        // Plain-HTTP loopback companion (see plain_companion_addr): same
+        for a in listeners
+            .iter()
+            .map(|l| l.local_addr().expect("bound listener has addr"))
+        {
+            println!("[ub] listening (TLS) on https://{a}");
+        }
+        // Plain-HTTP loopback companion (see plain_companion_for): same
         // app, loopback-only, same graceful drain. Spawned (not awaited)
         // so both listeners run together; joined with uds below.
         plain_handle =
-            if let Some(paddr) = plain_companion_addr(true, cfg.plain_loopback, &cfg.host, cfg.port) {
+            if let Some(paddr) = plain_companion_for(true, cfg.plain_loopback, &bind_ips, cfg.port) {
                 let plistener = tokio::net::TcpListener::bind(paddr).await.map_err(|e| {
                     format!("[ub] cannot bind plain loopback {paddr}: {e}")
                 })?;
@@ -654,18 +679,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             shutdown.await;
             drain.graceful_shutdown(None);
         });
-        axum_server::bind_rustls(addr.parse().map_err(|e| format!("[ub] invalid listen address: {e}"))?, rustls)
-            .handle(handle)
-            .serve(svc)
-            .await?;
+        // ponytail: spawn-all + join-all (no new deps). All listeners
+        // share one shutdown handle; the first serve error returned after
+        // join fails boot like the old single-listener `?` did.
+        let mut tls_tasks = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let std_listener = listener
+                .into_std()
+                .map_err(|e| format!("[ub] listener into_std: {e}"))?;
+            let h = handle.clone();
+            let r = rustls.clone();
+            let t = svc.clone();
+            tls_tasks.push(tokio::spawn(async move {
+                axum_server::from_tcp_rustls(std_listener, r)
+                    .handle(h)
+                    .serve(t)
+                    .await
+            }));
+        }
+        for t in tls_tasks {
+            t.await
+                .map_err(|e| format!("[ub] TLS listener panicked: {e}"))?
+                .map_err(|e| format!("[ub] TLS serve error: {e}"))?;
+        }
     } else {
-        let listener = tokio::net::TcpListener::bind(&addr).await?;
-        if cfg.http2 {
-            println!("[ub] listening (h2c) on http://{addr}");
-            serve_h2c(listener, app).await?;
-        } else {
-            println!("[ub] listening on http://{addr}");
-            axum::serve(listener, svc).with_graceful_shutdown(shutdown).await?;
+        let http2 = cfg.http2;
+        let mut plain_tasks = Vec::with_capacity(listeners.len());
+        for listener in listeners {
+            let a = listener.local_addr().expect("bound listener has addr");
+            if http2 {
+                println!("[ub] listening (h2c) on http://{a}");
+                let app_c = app.clone();
+                plain_tasks.push(tokio::spawn(async move {
+                    serve_h2c(listener, app_c).await.map_err(|e| e.to_string())
+                }));
+            } else {
+                println!("[ub] listening on http://{a}");
+                let svc_c = svc.clone();
+                let shut = shutdown_signal();
+                plain_tasks.push(tokio::spawn(async move {
+                    axum::serve(listener, svc_c)
+                        .with_graceful_shutdown(shut)
+                        .await
+                        .map_err(|e| e.to_string())
+                }));
+            }
+        }
+        for t in plain_tasks {
+            t.await
+                .map_err(|e| format!("[ub] listener panicked: {e}"))?
+                .map_err(|e| format!("[ub] serve error: {e}"))?;
         }
     }
     // Both listeners drain on the same signal; the unix task ends with its
@@ -1002,26 +1065,72 @@ async fn cors_mw(req: Request, next: Next) -> Response {
     resp
 }
 
-/// Plain-HTTP loopback companion address: when TLS is on and the TLS
-/// bind does NOT already cover loopback, also serve plaintext on
+/// Resolve the listen host like common services do: IP literals bind
+/// as-is (no DNS touched); anything else resolves via DNS at startup and
+/// binds the first address. Unknown names fail closed (refuse to boot
+/// half-configured) instead of falling back to an unintended interface.
+async fn resolve_bind_ip(host: &str) -> Result<std::net::IpAddr, String> {
+    let bare = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(host);
+    if bare.eq_ignore_ascii_case("localhost") {
+        return Ok(std::net::IpAddr::from([127, 0, 0, 1]));
+    }
+    if let Ok(ip) = bare.parse() {
+        return Ok(ip);
+    }
+    let mut addrs = tokio::net::lookup_host(format!("{bare}:1"))
+        .await
+        .map_err(|e| format!("[ub] cannot resolve host `{host}`: {e}"))?;
+    addrs
+        .next()
+        .map(|a| a.ip())
+        .ok_or_else(|| format!("[ub] host `{host}` resolved to nothing"))
+}
+
+/// Split a listen-host value into entries: comma-separated, trimmed,
+/// empties dropped ("somehost.com,10.10.8.8" -> ["somehost.com",
+/// "10.10.8.8"]). Pure for testing; DNS happens in resolve_bind_ips.
+fn split_hosts(host: &str) -> Vec<String> {
+    host.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Resolve every listen entry (IP literals bind as-is, hostnames via DNS
+/// at startup), deduped, order kept. Unknown names fail closed.
+async fn resolve_bind_ips(host: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    let mut out = Vec::new();
+    for h in split_hosts(host) {
+        let ip = resolve_bind_ip(&h).await?;
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    if out.is_empty() {
+        return Err("[ub] host resolved to nothing".into());
+    }
+    Ok(out)
+}
+
+/// Plain-HTTP loopback companion address: when TLS is on and NONE of the
+/// bound addresses covers loopback, also serve plaintext on
 /// 127.0.0.1:<same port> (testing, debugging, local microservices and
-/// reverse proxies — no cert flags needed on loopback). None = no
-/// companion: TLS off already serves plain wherever it binds, a
-/// loopback-covering TLS bind would conflict, or plain_loopback = false.
-/// Loopback-only by construction (never 0.0.0.0), same app + same gates.
-fn plain_companion_addr(
+/// reverse proxies). A single companion max no matter how many binds.
+/// None = no companion (TLS off serves plain already, some bind covers
+/// loopback, or plain_loopback = false). Loopback-only by construction.
+fn plain_companion_for(
     tls: bool,
     plain_loopback: bool,
-    host: &str,
+    bind_ips: &[std::net::IpAddr],
     port: u16,
 ) -> Option<std::net::SocketAddr> {
     if !tls || !plain_loopback {
         return None;
     }
-    match host {
-        "127.0.0.1" | "localhost" | "::1" | "[::1]" | "0.0.0.0" | "::" => None,
-        _ => format!("127.0.0.1:{port}").parse().ok(),
+    if bind_ips.iter().any(|ip| ip.is_loopback() || ip.is_unspecified()) {
+        return None;
     }
+    format!("127.0.0.1:{port}").parse().ok()
 }
 
 /// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
@@ -3175,24 +3284,43 @@ mod tests {
 
     #[test]
     fn plain_companion_only_when_tls_leaves_loopback_plain() {
-        use std::net::SocketAddr;
-        // TLS off: plain is already served wherever it binds — no companion.
-        assert_eq!(plain_companion_addr(false, true, "0.0.0.0", 3005), None);
+        use std::net::{IpAddr, SocketAddr};
+        let lo4: IpAddr = "127.0.0.1".parse().unwrap();
+        let any4: IpAddr = "0.0.0.0".parse().unwrap();
+        let pub4: IpAddr = "203.24.51.237".parse().unwrap();
+        let lo6: IpAddr = "::1".parse().unwrap();
+        // TLS off: plain is already served wherever it binds - no companion.
+        assert_eq!(plain_companion_for(false, true, &[pub4], 3005), None);
         // Opted out: none even with TLS on a public IP.
-        assert_eq!(
-            plain_companion_addr(true, false, "203.24.51.237", 3005),
-            None
-        );
-        // TLS bind covers loopback (wildcard/loopback hosts): companion
-        // would conflict or duplicate — none, with no error.
-        for h in ["0.0.0.0", "::", "127.0.0.1", "localhost", "::1"] {
-            assert_eq!(plain_companion_addr(true, true, h, 3005), None, "host={h}");
+        assert_eq!(plain_companion_for(true, false, &[pub4], 3005), None);
+        // Any bind covering loopback suppresses the companion (one check
+        // across the whole multi-bind set - a single companion max).
+        for ips in [vec![any4], vec![lo4], vec![lo6], vec!["::".parse().unwrap()], vec![pub4, lo4]] {
+            assert_eq!(plain_companion_for(true, true, &ips, 3005), None);
         }
-        // TLS on a public IP: plain companion on loopback, same port.
+        // TLS on public IP(s) only: one plain companion on loopback.
         assert_eq!(
-            plain_companion_addr(true, true, "203.24.51.237", 3010),
+            plain_companion_for(true, true, &[pub4], 3010),
             Some("127.0.0.1:3010".parse::<SocketAddr>().unwrap())
         );
+        assert_eq!(
+            plain_companion_for(true, true, &[pub4, "10.10.8.8".parse().unwrap()], 3010),
+            Some("127.0.0.1:3010".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn host_list_splits_trims_and_drops_empties() {
+        assert_eq!(split_hosts("0.0.0.0"), vec!["0.0.0.0".to_string()]);
+        assert_eq!(
+            split_hosts("somehost.com,10.10.8.8"),
+            vec!["somehost.com".to_string(), "10.10.8.8".to_string()]
+        );
+        assert_eq!(
+            split_hosts("  a.com ,, b.com, "),
+            vec!["a.com".to_string(), "b.com".to_string()]
+        );
+        assert!(split_hosts("  , ").is_empty());
     }
 
     #[test]
