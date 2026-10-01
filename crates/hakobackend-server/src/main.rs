@@ -515,10 +515,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let open = Router::new()
         .route("/api/health", get(health))
         .route("/api/ready", get(ready));
-    let mut app = Router::new()
-        .route("/api/__wstats", get(wstats_dump))
+    // ponytail: host gate wraps api + auth only (health/ready in `open`
+    // stay ungated). Layered after merge = runs before limit/auth, so
+    // off-domain traffic dies before any accounting.
+    let hosts = Arc::new(cfg.allowed_hosts.clone());
+    let gated = Router::new()
         .merge(api)
         .merge(auth_routes)
+        .layer(middleware::from_fn_with_state(hosts, host_mw));
+    let mut app = Router::new()
+        .route("/api/__wstats", get(wstats_dump))
+        .merge(gated)
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .merge(open)
         // gzip JSON responses, but never the live streams: compressing
@@ -838,6 +845,70 @@ async fn enforce_dpop(
         ctx = None;
     }
     ctx
+}
+
+/// Host allowlist gate (domain-designated backends): requests whose Host
+/// is outside the list are refused with 421 before limiter/auth/policy.
+/// Empty list = off (yesterday's default). Loopback (localhost, 127.0.0.1,
+/// ::1) ALWAYS passes — infra-local traffic (probes, loopback svc, dev)
+/// is never gated. Matching is case-insensitive and port-stripped,
+/// zero-alloc on the hot path. Health/ready live on the ungated `open`
+/// router as a second layer of probe safety.
+fn strip_host_port(h: &str) -> &str {
+    if let Some(rest) = h.strip_prefix('[') {
+        // [v6] or [v6]:port.
+        match rest.find(']') {
+            Some(i) => &rest[..i],
+            None => h,
+        }
+    } else {
+        match h.rsplit_once(':') {
+            // Single colon = host:port; multiple = bare IPv6, no port.
+            Some((host, _)) if !host.contains(':') => host,
+            _ => h,
+        }
+    }
+}
+
+fn host_allowed(allowed: &[String], host: Option<&str>) -> bool {
+    if allowed.is_empty() {
+        return true;
+    }
+    match host {
+        Some(h) => {
+            let bare = strip_host_port(h);
+            // ponytail: loopback bypass first (exact, no alloc) — the
+            // common local-probe shape never touches the list scan.
+            bare == "localhost" || bare == "127.0.0.1" || bare == "::1"
+                || allowed.iter().any(|a| a.eq_ignore_ascii_case(bare))
+        }
+        None => false,
+    }
+}
+
+async fn host_mw(
+    State(allowed): State<Arc<Vec<String>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if host_allowed(&allowed, host) {
+        next.run(req).await
+    } else {
+        // ponytail: cheapest correct refusal — empty 421 + close, no JSON
+        // body to build, no keep-alive slot held for scanners. A true
+        // silent drop would only buy retry storms (clients re-send what
+        // they never got an answer to); this is the resource floor.
+        (
+            StatusCode::MISDIRECTED_REQUEST,
+            [(header::CONNECTION, "close")],
+            "",
+        )
+            .into_response()
+    }
 }
 
 /// Auth middleware: Bearer (API clients) else access cookie (browser BFF) →
@@ -2945,9 +3016,30 @@ mod tests {
         assert_eq!(dpop_action(DpopMode::Accept, true, false), Keep);
         assert_eq!(dpop_action(DpopMode::Accept, true, true), MustVerify);
     }
+    #[test]
+    fn host_allowlist_matching() {
+        // Empty = off (yesterday's default: everything passes).
+        assert!(host_allowed(&[], Some("api.chemedu.site")));
+        assert!(host_allowed(&[], None));
+        let allowed = vec!["api.chemedu.site".to_string()];
+        // Exact, case-insensitive, port-stripped.
+        assert!(host_allowed(&allowed, Some("api.chemedu.site")));
+        assert!(host_allowed(&allowed, Some("API.CHEMEDU.SITE")));
+        assert!(host_allowed(&allowed, Some("api.chemedu.site:3010")));
+        // Loopback ALWAYS passes (local probes, loopback svc, dev) even
+        // with a list set — infra-local traffic is never gated.
+        assert!(host_allowed(&allowed, Some("127.0.0.1:3005")));
+        assert!(host_allowed(&allowed, Some("localhost")));
+        assert!(host_allowed(&allowed, Some("[::1]:3005")));
+        // Wrong host or missing Host header = refuse.
+        assert!(!host_allowed(&allowed, Some("evil.example")));
+        assert!(!host_allowed(&allowed, Some("other.internal:9")));
+        assert!(!host_allowed(&allowed, None));
+    }
 
     #[test]
     fn incoming_doc_honors_explicit_body_id() {
+
         // create() passes "": a valid body id becomes the primary id and
         // leaves data (no duplicate id keys downstream).
         let d = incoming_doc("", serde_json::json!({"id": "k1", "v": 1}));
@@ -3298,7 +3390,7 @@ mod tests {
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
                 wstats: false, benchmark: false, sock: None, http2: false,
-                sync_serve: None, sync_peer: vec![],
+                sync_serve: None, sync_peer: vec![], allowed_hosts: vec![],
             }),
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,

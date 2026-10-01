@@ -36,6 +36,12 @@ pub struct Args {
     /// Unix-only: a Windows build fails closed when it is set.
     #[arg(long)]
     pub sock: Option<String>,
+    /// Host allowlist for domain-designated backends (repeatable flag;
+    /// appended to the file list). Requests with other Host values get
+    /// 421 before limiter/auth/policy. Empty = off. Loopback
+    /// (localhost/127.0.0.1/::1) always passes regardless.
+    #[arg(long)]
+    pub allowed_hosts: Vec<String>,
     /// Hako socket_sync: serve this instance on a unix socket so peers can
     /// replicate from it (absent = no serving). Unix-only: fails closed at
     /// startup when set on other platforms.
@@ -108,6 +114,9 @@ pub struct UbConfig {
     /// Unix socket path (None = TCP only). Hot-reload ignores it (listener
     /// shape is boot-time; changing it needs a restart, unlike rules/auth).
     pub sock: Option<String>,
+    /// Host allowlist, same semantics as the flag. Set in config like
+    /// listen/bind (file base + flag extras). Empty = off.
+    pub allowed_hosts: Vec<String>,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -218,6 +227,8 @@ struct FileConfig {
     rules: Option<String>,
     auth: Option<String>,
     sock: Option<String>,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -352,6 +363,12 @@ pub fn resolve(args: &Args) -> UbConfig {
             .or(file.database.policy_file),
         auth: args.auth.clone().or(file.auth),
         sock: args.sock.clone().or(file.sock),
+        allowed_hosts: {
+            // File base + flag extras (same append idiom as peers).
+            let mut v = file.allowed_hosts;
+            v.extend(args.allowed_hosts.clone());
+            v
+        },
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -495,6 +512,11 @@ limit_auth_burst = 5
 # Changing it needs a restart (not hot-reloaded).
 # sock = "/run/hakobackend/hako.sock"
 
+# Domain designation: serve ONLY these Host values (plus loopback, which
+# always passes). Anything else is refused with 421 before limiter/auth.
+# Empty = serve all Hosts (yesterday's default). Boot-time like listen.
+# allowed_hosts = ["api.chemedu.site"]
+
 # Hako socket_sync peering (hako driver ONLY; other drivers refuse these
 # keys at startup). Serve this instance and/or dial peers over unix
 # sockets so N backends hold identical data (LWW converge, echo-safe).
@@ -541,6 +563,7 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             sock: None,
+            allowed_hosts: vec![],
             sync_serve: None,
             sync_peer: vec![],
             http2: false,
@@ -641,6 +664,26 @@ mod tests {
         let mut a = args();
         a.config = Some(f.clone());
         let _ = resolve(&a);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn allowed_hosts_file_dan_flag_append() {
+        // Absent = serve all Hosts.
+        assert!(resolve(&args()).allowed_hosts.is_empty());
+        let f = write_tmp(
+            "hakobackend_hosts_test.toml",
+            "allowed_hosts = [\"api.chemedu.site\"]\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert_eq!(resolve(&a).allowed_hosts, vec!["api.chemedu.site".to_string()]);
+        // Flags append to the file base.
+        a.allowed_hosts = vec!["other.example".into()];
+        assert_eq!(
+            resolve(&a).allowed_hosts,
+            vec!["api.chemedu.site".to_string(), "other.example".to_string()]
+        );
         let _ = std::fs::remove_file(f);
     }
 
