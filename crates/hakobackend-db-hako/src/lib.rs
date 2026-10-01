@@ -47,15 +47,21 @@ impl HakoDb {
     pub fn open(path: &str) -> Result<Self, AppError> {
         let db = hakodb::Hako::open(path, hakodb::config::HakoConfig::default())
             .map_err(|e| AppError::Internal(e.to_string()))?;
+        Ok(Self::from_db(Arc::new(db)))
+    }
+
+    /// Wrap an already-open engine (cluster members share their Arcs —
+    /// opening the same data dir twice would fork the WAL).
+    pub fn from_db(db: Arc<hakodb::Hako>) -> Self {
         let this = Self {
-            inner: Arc::new(db),
+            inner: db,
             channels: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             unique: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(unix)]
             sync: std::sync::Mutex::new(None),
         };
         this.load_unique_registry();
-        Ok(this)
+        this
     }
 
     /// Flush all shards to disk (WAL + segments). Sync engine call —

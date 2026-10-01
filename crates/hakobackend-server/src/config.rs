@@ -7,7 +7,8 @@
 
 use clap::Parser;
 
-pub const KNOWN_DRIVERS: &[&str] = &["hako", "postgres", "sqlite", "mysql", "rethinkdb"];
+pub const KNOWN_DRIVERS: &[&str] = &["hako", "hakocluster", "postgres", "sqlite", "mysql",
+"rethinkdb"];
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "universalbackend", version, about = "1 backend, multi database")]
@@ -493,7 +494,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# universalbackend — config templ
 host = "0.0.0.0"
 port = 3000
 
-driver = "hako"          # choices: hako (others in phase 3)
+driver = "hako"          # choices: hako | hakocluster (comma-separated dirs)
 data = "./data/hako.ub"  # file path or DSN
 
 rules = "./policy.toml"  # hot-reload; leave empty = open dev mode

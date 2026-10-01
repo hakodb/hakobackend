@@ -38,6 +38,7 @@ use hakobackend_auth_github::GithubOAuth;
 use hakobackend_auth_local::{ACCESS_COOKIE, DpopMode, DpopRequest, LocalAuth, REFRESH_COOKIE};
 use hakobackend_core::{AuthContext, AuthProvider, Change, ChangeKind, Database, Doc, Method, PathKind, QueryOptions, parse_collection_path};
 use hakobackend_db_hako::HakoDb;
+use hakobackend_db_hakocluster::ClusterDb;
 use hakobackend_db_postgres::PgDb;
 use hakobackend_db_sqlite::SqliteDb;
 use hakobackend_db_mysql::MysqlDb;
@@ -368,14 +369,25 @@ async fn open_driver(
     let db: Arc<dyn Database> = match driver {
         "hako" => {
             // ponytail: socket_sync lives ONLY in the hako arm (sync is
-            // per hako driver — other drivers fail closed below). A
-            // hakocluster driver comes later; it does not belong here.
+            // per hako driver — the hakocluster driver meshes itself).
             let hako = HakoDb::open(path).map_err(|e| e.to_string())?;
             hako
                 .enable_socket_sync(sync_serve, sync_peer)
                 .await
                 .map_err(|e| e.to_string())?;
             Arc::new(TtlDb::new(hako)) as Arc<dyn Database>
+        }
+        "hakocluster" => {
+            // In-process cluster: comma-separated Hako dirs, mesh + fan-out
+            // inside one backend process. Sync flags are refused here —
+            // peering is the cluster's own business (its default sock dir),
+            // not per-socket knobs on top.
+            if sync_serve.is_some() || !sync_peer.is_empty() {
+                return Err("sync_serve/sync_peer are hako-driver only; the hakocluster driver meshes itself".into());
+            }
+            let cluster =
+                ClusterDb::open(path).map_err(|e| e.to_string())?;
+            Arc::new(TtlDb::new(cluster)) as Arc<dyn Database>
         }
         "postgres" | "sqlite" | "mysql" | "rethinkdb" => {
             if sync_serve.is_some() || !sync_peer.is_empty() {

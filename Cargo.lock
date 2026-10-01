@@ -1379,6 +1379,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hakobackend-db-hakocluster"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hakobackend-core",
+ "hakobackend-db-hako",
+ "hakocluster",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hakobackend-db-mysql"
 version = "0.1.0"
 dependencies = [
@@ -1452,6 +1464,7 @@ dependencies = [
  "hakobackend-auth-oidc",
  "hakobackend-core",
  "hakobackend-db-hako",
+ "hakobackend-db-hakocluster",
  "hakobackend-db-mysql",
  "hakobackend-db-postgres",
  "hakobackend-db-rethinkdb",
@@ -1471,6 +1484,17 @@ dependencies = [
  "toml",
  "tower",
  "tower-http",
+]
+
+[[package]]
+name = "hakocluster"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f65a1c94a0be030d389f02a220b83aca79731505a658fe31e0883dece5f35ad"
+dependencies = [
+ "hakodb",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

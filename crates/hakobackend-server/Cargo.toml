@@ -1,11 +1,12 @@
 [package]
 name = "hakobackend-server"
-version = "0.2.18"
+version = "0.2.19"
 edition = "2021"
 
 [dependencies]
 hakobackend-core = { path = "../hakobackend-core" }
 hakobackend-db-hako = { path = "../hakobackend-db-hako" }
+hakobackend-db-hakocluster = { path = "../hakobackend-db-hakocluster" }
 hakobackend-policy = { path = "../hakobackend-policy" }
 hakobackend-auth-core = { path = "../hakobackend-auth-core" }
 hakobackend-auth-local = { path = "../hakobackend-auth-local" }
