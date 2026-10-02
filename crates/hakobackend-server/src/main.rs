@@ -1564,12 +1564,22 @@ async fn health() -> impl IntoResponse {
     )
 }
 
-/// Readiness (LBs/K8s): the driver answers, not just the socket.
+/// Readiness (LBs/K8s + browser dashboards): the driver answers, not
+/// just the socket. Hardcoded `Access-Control-Allow-Origin: *` (per
+/// fkip-234 monitoring report): the body is a public boolean (no auth,
+/// no credentials, nothing to leak), and probes must not depend on the
+/// CORS allowlist. health stays header-clean (hottest path, non-browser
+/// probes only).
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
-    match s.hot().await.db.list_collections().await {
+    let body = match s.hot().await.db.list_collections().await {
         Ok(_) => Json(serde_json::json!({ "ready": true })).into_response(),
         Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
-    }
+    };
+    (
+        [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
+        body,
+    )
+        .into_response()
 }
 
 /// Re-read config + driver + auth chain. "Hot-swap while running":
