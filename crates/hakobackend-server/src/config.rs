@@ -93,6 +93,10 @@ pub struct Args {
     /// acks at merge time, driver failures surface in logs.
     #[arg(long, default_value_t = false)]
     pub coalesce_writes: bool,
+    /// Gzip responses above 1 KB (default OFF: realtime backend optimizes
+    /// latency + CPU; bandwidth is the proxy's job when one fronts this).
+    #[arg(long, default_value_t = false)]
+    pub compress: bool,
     /// Stage profiler (PERFORMANCE_NOTE §7): UB_WSTATS=1 / config / this flag.
     /// 1/16 sampling + GET /api/__wstats (404 when off).
     #[arg(long, default_value_t = false)]
@@ -131,6 +135,8 @@ pub struct UbConfig {
     pub limit_auth: (u32, u32),
     pub trust_proxy: bool,
     pub coalesce_writes: bool,
+    /// Gzip responses above 1 KB (flag --compress wins when set).
+    pub compress: bool,
     /// Stage profiler on (env UB_WSTATS=1 also enables).
     pub wstats: bool,
     /// Run the internal benchmark then exit instead of serving.
@@ -263,6 +269,9 @@ struct FileConfig {
     http2: bool,
     #[serde(default)]
     coalesce_writes: bool,
+    /// Gzip responses above 1 KB (flag --compress wins when set).
+    #[serde(default)]
+    compress: bool,
     /// Stage profiler (flag `--wstats` wins when set).
     #[serde(default)]
     wstats: bool,
@@ -410,6 +419,7 @@ pub fn resolve(args: &Args) -> UbConfig {
         ),
         trust_proxy: args.trust_proxy || file.trust_proxy.unwrap_or(false),
         coalesce_writes: args.coalesce_writes || file.coalesce_writes,
+        compress: args.compress || file.compress,
         wstats: args.wstats || file.wstats,
         benchmark: args.benchmark || file.benchmark,
         tls_cert: args.tls_cert.clone().or(file.tls_cert),
@@ -508,6 +518,7 @@ auth = "off"             # off | local | chain:github,local | ./custom.toml
 
 # In-process flood protection (without redis): req/min per IP + burst.
 # Strict layer just for /api/auth/* (anti credential brute-force).
+# A 0 rate turns that layer fully OFF (bypassed, zero hot-path cost).
 limit_global = 600
 limit_global_burst = 100
 limit_auth = 20
@@ -553,6 +564,11 @@ limit_auth_burst = 5
 # sync_serve = "/run/hakobackend/sync1.sock"
 # sync_peer = ["/run/hakobackend/sync2.sock"]
 
+# Gzip responses above 1 KB (same as --compress). Default OFF: this is a
+# realtime backend (latency + CPU first); put compression on the edge
+# proxy when bandwidth matters. Changing it needs a restart.
+# compress = false
+
 # Plain-TCP HTTP/2 (h2c, prior knowledge; default h1 = unchanged). Same app;
 # multiplexing + HPACK helps header-heavy API traffic (Bearer JWTs). Ignored
 # under TLS (ALPN already serves h2 there). Changing it needs a restart.
@@ -597,6 +613,7 @@ mod tests {
             validate: false,
             print_default_config: false,
             coalesce_writes: false,
+            compress: false,
             wstats: false,
             benchmark: false,
         }

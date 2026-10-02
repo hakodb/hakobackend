@@ -338,6 +338,42 @@ pub struct Change {
     pub new: Option<Doc>,
 }
 
+/// Pre-serialized single document for the GET fast path: `json_inner` is
+/// the doc body as response bytes WITHOUT the `id` member (engine-native
+/// JSON emit, e.g. hakodb `write_json`), `version` feeds the ETag when the
+/// driver tracks per-doc versions. The server splices `id` in at framing
+/// time (see `frame_doc_json`), so no Value DOM is ever built on reads.
+#[derive(Debug, Clone)]
+pub struct RawDoc {
+    /// Monotonic per-mutation version (None = driver doesn't track; no ETag).
+    pub version: Option<u64>,
+    /// `{"_time":..,...fields}` — everything except `id`.
+    pub json_inner: Vec<u8>,
+}
+
+/// Frame a full GET response body: `{"id":<id>,<inner...>}`. Key order
+/// differs from `serde_json::to_vec(Doc)` (there `id` sorts with the rest);
+/// JSON-semantically identical, byte order not contracted. `id` goes
+/// through serde escaping (unicode ids are legal).
+pub fn frame_doc_json(id: &str, inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(id.len() + inner.len() + 16);
+    out.extend_from_slice(b"{\"id\":");
+    out.extend_from_slice(serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()).as_bytes());
+    out.push(b',');
+    // inner always starts with `{` (engine object emit); splice past it.
+    // Defensive: a non-object inner falls back to a nested body instead
+    // of producing corrupt JSON.
+    match inner.strip_prefix(b"{") {
+        Some(rest) => out.extend_from_slice(rest),
+        None => {
+            out.extend_from_slice(b"\"_value\":");
+            out.extend_from_slice(inner);
+            out.push(b'}');
+        }
+    }
+    out
+}
+
 #[async_trait::async_trait]
 pub trait Database: Send + Sync {
     /// Driver identity + capabilities (see DRIVER_CONTRACT.md).
@@ -346,6 +382,20 @@ pub trait Database: Send + Sync {
     async fn ensure_collection(&self, path: &str) -> Result<(), AppError>;
     async fn list_collections(&self) -> Result<Vec<String>, AppError>;
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError>;
+    /// Monotonic per-doc version for ETag/304 (None = untracked → no ETag).
+    /// Versions only ever increase per mutation, so equality means
+    /// unchanged even when the version space is shared across collections
+    /// (a collision only causes a redundant 200, never a stale 304).
+    async fn doc_version(&self, collection: &str, id: &str) -> Result<Option<u64>, AppError> {
+        let _ = (collection, id);
+        Ok(None)
+    }
+    /// Pre-serialized read (None = driver can't → server falls back to
+    /// `get` + serde). Same bytes `get` would produce, minus the DOM.
+    async fn get_json(&self, collection: &str, id: &str) -> Result<Option<RawDoc>, AppError> {
+        let _ = (collection, id);
+        Ok(None)
+    }
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError>;
     /// `merge=false` = replace the whole body; `merge=true` = shallow top-level merge.
     async fn insert(&self, collection: &str, doc: Doc) -> Result<Doc, AppError>;
@@ -438,6 +488,12 @@ impl<D: Database + Send + Sync> Database for Arc<D> {
     }
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
         self.as_ref().get(collection, id).await
+    }
+    async fn doc_version(&self, collection: &str, id: &str) -> Result<Option<u64>, AppError> {
+        self.as_ref().doc_version(collection, id).await
+    }
+    async fn get_json(&self, collection: &str, id: &str) -> Result<Option<RawDoc>, AppError> {
+        self.as_ref().get_json(collection, id).await
     }
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         self.as_ref().list(collection, q).await
@@ -625,6 +681,23 @@ mod tests {
     fn flat_table_parity_with_legacy() {
         assert_eq!(flat_table_name("posts"), "posts");
         assert_eq!(flat_table_name("posts/123/revisions"), "posts_revisions");
+    }
+
+    #[test]
+    fn frame_doc_json_splices_id() {
+        // Framed body parses to the same object `get` + serde would emit
+        // (key order is id-first, which JSON does not contract).
+        let inner = br#"{"_time":5,"a":1}"#;
+        let out = frame_doc_json("abc", inner);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v, serde_json::json!({"id": "abc", "_time": 5, "a": 1}));
+        // Unicode ids escape; non-object inners nest instead of corrupting.
+        let uni = frame_doc_json("a\"b", br#"{"x":1}"#);
+        let v2: serde_json::Value = serde_json::from_slice(&uni).unwrap();
+        assert_eq!(v2["id"], serde_json::json!("a\"b"));
+        let odd = frame_doc_json("z", b"[1,2]");
+        let v3: serde_json::Value = serde_json::from_slice(&odd).unwrap();
+        assert_eq!(v3, serde_json::json!({"id": "z", "_value": [1, 2]}));
     }
 
     #[test]

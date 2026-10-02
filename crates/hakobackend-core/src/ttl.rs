@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{agg_number, AppError, Capabilities, Change, Database, Doc, Filter, FilterOp, IndexInfo, IndexSpec, QueryOptions};
+use super::{agg_number, AppError, Capabilities, Change, Database, Doc, Filter, FilterOp, IndexInfo, IndexSpec, QueryOptions, RawDoc};
 
 /// Expiry field: microsecond epoch. Values that are not positive integers
 /// are ignored (doc stays immortal) — fail-open on malformed stamps.
@@ -30,6 +30,15 @@ pub fn is_expired(doc: &Doc) -> bool {
         .get(TTL_FIELD)
         .and_then(|v| v.as_i64())
         .is_some_and(|t| t > 0 && t <= now_micros())
+}
+
+/// Byte scan for the quoted expiry key inside pre-serialized JSON. The key
+/// is engine-emitted adjacent to its colon (`"__ttl_at":`), so a plain
+/// window search is exact for real fields; a string *value* containing the
+/// same text only triggers the safe fallback.
+fn contains_ttl_key(json: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"\"__ttl_at\"";
+    json.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
 
 /// Aggregates ignore paging at the trait level too (the server clears it,
@@ -114,6 +123,17 @@ impl<D: Database + Send + Sync> Database for TtlDb<D> {
     }
     async fn get(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
         Ok(self.inner.get(collection, id).await?.filter(|d| !is_expired(d)))
+    }
+    /// Raw fast path with the TTL gate preserved: docs carrying the expiry
+    /// field fall back to the filtered `get` (rare by design); the immortal
+    /// common case streams through untouched. Substring match is exact on
+    /// the quoted key (`"__ttl_at"`), so a false positive only costs a slow
+    /// path, never a wrong body. `doc_version` stays None here: an expired
+    /// doc never bumps its version, so a pre-fetch 304 could resurrect the
+    /// dead — post-fetch ETags (from `RawDoc.version`) are still served.
+    async fn get_json(&self, collection: &str, id: &str) -> Result<Option<RawDoc>, AppError> {
+        let raw = self.inner.get_json(collection, id).await?;
+        Ok(raw.filter(|r| !contains_ttl_key(&r.json_inner)))
     }
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         Ok(self
@@ -326,5 +346,93 @@ mod tests {
         }));
         let (visited, deleted) = sweep_once(&db_arc, 100).await;
         assert_eq!((visited, deleted), (1, 1));
+    }
+
+    #[test]
+    fn ttl_key_scan_exact_and_safe() {
+        // Real field → detected (slow fallback).
+        assert!(contains_ttl_key(br#"{"a":1,"__ttl_at":123}"#));
+        // Absent → fast path.
+        assert!(!contains_ttl_key(br#"{"a":1,"_time":5}"#));
+        // Looks-alike without quotes → not a field, fast path stays.
+        assert!(!contains_ttl_key(br#"{"note":"see __ttl_at docs"}"#));
+    }
+
+    #[tokio::test]
+    async fn raw_passthrough_keeps_ttl_gate() {
+        struct Raw {
+            version: u64,
+            inner: Vec<u8>,
+        }
+        #[async_trait::async_trait]
+        impl Database for Raw {
+            fn capabilities(&self) -> Capabilities {
+                Capabilities {
+                    driver: "raw",
+                    supports_watch: false,
+                    supports_transactions: false,
+                    supports_composite: false,
+                    supports_fts: false,
+                    supports_drop_index: false,
+                    supports_unique: false,
+                    supports_named_index: false,
+                    supports_native_aggregation: false,
+                }
+            }
+            async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
+                Ok(())
+            }
+            async fn list_collections(&self) -> Result<Vec<String>, AppError> {
+                Ok(vec![])
+            }
+            async fn get(&self, _c: &str, _i: &str) -> Result<Option<Doc>, AppError> {
+                Ok(None)
+            }
+            async fn list(&self, _c: &str, _q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
+                Ok(vec![])
+            }
+            async fn insert(&self, _c: &str, doc: Doc) -> Result<Doc, AppError> {
+                Ok(doc)
+            }
+            async fn set(&self, _c: &str, _i: &str, doc: Doc, _m: bool) -> Result<Doc, AppError> {
+                Ok(doc)
+            }
+            async fn delete(&self, _c: &str, _i: &str) -> Result<Option<Doc>, AppError> {
+                Ok(None)
+            }
+            async fn count(&self, _c: &str, _q: &QueryOptions) -> Result<u64, AppError> {
+                Ok(0)
+            }
+            async fn subscribe(&self, _c: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
+                Ok(tokio::sync::broadcast::channel(16).0.subscribe())
+            }
+            async fn create_index(&self, _c: &str, _s: &IndexSpec) -> Result<IndexInfo, AppError> {
+                Err(AppError::BadRequest("no".into()))
+            }
+            async fn list_indexes(&self, _c: &str) -> Result<Vec<IndexInfo>, AppError> {
+                Ok(vec![])
+            }
+            async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
+                Ok(())
+            }
+            async fn doc_version(&self, _c: &str, _i: &str) -> Result<Option<u64>, AppError> {
+                Ok(Some(self.version))
+            }
+            async fn get_json(&self, _c: &str, _i: &str) -> Result<Option<RawDoc>, AppError> {
+                Ok(Some(RawDoc { version: Some(self.version), json_inner: self.inner.clone() }))
+            }
+        }
+        // Immortal doc streams through with its version.
+        let live = TtlDb::new(Raw { version: 7, inner: br#"{"_time":1,"a":2}"#.to_vec() });
+        let got = live.get_json("c", "x").await.unwrap().unwrap();
+        assert_eq!(got.version, Some(7));
+        // TTL-carrying doc falls back (None → filtered get), even alive.
+        let ttl = TtlDb::new(Raw {
+            version: 9,
+            inner: format!(r#"{{"_time":1,"{}":9999999999999999}}"#, TTL_FIELD).into_bytes(),
+        });
+        assert!(ttl.get_json("c", "x").await.unwrap().is_none());
+        // And pre-fetch versions stay off through the wrapper (no stale 304).
+        assert!(live.doc_version("c", "x").await.unwrap().is_none());
     }
 }

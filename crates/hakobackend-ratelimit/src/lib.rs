@@ -74,7 +74,16 @@ impl Limiter {
         *self.quota.write().unwrap() = quota;
     }
 
+    /// `0` rate = bypass: the middleware skips the check entirely (zero
+    /// hot-path cost, no contention). Distinct from a tiny quota on purpose:
+    /// `per_minute(0, N)` would 429 everything past burst — a trap. Set the
+    /// config value to 0 to turn a layer fully off.
+    pub fn is_off(&self) -> bool {
+        self.quota.read().unwrap().rate_per_sec <= 0.0
+    }
+
     /// `Ok(())` = pass; `Err(seconds)` = reject + honest Retry-After.
+    /// Callers check `is_off` first and bypass before reaching here.
     pub fn check(&self, key: &str) -> Result<(), u64> {
         let quota = *self.quota.read().unwrap();
         let now = (self.clock)();
@@ -178,5 +187,14 @@ mod tests {
         m.advance(Duration::from_secs(601));
         // a,b idle → evicted, c admitted.
         assert!(l.check("c").is_ok());
+    }
+
+    #[test]
+    fn nol_rate_is_off() {
+        let m = Manual::new();
+        let l = Limiter::with_clock(Quota::per_minute(0, 100), m.clock());
+        assert!(l.is_off());
+        let l2 = Limiter::with_clock(Quota::per_minute(1, 1), m.clock());
+        assert!(!l2.is_off());
     }
 }

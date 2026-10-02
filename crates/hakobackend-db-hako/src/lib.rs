@@ -376,6 +376,32 @@ impl Database for HakoDb {
             .map_err(|e| AppError::Internal(e.to_string()))
     }
 
+    async fn doc_version(&self, collection: &str, id: &str) -> Result<Option<u64>, AppError> {
+        let _ = collection;
+        // Bare-key space is shared across collections, but versions only
+        // ever increase per mutation: equality still means unchanged (a
+        // collision only causes a redundant 200, never a stale 304).
+        Ok(self.inner.current_version(id))
+    }
+
+    async fn get_json(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<hakobackend_core::RawDoc>, AppError> {
+        // ponytail: same direct-call rule as get (decode is µs-scale; the
+        // hop costs more). write_json emits response bytes straight from
+        // the decoded doc — no serde Value DOM, no HashMap, no to_vec.
+        match self.inner.get(collection, id) {
+            Ok(Some(h)) => Ok(Some(hakobackend_core::RawDoc {
+                version: self.inner.current_version(id),
+                json_inner: h.to_json_bytes(),
+            })),
+            Ok(None) => Ok(None),
+            Err(e) => Err(AppError::Internal(e.to_string())),
+        }
+    }
+
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         // Direct translate to the native query model (requires hakodb
         // >= 0.8.24: the planner never pushes a scan limit under unsatisfied

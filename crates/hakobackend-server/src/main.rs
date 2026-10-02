@@ -12,6 +12,7 @@ mod coalesce;
 mod config;
 mod bench;
 mod realtime;
+mod tokcache;
 
 use axum::{
     Json, Router,
@@ -86,6 +87,9 @@ struct AppState {
     coalesce_on: bool,
     /// Loopback service keys (hot-reload via /api/admin/reload for rotation).
     service: Arc<tokio::sync::RwLock<Arc<ServiceAuth>>>,
+    /// Resolved-token cache (verify once, reuse to exp/idle; flushed on
+    /// reload, revoked on logout; DPoP still enforced per request).
+    tokcache: Arc<tokcache::TokenCache>,
 }
 
 /// Loopback service-key state: sha256 hashes (keys never compared raw) +
@@ -485,6 +489,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
         service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&cfg.service_keys, &cfg.service_allow))),
+        tokcache: Arc::new(tokcache::TokenCache::new()),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -537,28 +542,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .merge(auth_routes)
         .layer(middleware::from_fn(cors_mw))
         .layer(middleware::from_fn_with_state(hosts, host_mw));
-    let mut app = Router::new()
-        .route("/api/__wstats", get(wstats_dump))
-        .merge(gated)
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
-        .merge(open)
-        // gzip JSON responses, but never the live streams: compressing
-        // SSE would buffer flushes and add event latency for little gain
-        // (stream frames are already tiny; WS upgrades carry no body).
-        // SizeAbove(1024): gzip below ~1 KB costs more than it saves
-        // (measured 13-33% overhead on small docs when clients compress).
-        .layer(
-            tower_http::compression::CompressionLayer::new().compress_when(
-                tower_http::compression::predicate::SizeAbove::new(1024).and(
-                    tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
-                ),
-            ),
-        )
-        // 8 MB bodies (legacy json-limit parity); larger payloads 413.
-        .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
-        // Outermost: total-latency clock + sample flag (front_mw runs first).
-        .layer(middleware::from_fn(front_mw))
-        .with_state(state);
+    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
+    // backend (latency + CPU first) and compression cost 6.5x throughput
+    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
+    // the edge proxy's job when one fronts this. Opt-in only.
+    let compress = cfg.compress;
+    if compress {
+        eprintln!("[ub] compress on: gzip responses above 1 KB");
+    }
+    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
+    // backend (latency + CPU first) and compression cost 6.5x throughput
+    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
+    // the edge proxy's job when one fronts this. Opt-in only.
+    let compress = cfg.compress;
+    if compress {
+        eprintln!("[ub] compress on: gzip responses above 1 KB");
+    }
+    let mut app = maybe_compress(
+        Router::new()
+            .route("/api/__wstats", get(wstats_dump))
+            .merge(gated)
+            .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+            .merge(open),
+        compress,
+    )
+    // 8 MB bodies (legacy json-limit parity); larger payloads 413.
+    .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+    // Outermost: total-latency clock + sample flag (front_mw runs first).
+    .layer(middleware::from_fn(front_mw))
+    .with_state(state);
     if tls {
         // HSTS only meaningful via TLS (no effect on plain http).
         app = app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
@@ -784,6 +796,11 @@ async fn limit_mw(
     next: Next,
 ) -> Response {
     let ws_t0 = std::time::Instant::now();
+    // `0` rate = layer off: bypass before any key alloc, hash, or lock.
+    // (A tiny-but-nonzero quota still enforces; off is explicit.)
+    if s.limiter.is_off() {
+        return next.run(req).await;
+    }
     // Peer from extensions by hand (not the ConnectInfo extractor): unix
     // arrivals carry UnixPeer instead of a TCP peer, and the extractor
     // would 500-reject them. Unix = one shared local bucket (all of it is
@@ -902,12 +919,20 @@ fn dpop_action(mode: DpopMode, is_local_token: bool, has_proof: bool) -> DpopAct
 }
 
 /// Resolve one token → AuthContext (used by middleware, WS, SSE).
+/// The token cache sits in front: a hit skips the provider chain (crypto
+/// + HTTPS) AND the Arc snapshots below. DPoP/CSRF enforcement stays
+/// downstream, untouched by caching.
 async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
+    if let Some(hit) = s.tokcache.get(token) {
+        return hit;
+    }
     let policy = s.policy.get().await;
     let db = s.db.read().await.clone();
     let chain = s.auth.read().await.clone();
     let db_ref: &dyn Database = &*db;
-    chain.resolve(&policy.identity, Some(db_ref), token).await
+    let ctx = chain.resolve(&policy.identity, Some(db_ref), token).await;
+    s.tokcache.put(token, ctx.clone());
+    ctx
 }
 
 /// DPoP enforcement shared by HTTP middleware, WS upgrade, and SSE open:
@@ -1159,6 +1184,9 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
         let svc = s.service.read().await.clone();
         if !svc.hashes.is_empty() && loopback_peer(&req) && svc_key_match(&svc.hashes, t) {
             req.extensions_mut().insert(Some(svc_context(&svc.scopes)));
+            if WSAMP.try_get().unwrap_or(false) {
+                wstats::add(&wstats::F[1], ws_t0.elapsed().as_nanos() as u64);
+            }
             return next.run(req).await;
         }
     }
@@ -1393,6 +1421,9 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     *s.auth.write().await = Arc::new(chain);
     *s.local.write().await = local;
     *s.github.write().await = github;
+    // Chain/mapping may have changed: cached contexts reference the old
+    // world (uid mapping, provider set). Flush; clients re-resolve once.
+    s.tokcache.clear();
     // Drain coalesced PATCHes into the fresh driver before serving it.
     {
         let dbh = s.db.read().await.clone();
@@ -1512,8 +1543,8 @@ mod wstats {
     }
     // PUT: authz / get_old / allow / preproc / eng_set / emit / serdom
     pub static W: [T; 7] = [T::new(), T::new(), T::new(), T::new(), T::new(), T::new(), T::new()];
-    // GET-single: authz / eng_get / overlay / allow_ser
-    pub static G: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // GET-single: authz / eng_get / overlay / allow / ser
+    pub static G: [T; 5] = [T::new(), T::new(), T::new(), T::new(), T::new()];
     // LIST: authz / eng_list / filter / serdom
     pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     // Per-shape LIST split (same 3 inner stages): order / filter /
@@ -1591,8 +1622,8 @@ mod wstats {
             &[&W[0], &W[1], &W[2], &W[3], &W[4], &W[5], &W[6]],
         ) + &tab(
             "get",
-            &["authz", "eng_get", "overlay", "allow_ser"],
-            &[&G[0], &G[1], &G[2], &G[3]],
+            &["authz", "eng_get", "overlay", "allow", "ser"],
+            &[&G[0], &G[1], &G[2], &G[3], &G[4]],
         ) + &tab(
             "list",
             &["authz", "eng_list", "filter", "serdom"],
@@ -1703,11 +1734,140 @@ async fn wstats_dump() -> Response {
     wstats::render().into_response()
 }
 
+fn etag_of(version: u64) -> String {
+    format!("\"{version}\"")
+}
+
+/// If-None-Match against a version ETag: `*` or an exact (strong or weak)
+/// match. Auth/allow run first, so a 304 never leaks existence to the
+/// unauthorized — the check order in the handler guarantees it.
+fn etag_match(headers: &HeaderMap, version: u64) -> bool {
+    let strong = etag_of(version);
+    let weak = format!("W/{strong}");
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            s.split(',').any(|t| {
+                let t = t.trim();
+                t == "*" || t == strong || t == weak
+            })
+        })
+}
+
+fn not_modified(version: u64) -> Response {
+    let mut h = HeaderMap::new();
+    if let Ok(v) = header::HeaderValue::from_str(&etag_of(version)) {
+        h.insert(header::ETAG, v);
+    }
+    (StatusCode::NOT_MODIFIED, h, "").into_response()
+}
+
+fn raw_json(body: Vec<u8>, version: Option<u64>) -> Response {
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    if let Some(v) = version {
+        if let Ok(ev) = header::HeaderValue::from_str(&etag_of(v)) {
+            h.insert(header::ETAG, ev);
+        }
+    }
+    (h, body).into_response()
+}
+
+/// Owned GET fallback: drivers without pre-serialized reads, docs with
+/// pending coalesced PATCHes, and TTL-carrying docs (filtered here).
+/// Same bytes as before, only reached off the fast path.
+#[allow(clippy::too_many_arguments)]
+async fn get_owned(
+    s: AppState,
+    policy: Arc<PolicyFile>,
+    auth: Option<AuthContext>,
+    collection: String,
+    stored: String,
+    id: String,
+    samp: bool,
+    mut ws_t: std::time::Instant,
+) -> Response {
+    let db = s.db.read().await.clone();
+    // allow was already checked on the shell; re-check on the real doc is
+    // free here (µs) and keeps one authorization rule for both paths.
+    match db.get(&stored, &id).await {
+        Ok(maybe_doc) => {
+            if samp {
+                wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
+            let overlaid = s.coalescer.overlay(
+                &stored,
+                &id,
+                maybe_doc.as_ref().map(|d| d.data.clone()),
+            );
+            let doc = match overlaid {
+                Some(data) => Some(Doc { id: id.clone(), data }),
+                None => maybe_doc,
+            };
+            if samp {
+                wstats::add(&wstats::G[2], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
+            match doc {
+                Some(doc) => {
+                    if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
+                        return forbidden();
+                    }
+                    if samp {
+                        wstats::add(&wstats::G[3], ws_t.elapsed().as_nanos() as u64);
+                        ws_t = std::time::Instant::now();
+                    }
+                    // ponytail: serialize Doc straight to bytes; the old
+                    // to_value() built a throwaway Value DOM first.
+                    let r = Json(doc).into_response();
+                    if samp {
+                        wstats::add(&wstats::G[4], ws_t.elapsed().as_nanos() as u64);
+                    }
+                    r
+                }
+                None => err(StatusCode::NOT_FOUND, "Document not found"),
+            }
+        }
+        Err(_) => err_internal(),
+    }
+}
+
+/// Conditional gzip: one expression (the app builder below must stay a
+/// single `let` chain — splitting it into statements breaks Router<S>
+/// inference on this axum version and surfaces as bogus AppState errors
+/// at the listener sites). `on=false` returns the router untouched.
+fn maybe_compress<S>(router: Router<S>, on: bool) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if !on {
+        return router;
+    }
+    // gzip JSON responses, but never the live streams: compressing
+    // SSE would buffer flushes and add event latency for little gain
+    // (stream frames are already tiny; WS upgrades carry no body).
+    // SizeAbove(1024): gzip below ~1 KB costs more than it saves
+    // (measured 13-33% overhead on small docs when clients compress).
+    router.layer(
+        tower_http::compression::CompressionLayer::new().compress_when(
+            tower_http::compression::predicate::SizeAbove::new(1024).and(
+                tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+            ),
+        ),
+    )
+}
+
 async fn get_or_list(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
@@ -1726,44 +1886,63 @@ async fn get_or_list(
                 wstats::add(&wstats::G[0], ws_t.elapsed().as_nanos() as u64);
                 ws_t = std::time::Instant::now();
             }
-            match db.get(&stored, &id).await {
-                Ok(maybe_doc) => {
-                    // Coalescer overlay: pending PATCHes merge over storage
-                    // so read-your-write holds inside the window.
+            // ponytail: shell doc for the allow check. Read slots only ever
+            // inspect the id (UidSelf); Fields passes on reads and the rest
+            // ignore the resource — so no decode is needed to authorize.
+            let shell = Doc { id: id.clone(), data: Default::default() };
+            if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&shell)) {
+                return forbidden();
+            }
+            if samp {
+                wstats::add(&wstats::G[3], ws_t.elapsed().as_nanos() as u64);
+                ws_t = std::time::Instant::now();
+            }
+            // ETag pre-check (version probe only, no fetch): equality means
+            // unchanged, so polling clients get a 304 without any decode.
+            if let Ok(Some(v)) = db.doc_version(&stored, &id).await {
+                if etag_match(&headers, v) {
+                    return not_modified(v);
+                }
+            }
+            // Coalescer overlay: pending PATCHes merge over storage, so
+            // read-your-write holds inside the window. Pending docs take
+            // the owned path (merge needs the real body); everything else
+            // streams pre-serialized bytes with zero DOM.
+            if !s.coalescer.is_empty() && s.coalescer.has(&stored, &id) {
+                return get_owned(
+                    s.clone(),
+                    policy,
+                    auth,
+                    collection,
+                    stored,
+                    id,
+                    samp,
+                    ws_t,
+                )
+                .await;
+            }
+            match db.get_json(&stored, &id).await {
+                Ok(Some(raw)) => {
                     if samp {
                         wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
+                        wstats::add(&wstats::G[4], ws_t.elapsed().as_nanos() as u64);
                         ws_t = std::time::Instant::now();
                     }
-                    let overlaid = s.coalescer.overlay(
-                        &stored,
-                        &id,
-                        maybe_doc.as_ref().map(|d| d.data.clone()),
-                    );
-                    let doc = match overlaid {
-                        Some(data) => Some(Doc { id: id.clone(), data }),
-                        None => maybe_doc,
-                    };
-                    if samp {
-                        wstats::add(&wstats::G[2], ws_t.elapsed().as_nanos() as u64);
-                        ws_t = std::time::Instant::now();
-                    }
-                    match doc {
-                        Some(doc) => {
-                            if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&doc)) {
-                                return forbidden();
-                            }
-                            // ponytail: serialize Doc straight to bytes; the old
-                            // to_value() built a throwaway Value DOM first.
-                            let r = Json(doc).into_response();
-                            if samp {
-                                wstats::add(&wstats::G[3], ws_t.elapsed().as_nanos() as u64);
-                            }
-                            r
+                    if let Some(v) = raw.version {
+                        if etag_match(&headers, v) {
+                            return not_modified(v);
                         }
-                        None => err(StatusCode::NOT_FOUND, "Document not found"),
+                        return raw_json(
+                            hakobackend_core::frame_doc_json(&id, &raw.json_inner),
+                            Some(v),
+                        );
                     }
+                    raw_json(hakobackend_core::frame_doc_json(&id, &raw.json_inner), None)
                 }
-                Err(_) => err_internal(),
+                // Driver can't pre-serialize (or doc missing): owned fallback.
+                _ => {
+                    get_owned(s.clone(), policy, auth, collection, stored, id, samp, ws_t).await
+                }
             }
         }
         PathKind::Collection { collection } => {
@@ -2885,6 +3064,12 @@ async fn auth_logout(
         if let Some(local) = s.local.read().await.clone() {
             let _ = local.logout(&t).await;
         }
+        // The access token may be cached: kill it now, TTL notwithstanding.
+        // (Refresh-token logout above kills future issuance; this kills the
+        // live bearer. Cookie tokens share the same cache key space.)
+        if let Some(a) = read_cookie(&headers, ACCESS_COOKIE) {
+            s.tokcache.remove(&a);
+        }
     }
     (StatusCode::OK, clear_cookies(), Json(serde_json::json!({ "success": true }))).into_response()
 }
@@ -3707,12 +3892,14 @@ mod tests {
                 limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
+                compress: false,
                 wstats: false, benchmark: false, sock: None, http2: false,
                 sync_serve: None, sync_peer: vec![], allowed_hosts: vec![],
             }),
             coalescer: Arc::new(coalesce::Coalescer::default()),
             coalesce_on: false,
             service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&[], &[]))),
+            tokcache: Arc::new(tokcache::TokenCache::new()),
         };
         (st, raw)
     }

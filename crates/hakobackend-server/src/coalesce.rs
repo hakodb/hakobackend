@@ -35,6 +35,19 @@ pub struct Coalescer {
 }
 
 impl Coalescer {
+    /// True when nothing is pending anywhere (the common case: feature off
+    /// or idle). Lets read paths skip the clone+lookup entirely.
+    pub fn is_empty(&self) -> bool {
+        self.pending.lock().unwrap().is_empty()
+    }
+
+    /// True when this exact doc has a pending body (overlay would change
+    /// the stored bytes). Targeted check so fast paths only fall back for
+    /// docs that actually need the merge.
+    pub fn has(&self, collection: &str, id: &str) -> bool {
+        let pending = self.pending.lock().unwrap();
+        pending.contains_key(&(collection.to_string(), id.to_string()))
+    }
     /// Eligible when every top-level key is plain and no sentinel appears
     /// anywhere in the payload (string scan: cheap, conservative).
     pub fn eligible(body: &serde_json::Value) -> bool {

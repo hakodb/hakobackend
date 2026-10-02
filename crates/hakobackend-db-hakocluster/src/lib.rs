@@ -104,6 +104,31 @@ impl hakobackend_core::Database for ClusterDb {
         out
     }
 
+    async fn doc_version(&self, collection: &str, id: &str) -> Result<Option<u64>, AppError> {
+        // Same sticky member as get (a version from another member could
+        // disagree inside the lag window; reads and their ETags stay on
+        // one member per request).
+        let index = self.cluster.read_index();
+        let out = self.members[index].doc_version(collection, id).await;
+        if out.is_ok() {
+            self.cluster.note_read(index);
+        }
+        out
+    }
+
+    async fn get_json(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<hakobackend_core::RawDoc>, AppError> {
+        let index = self.cluster.read_index();
+        let out = self.members[index].get_json(collection, id).await;
+        if out.is_ok() {
+            self.cluster.note_read(index);
+        }
+        out
+    }
+
     async fn list(&self, collection: &str, q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
         let index = self.cluster.read_index();
         let out = self.members[index].list(collection, q).await;
