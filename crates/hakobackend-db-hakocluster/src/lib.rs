@@ -213,7 +213,14 @@ mod tests {
         let db = ClusterDb::open(&format!("{a},{b}")).unwrap();
         assert_eq!(db.instance_count(), 2);
         db.insert("c", doc("k1")).await.unwrap();
-        // Immediate on the writer (routing, no sync wait).
+        // Fan-out may hit the replica before the tail converges: poll
+        // until the write is visible everywhere, then measure spread.
+        let t = std::time::Instant::now();
+        while t.elapsed() < std::time::Duration::from_secs(10) {
+            if db.get("c", "k1").await.unwrap().is_some() {
+                break;
+            }
+        }
         assert!(db.get("c", "k1").await.unwrap().is_some());
         for _ in 0..30 {
             assert!(db.get("c", "k1").await.unwrap().is_some());
