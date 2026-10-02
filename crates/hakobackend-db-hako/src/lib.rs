@@ -395,18 +395,20 @@ impl Database for HakoDb {
         id: &str,
     ) -> Result<Option<hakobackend_core::RawDoc>, AppError> {
         // ponytail: same direct-call rule as get (decode is µs-scale; the
-        // hop costs more). write_json emits response bytes straight from
-        // the decoded doc — no serde Value DOM, no HashMap, no to_vec.
+        // hop costs more). serde emit, NOT write_json: measured 101µs vs
+        // ~35µs on string-heavy docs — serde's SIMD string scan beats the
+        // byte-loop 3x when one field holds 7 KB of HTML (write_json's
+        // 1.89x win was int-heavy bench shapes). No HashMap/Doc detour:
+        // to_json + to_vec straight to the frame buffer.
         // Version mirrors doc_version (counter, else logical time) so the
         // ETag is identical whether it came pre- or post-fetch.
         match self.inner.get(collection, id) {
             Ok(Some(h)) => {
                 let version =
                     self.inner.current_version(id).or_else(|| Some(h.get_logical_time() as u64));
-                Ok(Some(hakobackend_core::RawDoc {
-                    version,
-                    json_inner: h.to_json_bytes(),
-                }))
+                let json_inner = serde_json::to_vec(&h.to_json())
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                Ok(Some(hakobackend_core::RawDoc { version, json_inner }))
             }
             Ok(None) => Ok(None),
             Err(e) => Err(AppError::Internal(e.to_string())),
