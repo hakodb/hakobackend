@@ -90,6 +90,8 @@ struct AppState {
     /// Resolved-token cache (verify once, reuse to exp/idle; flushed on
     /// reload, revoked on logout; DPoP still enforced per request).
     tokcache: Arc<tokcache::TokenCache>,
+    /// Hot snapshot of the five per-request Arcs (see hot()).
+    hot_cache: Arc<HotCache>,
 }
 
 /// Loopback service-key state: sha256 hashes (keys never compared raw) +
@@ -281,8 +283,75 @@ fn svc_context(scopes: &[String]) -> AuthContext {
 
 impl AppState {
     /// Global policy (single-user backend: one policy file, no overlays).
+    /// Cold path only now (snapshot refresh + tests) — hot paths use hot().
     pub async fn policy(&self) -> Arc<PolicyFile> {
         self.policy.get().await
+    }
+
+    /// Hot snapshot: policy + db + auth + service + local Arcs, refreshed
+    /// at most once per SNAP_TTL. Replaces the per-request mtime stat +
+    /// 3-5 contended tokio locks (~8µs, the old authz stage) with one
+    /// uncontended mutex + Arc clones (~200 ns). File edits land within
+    /// SNAP_TTL; /api/admin/reload invalidates immediately.
+    pub async fn hot(&self) -> Hot {
+        self.hot_cache.get(self).await
+    }
+}
+
+/// One snapshot fetch: all hot Arcs, cloned out together.
+#[derive(Clone)]
+struct Hot {
+    policy: Arc<PolicyFile>,
+    db: Arc<dyn Database>,
+    auth: Arc<AuthChain>,
+    service: Arc<ServiceAuth>,
+    local: Option<Arc<LocalAuth>>,
+}
+
+/// Refresh cadence for the hot snapshot. Policy/file edits apply within
+/// this window on hot paths (reload is still immediate via invalidate).
+const SNAP_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct HotSnap {
+    at: Option<std::time::Instant>,
+    hot: Hot,
+}
+
+struct HotCache {
+    inner: tokio::sync::Mutex<HotSnap>,
+}
+
+impl HotCache {
+    fn new(hot: Hot) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(HotSnap { at: Some(std::time::Instant::now()), hot }),
+        }
+    }
+
+    async fn get(&self, s: &AppState) -> Hot {
+        {
+            let g = self.inner.lock().await;
+            if g.at.is_some_and(|t| t.elapsed() < SNAP_TTL) {
+                return g.hot.clone();
+            }
+        }
+        // Stale: refetch under no lock (awaits), then publish. Two
+        // concurrent refreshes both fetch; last write wins, harmless.
+        let hot = Hot {
+            policy: s.policy.get().await,
+            db: s.db.read().await.clone(),
+            auth: s.auth.read().await.clone(),
+            service: s.service.read().await.clone(),
+            local: s.local.read().await.clone(),
+        };
+        let mut g = self.inner.lock().await;
+        g.at = Some(std::time::Instant::now());
+        g.hot = hot.clone();
+        hot
+    }
+
+    async fn invalidate(&self) {
+        self.inner.lock().await.at = None;
     }
 }
 
@@ -477,19 +546,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_handle: Arc<tokio::sync::RwLock<Arc<dyn Database>>> =
         Arc::new(tokio::sync::RwLock::new(db));
+    let auth_handle = Arc::new(tokio::sync::RwLock::new(Arc::new(chain)));
+    let local_handle: Arc<tokio::sync::RwLock<Option<Arc<LocalAuth>>>> =
+        Arc::new(tokio::sync::RwLock::new(local));
+    let service_handle = Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(
+        &cfg.service_keys,
+        &cfg.service_allow,
+    )));
+    // Snapshot seeds from the same handles the state moves below.
+    let hot_cache = Arc::new(HotCache::new(Hot {
+        policy: policy.get().await,
+        db: db_handle.read().await.clone(),
+        auth: auth_handle.read().await.clone(),
+        service: service_handle.read().await.clone(),
+        local: local_handle.read().await.clone(),
+    }));
     let state = AppState {
         db: db_handle.clone(),
         policy,
-        auth: Arc::new(tokio::sync::RwLock::new(Arc::new(chain))),
-        local: Arc::new(tokio::sync::RwLock::new(local)),        github: Arc::new(tokio::sync::RwLock::new(github)),
+        auth: auth_handle,
+        local: local_handle,        github: Arc::new(tokio::sync::RwLock::new(github)),
         limits: limits.clone(),
         tls,
         admin_uids: Arc::new(cfg.admin_uids.clone()),
         cli: Arc::new(cli),
         coalescer: Arc::new(coalesce::Coalescer::default()),
         coalesce_on: cfg.coalesce_writes,
-        service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&cfg.service_keys, &cfg.service_allow))),
+        service: service_handle,
         tokcache: Arc::new(tokcache::TokenCache::new()),
+        hot_cache,
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -926,11 +1011,11 @@ async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
     if let Some(hit) = s.tokcache.get(token) {
         return hit;
     }
-    let policy = s.policy.get().await;
-    let db = s.db.read().await.clone();
-    let chain = s.auth.read().await.clone();
-    let db_ref: &dyn Database = &*db;
-    let ctx = chain.resolve(&policy.identity, Some(db_ref), token).await;
+    // One snapshot fetch serves policy + db + auth (a single mutex, not
+    // three contended locks + a stat call).
+    let hot = s.hot().await;
+    let db_ref: &dyn Database = &*hot.db;
+    let ctx = hot.auth.resolve(&hot.policy.identity, Some(db_ref), token).await;
     s.tokcache.put(token, ctx.clone());
     ctx
 }
@@ -949,7 +1034,7 @@ async fn enforce_dpop(
     // Fast paths first (identical outcomes, no crypto): no token or no
     // local provider means nothing to enforce; DPoP Off keeps everything.
     let Some(tok) = token else { return ctx };
-    let Some(local) = s.local.read().await.clone() else { return ctx };
+    let Some(local) = s.hot().await.local.clone() else { return ctx };
     if local.dpop_mode() == DpopMode::Off {
         return ctx;
     }
@@ -1181,7 +1266,7 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     // svc context (skips resolve/DPoP/CSRF — none apply to a static key).
     // Anything else falls through to the normal paths, unchanged.
     if let Some(t) = &token {
-        let svc = s.service.read().await.clone();
+        let svc = s.hot().await.service.clone();
         if !svc.hashes.is_empty() && loopback_peer(&req) && svc_key_match(&svc.hashes, t) {
             req.extensions_mut().insert(Some(svc_context(&svc.scopes)));
             if WSAMP.try_get().unwrap_or(false) {
@@ -1389,7 +1474,7 @@ async fn health() -> impl IntoResponse {
 
 /// Readiness (LBs/K8s): the driver answers, not just the socket.
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
-    match s.db.read().await.list_collections().await {
+    match s.hot().await.db.list_collections().await {
         Ok(_) => Json(serde_json::json!({ "ready": true })).into_response(),
         Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     }
@@ -1412,7 +1497,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
         Ok(db) => db,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
-    let identity = s.policy.get().await.identity.clone();
+    let identity = s.hot().await.policy.identity.clone();
     let (chain, local, github) = match open_auth_result(cfg.auth.as_deref(), db.clone(), identity) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
@@ -1424,9 +1509,12 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // Chain/mapping may have changed: cached contexts reference the old
     // world (uid mapping, provider set). Flush; clients re-resolve once.
     s.tokcache.clear();
+    // Hot snapshot may hold pre-reload Arcs (policy/db/auth/service/local):
+    // expire it so the next request refetches. ≤1s staleness otherwise.
+    s.hot_cache.invalidate().await;
     // Drain coalesced PATCHes into the fresh driver before serving it.
     {
-        let dbh = s.db.read().await.clone();
+        let dbh = s.hot().await.db.clone();
         s.coalescer
             .flush_all(|coll, id, body| {
                 let dbh = dbh.clone();
@@ -1457,7 +1545,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     s.limits.auth.set_quota(Quota::per_minute(cfg.limit_auth.0, cfg.limit_auth.1));
     // Service keys rotate the same way (add new, reload, drop old).
     *s.service.write().await = ServiceAuth::build(&cfg.service_keys, &cfg.service_allow);
-    auto_provision(&s.db.read().await.clone(), &s.policy.get().await, &cfg.indexes).await;
+    auto_provision(&s.hot().await.db.clone(), &s.hot().await.policy, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
     msg.into_response()
@@ -1466,7 +1554,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
 async fn list_collections(
     State(s): State<AppState>,
 ) -> impl IntoResponse {
-    match s.db.read().await.list_collections().await {
+    match s.hot().await.db.list_collections().await {
         Ok(c) => Json(c).into_response(),
         Err(_) => err_internal(),
     }
@@ -1487,11 +1575,11 @@ async fn create_collection(
     if denied_internal(&name).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
-    let policy = s.policy().await;
+    let policy = s.hot().await.policy;
     if !policy.allow(auth.as_ref(), &name, Method::Create, None) {
         return forbidden();
     }
-    match s.db.read().await.ensure_collection(&stored(&name)).await {
+    match s.hot().await.db.ensure_collection(&stored(&name)).await {
         Ok(()) => ok_true(),
                 Err(_) => err_internal(),
     }
@@ -1791,7 +1879,7 @@ async fn get_owned(
     samp: bool,
     mut ws_t: std::time::Instant,
 ) -> Response {
-    let db = s.db.read().await.clone();
+    let db = s.hot().await.db.clone();
     // allow was already checked on the shell; re-check on the real doc is
     // free here (µs) and keeps one authorization rule for both paths.
     match db.get(&stored, &id).await {
@@ -1871,8 +1959,9 @@ async fn get_or_list(
 ) -> impl IntoResponse {
     let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
-    let policy = s.policy().await;
-    let db = s.db.read().await.clone();
+    // One snapshot fetch serves policy + db (a single mutex for the
+    // hottest endpoint; other handlers fetch per access, ~100 ns each).
+    let hot = s.hot().await;
     match parse_collection_path(&path) {
         PathKind::Document { collection, id } => {
             if let Some(r) = denied_internal(&collection) {
@@ -1890,7 +1979,7 @@ async fn get_or_list(
             // inspect the id (UidSelf); Fields passes on reads and the rest
             // ignore the resource — so no decode is needed to authorize.
             let shell = Doc { id: id.clone(), data: Default::default() };
-            if !policy.allow(auth.as_ref(), &collection, Method::Get, Some(&shell)) {
+            if !hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(&shell)) {
                 return forbidden();
             }
             if samp {
@@ -1899,7 +1988,7 @@ async fn get_or_list(
             }
             // ETag pre-check (version probe only, no fetch): equality means
             // unchanged, so polling clients get a 304 without any decode.
-            if let Ok(Some(v)) = db.doc_version(&stored, &id).await {
+            if let Ok(Some(v)) = hot.db.doc_version(&stored, &id).await {
                 if etag_match(&headers, v) {
                     return not_modified(v);
                 }
@@ -1911,7 +2000,7 @@ async fn get_or_list(
             if !s.coalescer.is_empty() && s.coalescer.has(&stored, &id) {
                 return get_owned(
                     s.clone(),
-                    policy,
+                    hot.policy.clone(),
                     auth,
                     collection,
                     stored,
@@ -1921,7 +2010,7 @@ async fn get_or_list(
                 )
                 .await;
             }
-            match db.get_json(&stored, &id).await {
+            match hot.db.get_json(&stored, &id).await {
                 Ok(Some(raw)) => {
                     if samp {
                         wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
@@ -1941,7 +2030,7 @@ async fn get_or_list(
                 }
                 // Driver can't pre-serialize (or doc missing): owned fallback.
                 _ => {
-                    get_owned(s.clone(), policy, auth, collection, stored, id, samp, ws_t).await
+                    get_owned(s.clone(), hot.policy.clone(), auth, collection, stored, id, samp, ws_t).await
                 }
             }
         }
@@ -1961,7 +2050,7 @@ async fn get_or_list(
                         ws_t = std::time::Instant::now();
                     }
                     let shape = wstats::classify(&opts) as usize;
-                    match db.list(&stored, &opts).await {
+                    match hot.db.list(&stored, &opts).await {
                     // Per-doc filter (replacement for the server.ts:233 loop): documents
                     // failing the rule are excluded from the response, with no extra N+1
                     // queries when drivers push rules into queries (phase 3).
@@ -1974,7 +2063,7 @@ async fn get_or_list(
                         }
                         let visible: Vec<_> = docs
                             .into_iter()
-                            .filter(|d| policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
+                            .filter(|d| hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
                             .collect();
                         if samp {
                             wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
@@ -2075,11 +2164,11 @@ async fn index_create_inner(
         Ok(spec) => spec,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
-    let policy = s.policy().await;
+    let policy = s.hot().await.policy;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
         return forbidden();
     }
-    let db = s.db.read().await.clone();
+    let db = s.hot().await.db.clone();
     let stored = stored(&collection);
     let _ = db.ensure_collection(&stored).await;
     match db.create_index(&stored, &spec).await {
@@ -2103,11 +2192,11 @@ async fn index_list(
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.policy().await;
+    let policy = s.hot().await.policy;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
-    match s.db.read().await.list_indexes(&stored(&collection)).await {
+    match s.hot().await.db.list_indexes(&stored(&collection)).await {
         Ok(indexes) => Json(indexes).into_response(),
                 Err(_) => err_internal(),
     }
@@ -2125,11 +2214,11 @@ async fn index_drop(
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
-    let policy = s.policy().await;
+    let policy = s.hot().await.policy;
     if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
         return forbidden();
     }
-    match s.db.read().await.drop_index(&stored(&collection), &name).await {
+    match s.hot().await.db.drop_index(&stored(&collection), &name).await {
         Ok(()) => ok_true(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -2160,12 +2249,12 @@ async fn create(
             if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
-            let policy = s.policy().await;
+            let policy = s.hot().await.policy;
             let incoming = incoming_doc("", body);
             if !policy.allow(auth.as_ref(), &collection, Method::Create, Some(&incoming)) {
                 return forbidden();
             }
-            let db = s.db.read().await.clone();
+            let db = s.hot().await.db.clone();
             let stored = stored(&collection);
             let _ = db.ensure_collection(&stored).await;
             // Atomics collapse (legacy parity) + createdAt/updatedAt stamping.
@@ -2263,8 +2352,8 @@ async fn write_doc(
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.policy().await;
-            let db = s.db.read().await.clone();
+            let policy = s.hot().await.policy;
+            let db = s.hot().await.db.clone();
             let stored = stored(&collection);
             // Policy-level read-before-write skip (PUT only): with no Owner
             // rule governing the write the old doc is pure overhead (~115us).
@@ -2399,8 +2488,8 @@ async fn remove(
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.policy().await;
-            let db = s.db.read().await.clone();
+            let policy = s.hot().await.policy;
+            let db = s.hot().await.db.clone();
             let stored = stored(&collection);
             let existing = db.get(&stored, &id).await.ok().flatten();
             if !policy.allow(auth.as_ref(), &collection, Method::Delete, existing.as_ref()) {
@@ -2739,8 +2828,8 @@ async fn batch(
         Ok(v) => v,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
-    let db = s.db.read().await.clone();
-    let policy = s.policy().await;
+    let db = s.hot().await.db.clone();
+    let policy = s.hot().await.policy;
     match run_ops(&db, &policy, auth.as_ref(), ops, false).await {
         Ok(results) => render_results(results),
         Err((StatusCode::INTERNAL_SERVER_ERROR, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
@@ -2757,8 +2846,8 @@ async fn transaction(
         Ok(v) => v,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
-    let db = s.db.read().await.clone();
-    let policy = s.policy().await;
+    let db = s.hot().await.db.clone();
+    let policy = s.hot().await.policy;
     match run_ops(&db, &policy, auth.as_ref(), ops, true).await {
         Ok(results) => render_results(results),
         Err((status, msg, code)) => err_code(status, msg, code),
@@ -2785,8 +2874,8 @@ async fn collection_group(
     if let Some(r) = valid_names(&name, None) {
         return r;
     }
-    let policy = s.policy().await;
-    let db = s.db.read().await.clone();
+    let policy = s.hot().await.policy;
+    let db = s.hot().await.db.clone();
     let collections = match db.list_collections().await {
         Ok(c) => c,
         Err(_) => return err_internal(),
@@ -2856,11 +2945,11 @@ async fn aggregate(
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.policy().await;
+    let policy = s.hot().await.policy;
     if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
         return forbidden();
     }
-    let db = s.db.read().await.clone();
+    let db = s.hot().await.db.clone();
     let stored = stored(&collection);
     // Aggregates ignore paging (legacy passes options through to count/sum/avg).
     let mut opts = body.options.clone();
@@ -2938,7 +3027,7 @@ fn clear_cookies() -> HeaderMap {
 }
 
 async fn local_or_400(s: &AppState) -> Result<Arc<LocalAuth>, Response> {
-    s.local.read().await.clone().ok_or_else(|| {
+    s.hot().await.local.clone().ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "local auth is not active (see --auth)").into_response()
     })
 }
@@ -2972,7 +3061,7 @@ async fn auth_register(
     match local.register(id, email, &password, body).await {
         Ok(doc) => {
             // Gateway bus: user creates are CRUD events too.
-            let users = s.policy.get().await.identity.users_collection.clone();
+            let users = s.hot().await.policy.identity.users_collection.clone();
             let stored = stored(&users);
             realtime::emit(
                 &stored,
@@ -3061,7 +3150,7 @@ async fn auth_logout(
 ) -> impl IntoResponse {
     // Best-effort revoke; clearing cookies is the real logout.
     if let Some(t) = read_cookie(&headers, REFRESH_COOKIE) {
-        if let Some(local) = s.local.read().await.clone() {
+        if let Some(local) = s.hot().await.local.clone() {
             let _ = local.logout(&t).await;
         }
         // The access token may be cached: kill it now, TTL notwithstanding.
@@ -3170,7 +3259,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                     let mut next = resolve_token(&s, token).await;
                     // No headers mid-socket: a DPoP-bound token can't prove
                     // here, so Require/MustVerify degrades it to anonymous.
-                    if let Some(local) = s.local.read().await.clone() {
+                    if let Some(local) = s.hot().await.local.clone() {
                         let is_local = next
                             .as_ref()
                             .and_then(|c| c.extra.get("provider"))
@@ -3216,7 +3305,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                         None => auth.clone(),
                     };
                     if v.get("token").is_some() {
-                        if let Some(local) = s.local.read().await.clone() {
+                        if let Some(local) = s.hot().await.local.clone() {
                             let is_local = sub_auth
                                 .as_ref()
                                 .and_then(|c| c.extra.get("provider"))
@@ -3227,8 +3316,8 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                             }
                         }
                     }
-                    let db = s.db.read().await.clone();
-                    let policy = s.policy().await;
+                    let db = s.hot().await.db.clone();
+                    let policy = s.hot().await.policy;
                     match realtime::subscribe(db, policy, sub_auth, spec).await {
                         Ok(sub) => {
                             // Per-connection snapshot budget (anti memory-bomb).
@@ -3322,8 +3411,8 @@ async fn sse_handler(
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
     let group = matches!(q.get("group").map(|g| g.as_str()), Some("1") | Some("true"));
-    let db = s.db.read().await.clone();
-    let policy = s.policy().await;
+    let db = s.hot().await.db.clone();
+    let policy = s.hot().await.policy;
     let sub = match realtime::subscribe(db, policy, auth, realtime::SubSpec { collection, options, group }).await {
         Ok(sub) => sub,
         Err(e) if matches!(e, hakobackend_core::AppError::PermissionDenied) => return forbidden(),
@@ -3388,7 +3477,7 @@ async fn github_callback(
         _ => return err(StatusCode::BAD_REQUEST, "code + state required"),
     };
     // Global flow only (single-user backend, no tenant bundles).
-    let (g, local) = match (s.github.read().await.clone(), s.local.read().await.clone()) {
+    let (g, local) = match (s.github.read().await.clone(), s.hot().await.local.clone()) {
         (Some(g), Some(l)) => (g, l),
         _ => return err(StatusCode::BAD_REQUEST, "github oauth requires env credentials + `local` in the chain"),
     };
@@ -3870,12 +3959,13 @@ mod tests {
         let raw: Arc<dyn Database> =
             Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
         let dbh = Arc::new(tokio::sync::RwLock::new(raw.clone()));
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
         let st = AppState {
             db: dbh.clone(),
-            policy: Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned()))),
-            auth: Arc::new(tokio::sync::RwLock::new(Arc::new(
-                open_chain(&AuthSpec::Off, None, None).expect("off chain builds"),
-            ))),
+            policy: policy_hot.clone(),
+            auth: Arc::new(tokio::sync::RwLock::new(chain_root.clone())),
             local: Arc::new(tokio::sync::RwLock::new(None)),
             github: Arc::new(tokio::sync::RwLock::new(None)),
             limits: Arc::new(LimitLayers {
@@ -3900,6 +3990,13 @@ mod tests {
             coalesce_on: false,
             service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&[], &[]))),
             tokcache: Arc::new(tokcache::TokenCache::new()),
+            hot_cache: Arc::new(HotCache::new(Hot {
+                policy: policy_hot.get().await,
+                db: raw.clone(),
+                auth: chain_root.clone(),
+                service: ServiceAuth::build(&[], &[]),
+                local: None,
+            })),
         };
         (st, raw)
     }
