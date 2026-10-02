@@ -43,6 +43,14 @@ pub struct Args {
     /// (localhost/127.0.0.1/::1) always passes regardless.
     #[arg(long)]
     pub allowed_hosts: Vec<String>,
+    /// CORS strict origin allowlist (repeatable flag; file base + flag
+    /// extras, same merge as allowed_hosts). Empty = legacy echo-any
+    /// http(s) origin (today's behavior, documented risk).
+    #[arg(long)]
+    pub cors_allowed_origins: Vec<String>,
+    /// Max JSON/body bytes in MB (default 8, legacy json-limit parity).
+    #[arg(long)]
+    pub body_limit_mb: Option<u64>,
     /// Hako socket_sync: serve this instance on a unix socket so peers can
     /// replicate from it (absent = no serving). Unix-only: fails closed at
     /// startup when set on other platforms.
@@ -126,6 +134,26 @@ pub struct UbConfig {
     /// Host allowlist, same semantics as the flag. Set in config like
     /// listen/bind (file base + flag extras). Empty = off.
     pub allowed_hosts: Vec<String>,
+    /// CORS strict origin allowlist (file base + flag extras). Empty =
+    /// legacy echo-any http(s) origin. Boot-time like listeners.
+    pub cors_allowed_origins: Vec<String>,
+    /// Session cookie flags (file-only, boot-time): Secure default true
+    /// (plain-http dev sets false), SameSite Strict|Lax|None (default
+    /// Strict; None requires Secure), Path default "/", Domain unset.
+    pub cookie_secure: bool,
+    pub cookie_samesite: String,
+    pub cookie_path: String,
+    pub cookie_domain: Option<String>,
+    /// Max JSON/body bytes in MB (default 8). Boot-time like listeners.
+    pub body_limit_mb: u64,
+    /// HSTS max-age seconds (default 31536000, TLS only). 0 = omit header.
+    pub hsts_max_age_secs: u64,
+    /// gzip minimum body bytes (default 1024; only with compress on).
+    pub compress_min_bytes: u64,
+    /// WS caps: max message KB (default 1024) + max subs per socket
+    /// (default 100). Boot-time.
+    pub ws_max_msg_kb: u64,
+    pub ws_max_subs: u64,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -251,6 +279,19 @@ struct FileConfig {
     plain_loopback: bool,
     #[serde(default)]
     allowed_hosts: Vec<String>,
+    /// CORS strict origin allowlist (flag extras append).
+    #[serde(default)]
+    cors_allowed_origins: Vec<String>,
+    /// Session cookie flags (all file-only, boot-time).
+    cookie_secure: Option<bool>,
+    cookie_samesite: Option<String>,
+    cookie_path: Option<String>,
+    cookie_domain: Option<String>,
+    body_limit_mb: Option<u64>,
+    hsts_max_age_secs: Option<u64>,
+    compress_min_bytes: Option<u64>,
+    ws_max_msg_kb: Option<u64>,
+    ws_max_subs: Option<u64>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -395,6 +436,20 @@ pub fn resolve(args: &Args) -> UbConfig {
             v.extend(args.allowed_hosts.clone());
             v
         },
+        cors_allowed_origins: {
+            let mut v = file.cors_allowed_origins;
+            v.extend(args.cors_allowed_origins.clone());
+            v
+        },
+        cookie_secure: file.cookie_secure.unwrap_or(true),
+        cookie_samesite: file.cookie_samesite.unwrap_or_else(|| "Strict".into()),
+        cookie_path: file.cookie_path.unwrap_or_else(|| "/".into()),
+        cookie_domain: file.cookie_domain,
+        body_limit_mb: args.body_limit_mb.or(file.body_limit_mb).unwrap_or(8),
+        hsts_max_age_secs: file.hsts_max_age_secs.unwrap_or(31_536_000),
+        compress_min_bytes: file.compress_min_bytes.unwrap_or(1024),
+        ws_max_msg_kb: file.ws_max_msg_kb.unwrap_or(1024),
+        ws_max_subs: file.ws_max_subs.unwrap_or(100),
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -525,6 +580,30 @@ limit_auth = 20
 limit_auth_burst = 5
 # trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
 
+# CORS strict origin allowlist (same as --cors-allowed-origins, appends).
+# Empty (default) = legacy echo-any http(s) Origin + credentials. Set this
+# in production when browsers from fixed origins are the only clients.
+# cors_allowed_origins = ["https://app.example.com"]
+
+# Session cookie flags (defaults = today's behavior). SameSite=None
+# requires Secure (boot refuses otherwise); plain-http dev sets
+# cookie_secure = false (browsers drop Secure cookies over http).
+# cookie_secure = true
+# cookie_samesite = "Strict"  # Strict|Lax|None
+# cookie_path = "/"
+# cookie_domain = "example.com"  # unset = host-only (default)
+
+# Max JSON/body size in MB (default 8, legacy json-limit parity; larger 413).
+# body_limit_mb = 8
+# HSTS max-age seconds on TLS responses (default 31536000; 0 = omit header).
+# hsts_max_age_secs = 31536000
+# Gzip minimum body bytes, only with compress on (default 1024).
+# compress_min_bytes = 1024
+# WS caps: max inbound message KB (default 1024) + max subs per socket
+# (default 100, over-budget subscribes are rejected, never silently dropped).
+# ws_max_msg_kb = 1024
+# ws_max_subs = 100
+
 # Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
 # wstats = false
 # Internal per-driver benchmark (same as --benchmark): fixed shapes,
@@ -607,6 +686,8 @@ mod tests {
             tls_key: None,
             sock: None,
             allowed_hosts: vec![],
+            cors_allowed_origins: vec![],
+            body_limit_mb: None,
             sync_serve: None,
             sync_peer: vec![],
             http2: false,
@@ -739,6 +820,46 @@ mod tests {
         let mut a = args();
         a.config = Some(f.clone());
         assert!(resolve(&a).http2);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn vital_defaults_match_today() {
+        // Every new knob defaults to today's hardcoded behavior.
+        let cfg = resolve(&args());
+        assert!(cfg.cors_allowed_origins.is_empty());
+        assert!(cfg.cookie_secure);
+        assert_eq!(cfg.cookie_samesite, "Strict");
+        assert_eq!(cfg.cookie_path, "/");
+        assert!(cfg.cookie_domain.is_none());
+        assert_eq!(cfg.body_limit_mb, 8);
+        assert_eq!(cfg.hsts_max_age_secs, 31_536_000);
+        assert_eq!(cfg.compress_min_bytes, 1024);
+        assert_eq!(cfg.ws_max_msg_kb, 1024);
+        assert_eq!(cfg.ws_max_subs, 100);
+        // File overrides stick.
+        let f = write_tmp(
+            "hakobackend_vital_test.toml",
+            "cors_allowed_origins = [\"https://a.example\"]\ncookie_secure = false\ncookie_samesite = \"Lax\"\nbody_limit_mb = 16\nhsts_max_age_secs = 0\nws_max_subs = 10\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert_eq!(cfg.cors_allowed_origins, vec!["https://a.example".to_string()]);
+        assert!(!cfg.cookie_secure);
+        assert_eq!(cfg.cookie_samesite, "Lax");
+        assert_eq!(cfg.body_limit_mb, 16);
+        assert_eq!(cfg.hsts_max_age_secs, 0);
+        assert_eq!(cfg.ws_max_subs, 10);
+        // Flags append (cors) / win (body).
+        a.cors_allowed_origins = vec!["https://b.example".into()];
+        a.body_limit_mb = Some(32);
+        let cfg = resolve(&a);
+        assert_eq!(
+            cfg.cors_allowed_origins,
+            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+        );
+        assert_eq!(cfg.body_limit_mb, 32);
         let _ = std::fs::remove_file(f);
     }
 

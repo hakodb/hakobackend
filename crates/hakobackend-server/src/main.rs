@@ -92,6 +92,61 @@ struct AppState {
     tokcache: Arc<tokcache::TokenCache>,
     /// Hot snapshot of the five per-request Arcs (see hot()).
     hot_cache: Arc<HotCache>,
+    /// CORS strict allowlist (empty = legacy echo-any). Boot-time.
+    cors_allowed: Arc<Vec<String>>,
+    /// Session cookie flags (boot-time, fail-closed validation).
+    cookies: Arc<CookieConf>,
+    /// Max body bytes (boot-time). Scalars ride AppState by value —
+    /// AppState clones per connection, Arcs only for heap data.
+    body_limit: u64,
+    hsts_max_age: u64,
+    /// Gzip floor in bytes (tower takes u16; larger clamps — past 64 KB
+    /// compression is off in practice anyway).
+    compress_min_bytes: u16,
+    ws_max_msg: usize,
+    ws_max_subs: usize,
+}
+
+/// Session cookie flags (config-file driven, boot-time). Defaults mirror
+/// the old hardcoded `Secure; HttpOnly; SameSite=Strict; Path=/`.
+#[derive(Debug, Clone)]
+struct CookieConf {
+    secure: bool,
+    samesite: String,
+    path: String,
+    domain: Option<String>,
+}
+
+impl CookieConf {
+    fn build(cfg: &config::UbConfig) -> Self {
+        // Fail closed at boot (typos in security flags must never silently
+        // weaken to a default).
+        let samesite = cfg.cookie_samesite.clone();
+        if !["Strict", "Lax", "None"].contains(&samesite.as_str()) {
+            panic!("[ub] cookie_samesite must be Strict|Lax|None, got `{samesite}`");
+        }
+        if samesite == "None" && !cfg.cookie_secure {
+            panic!("[ub] cookie_samesite=None requires cookie_secure=true (browsers reject None without Secure)");
+        }
+        Self {
+            secure: cfg.cookie_secure,
+            samesite,
+            path: cfg.cookie_path.clone(),
+            domain: cfg.cookie_domain.clone(),
+        }
+    }
+
+    fn pair(&self, name: &str, value: &str, age: u64) -> String {
+        let mut v = format!("{name}={value}; Path={}; Max-Age={age}; HttpOnly", self.path);
+        if let Some(d) = &self.domain {
+            v.push_str(&format!("; Domain={d}"));
+        }
+        if self.secure {
+            v.push_str("; Secure");
+        }
+        v.push_str(&format!("; SameSite={}", self.samesite));
+        v
+    }
 }
 
 /// Loopback service-key state: sha256 hashes (keys never compared raw) +
@@ -585,6 +640,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service: service_handle,
         tokcache: Arc::new(tokcache::TokenCache::new()),
         hot_cache,
+        cors_allowed: Arc::new(cfg.cors_allowed_origins.clone()),
+        cookies: Arc::new(CookieConf::build(&cfg)),
+        body_limit: cfg.body_limit_mb.saturating_mul(1024 * 1024),
+        hsts_max_age: cfg.hsts_max_age_secs,
+        compress_min_bytes: cfg.compress_min_bytes.min(u16::MAX as u64) as u16,
+        ws_max_msg: cfg.ws_max_msg_kb.saturating_mul(1024) as usize,
+        ws_max_subs: cfg.ws_max_subs as usize,
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -635,7 +697,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gated = Router::new()
         .merge(api)
         .merge(auth_routes)
-        .layer(middleware::from_fn(cors_mw))
+        .layer(middleware::from_fn_with_state(state.cors_allowed.clone(), cors_mw))
         .layer(middleware::from_fn_with_state(hosts, host_mw));
     // Gzip is OFF by default (`compress`, flag/config): this is a realtime
     // backend (latency + CPU first) and compression cost 6.5x throughput
@@ -651,8 +713,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the edge proxy's job when one fronts this. Opt-in only.
     let compress = cfg.compress;
     if compress {
-        eprintln!("[ub] compress on: gzip responses above 1 KB");
+        eprintln!(
+            "[ub] compress on: gzip responses above {} bytes",
+            cfg.compress_min_bytes
+        );
     }
+    let body_limit = state.body_limit;
+    let hsts_max_age = state.hsts_max_age;
     let mut app = maybe_compress(
         Router::new()
             .route("/api/__wstats", get(wstats_dump))
@@ -660,17 +727,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
             .merge(open),
         compress,
+        state.compress_min_bytes,
     )
-    // 8 MB bodies (legacy json-limit parity); larger payloads 413.
-    .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
+    // Body cap (legacy 8 MB json-limit parity); larger payloads 413.
+    .layer(axum::extract::DefaultBodyLimit::max(
+        body_limit as usize,
+    ))
     // Outermost: total-latency clock + sample flag (front_mw runs first).
     .layer(middleware::from_fn(front_mw))
     .with_state(state);
-    if tls {
+    if tls && hsts_max_age > 0 {
         // HSTS only meaningful via TLS (no effect on plain http).
+        let hsts = format!("max-age={hsts_max_age}; includeSubDomains");
         app = app.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::STRICT_TRANSPORT_SECURITY,
-            header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+            header::HeaderValue::from_str(&hsts)
+                .unwrap_or_else(|_| header::HeaderValue::from_static("max-age=31536000; includeSubDomains")),
         ));
     }
 
@@ -1145,9 +1217,14 @@ async fn host_mw(
 /// CORS parity with the nginx edge this replaces (map $http_origin):
 /// echo any http(s) Origin + credentials. Pure + tested; the middleware
 /// applies it to responses and short-circuits preflights with 204.
-fn cors_headers(origin: Option<&str>) -> Option<HeaderMap> {
+/// `allowed` empty = legacy echo-any (today's behavior); non-empty =
+/// strict allowlist (exact match, unlisted origins get no CORS headers).
+fn cors_headers(origin: Option<&str>, allowed: &[String]) -> Option<HeaderMap> {
     let o = origin?;
     if !(o.starts_with("http://") || o.starts_with("https://")) {
+        return None;
+    }
+    if !allowed.is_empty() && !allowed.iter().any(|a| a == o) {
         return None;
     }
     let mut h = HeaderMap::new();
@@ -1176,11 +1253,16 @@ fn cors_headers(origin: Option<&str>) -> Option<HeaderMap> {
     Some(h)
 }
 
-async fn cors_mw(req: Request, next: Next) -> Response {
+async fn cors_mw(
+    State(allowed): State<Arc<Vec<String>>>,
+    req: Request,
+    next: Next,
+) -> Response {
     let headers = cors_headers(
         req.headers()
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok()),
+        &allowed,
     );
     if req.method() == axum::http::Method::OPTIONS {
         // Preflight short-circuit (nginx returned 204 the same way).
@@ -1939,7 +2021,7 @@ async fn get_owned(
 /// single `let` chain — splitting it into statements breaks Router<S>
 /// inference on this axum version and surfaces as bogus AppState errors
 /// at the listener sites). `on=false` returns the router untouched.
-fn maybe_compress<S>(router: Router<S>, on: bool) -> Router<S>
+fn maybe_compress<S>(router: Router<S>, on: bool, min_bytes: u16) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
@@ -1949,11 +2031,11 @@ where
     // gzip JSON responses, but never the live streams: compressing
     // SSE would buffer flushes and add event latency for little gain
     // (stream frames are already tiny; WS upgrades carry no body).
-    // SizeAbove(1024): gzip below ~1 KB costs more than it saves
+    // min_bytes (default 1024): gzip below ~1 KB costs more than it saves
     // (measured 13-33% overhead on small docs when clients compress).
     router.layer(
         tower_http::compression::CompressionLayer::new().compress_when(
-            tower_http::compression::predicate::SizeAbove::new(1024).and(
+            tower_http::compression::predicate::SizeAbove::new(min_bytes).and(
                 tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
             ),
         ),
@@ -3013,25 +3095,28 @@ async fn aggregate(
 }
 // --- Local auth (BFF): two HttpOnly cookies, browser never holds tokens ---
 
-fn session_cookies(local: &LocalAuth, tokens: &hakobackend_auth_local::SessionTokens) -> HeaderMap {
+fn session_cookies(
+    local: &LocalAuth,
+    tokens: &hakobackend_auth_local::SessionTokens,
+    conf: &CookieConf,
+) -> HeaderMap {
     let mut h = HeaderMap::new();
     let pair = [
         (ACCESS_COOKIE, &tokens.access_jwt, local.access_ttl()),
         (REFRESH_COOKIE, &tokens.refresh_opaque, local.refresh_ttl()),
     ];
     for (name, value, age) in pair {
-        // __Host-: Secure + Path=/ + no Domain (required; localhost counts as secure context).
-        let v = format!("{name}={value}; Path=/; Max-Age={age}; Secure; HttpOnly; SameSite=Strict");
-        h.append(header::SET_COOKIE, v.parse().unwrap());
+        // __Host- shape when defaulted (Secure + Path=/ + no Domain);
+        // deployers opting into Domain/SameSite=None own the consequence.
+        h.append(header::SET_COOKIE, conf.pair(name, value, age).parse().unwrap());
     }
     h
 }
 
-fn clear_cookies() -> HeaderMap {
+fn clear_cookies(conf: &CookieConf) -> HeaderMap {
     let mut h = HeaderMap::new();
     for name in [ACCESS_COOKIE, REFRESH_COOKIE] {
-        let v = format!("{name}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict");
-        h.append(header::SET_COOKIE, v.parse().unwrap());
+        h.append(header::SET_COOKIE, conf.pair(name, "", 0).parse().unwrap());
     }
     h
 }
@@ -3119,7 +3204,7 @@ async fn auth_login(
             let dpop = proof.as_deref().map(|proof| DpopRequest { proof, method: "POST", uri: &uri });
             match local.login(&l, &p, dpop).await {
                 Ok((ctx, tokens)) => {
-                    let headers = session_cookies(&local, &tokens);
+                    let headers = session_cookies(&local, &tokens, &s.cookies);
                     (StatusCode::OK, headers, Json(serde_json::json!({ "uid": ctx.uid }))).into_response()
                 }
                 // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
@@ -3146,11 +3231,11 @@ async fn auth_refresh(
     let dpop = proof.as_deref().map(|proof| DpopRequest { proof, method: "POST", uri: &uri });
     match local.refresh(&presented, dpop).await {
         Ok((ctx, tokens)) => {
-            let h = session_cookies(&local, &tokens);
+            let h = session_cookies(&local, &tokens, &s.cookies);
             (StatusCode::OK, h, Json(serde_json::json!({ "uid": ctx.uid }))).into_response()
         }
         // Reuse/expired/foreign: clear cookies + reject (fail-closed).
-        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(), Json(serde_json::json!({ "error": "invalid session" }))).into_response(),
+        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(&s.cookies), Json(serde_json::json!({ "error": "invalid session" }))).into_response(),
     }
 }
 
@@ -3170,7 +3255,7 @@ async fn auth_logout(
             s.tokcache.remove(&a);
         }
     }
-    (StatusCode::OK, clear_cookies(), Json(serde_json::json!({ "success": true }))).into_response()
+    (StatusCode::OK, clear_cookies(&s.cookies), Json(serde_json::json!({ "success": true }))).into_response()
 }
 
 async fn auth_me(Extension(auth): Extension<Option<AuthContext>>) -> impl IntoResponse {
@@ -3190,9 +3275,9 @@ async fn auth_me(Extension(auth): Extension<Option<AuthContext>>) -> impl IntoRe
 // Token via Bearer/cookie preferred; ?token= fallback (logged in URL —
 // recommended only via TLS; see TLS phase). 100 subs/WS connection limit.
 
-/// Inbound WS message size limit (anti frame-flood).
-const WS_MAX_MSG: usize = 1024 * 1024;
-
+// WS caps live on AppState (ws_max_msg_kb / ws_max_subs); the old
+// `WS_MAX_MSG` const is retired. Over-budget subscribes are rejected,
+// never silently dropped (see the error above).
 async fn ws_handler(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -3241,7 +3326,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
         if let Some(msg) = msg {
             let text = match msg {
                 Ok(ws::Message::Text(t)) => {
-                    if t.len() > WS_MAX_MSG {
+                    if t.len() > s.ws_max_msg {
                         break;
                     }
                     t.to_string()
@@ -3294,7 +3379,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                         }
                         continue;
                     }
-                    if subs.len() >= realtime::MAX_SUBS_PER_SOCKET && !subs.contains_key(&key) {
+                    if subs.len() >= s.ws_max_subs && !subs.contains_key(&key) {
                         if !ws_send(&mut socket, ws_err(Some(&key), "subscription limit exceeded")).await {
                             break;
                         }
@@ -3503,7 +3588,7 @@ async fn github_callback(
     }
     match local.login_external(&uid, email, profile).await {
         Ok((_ctx, tokens)) => {
-            let mut h = session_cookies(&local, &tokens);
+            let mut h = session_cookies(&local, &tokens, &s.cookies);
             // Single-use nonce: consume the cookie too.
             h.append(
                 header::SET_COOKIE,
@@ -3622,7 +3707,8 @@ mod tests {
     #[test]
     fn cors_echoes_http_origins_only() {
         // Mirrors the nginx map it replaces: echo any http(s) Origin.
-        let h = cors_headers(Some("https://app.chemedu.site")).unwrap();
+        let open: Vec<String> = vec![];
+        let h = cors_headers(Some("https://app.chemedu.site"), &open).unwrap();
         assert_eq!(
             h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://app.chemedu.site"
@@ -3632,11 +3718,46 @@ mod tests {
             "true"
         );
         assert!(h.contains_key(header::VARY));
-        assert!(cors_headers(Some("http://localhost:3000")).is_some());
+        assert!(cors_headers(Some("http://localhost:3000"), &open).is_some());
         // Non-http, null, missing = no CORS headers.
-        assert!(cors_headers(Some("ftp://x")).is_none());
-        assert!(cors_headers(Some("null")).is_none());
-        assert!(cors_headers(None).is_none());
+        assert!(cors_headers(Some("ftp://x"), &open).is_none());
+        assert!(cors_headers(Some("null"), &open).is_none());
+        assert!(cors_headers(None, &open).is_none());
+    }
+
+    #[test]
+    fn cors_allowlist_is_exact() {
+        let allowed = vec!["https://app.example.com".to_string()];
+        assert!(cors_headers(Some("https://app.example.com"), &allowed).is_some());
+        // Subdomain, scheme, port, and prefix games all miss.
+        assert!(cors_headers(Some("https://evil.example.com"), &allowed).is_none());
+        assert!(cors_headers(Some("http://app.example.com"), &allowed).is_none());
+        assert!(cors_headers(Some("https://app.example.com:8443"), &allowed).is_none());
+        assert!(cors_headers(Some("https://app.example.com.evil.com"), &allowed).is_none());
+    }
+
+    #[test]
+    fn cookie_pair_shapes_flags() {
+        let strict = CookieConf {
+            secure: true,
+            samesite: "Strict".into(),
+            path: "/".into(),
+            domain: None,
+        };
+        assert_eq!(
+            strict.pair("ub_access", "tok", 600),
+            "ub_access=tok; Path=/; Max-Age=600; HttpOnly; Secure; SameSite=Strict"
+        );
+        let lax = CookieConf {
+            secure: false,
+            samesite: "Lax".into(),
+            path: "/api".into(),
+            domain: Some("example.com".into()),
+        };
+        assert_eq!(
+            lax.pair("n", "", 0),
+            "n=; Path=/api; Max-Age=0; HttpOnly; Domain=example.com; SameSite=Lax"
+        );
     }
 
     #[test]
@@ -3992,7 +4113,7 @@ mod tests {
                 limit_global_burst: None, limit_auth: None, limit_auth_burst: None,
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
-                compress: false,
+                compress: false, body_limit_mb: None, cors_allowed_origins: vec![],
                 wstats: false, benchmark: false, sock: None, http2: false,
                 sync_serve: None, sync_peer: vec![], allowed_hosts: vec![],
             }),
@@ -4007,6 +4128,18 @@ mod tests {
                 service: ServiceAuth::build(&[], &[]),
                 local: None,
             })),
+            cors_allowed: Arc::new(vec![]),
+            cookies: Arc::new(CookieConf {
+                secure: true,
+                samesite: "Strict".into(),
+                path: "/".into(),
+                domain: None,
+            }),
+            body_limit: 8 * 1024 * 1024,
+            hsts_max_age: 31_536_000,
+            compress_min_bytes: 1024,
+            ws_max_msg: 1024 * 1024,
+            ws_max_subs: 100,
         };
         (st, raw)
     }
