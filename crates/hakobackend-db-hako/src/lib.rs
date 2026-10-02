@@ -381,21 +381,12 @@ impl Database for HakoDb {
         // Bare-key space is shared across collections, but versions only
         // ever increase per mutation: equality still means unchanged (a
         // collision only causes a redundant 200, never a stale 304).
-        if let Some(v) = self.inner.current_version(id) {
-            return Ok(Some(v));
-        }
-        // Cold version map (fresh boot: versions are memory-only, so every
-        // restart starts empty): fall back to the doc's logical time via a
-        // decode-free view. Same-micro distinct writes can't happen on one
-        // node (WAL fsync serializes writers ~ms apart); replicated applies
-        // preserve origin ts+content together, so equal time still means
-        // equal bytes there. Residual hole (LWW time-travel to an exactly
-        // previously-seen micro) is documented, not fixed.
-        match self.inner.get_view(collection, id) {
-            Ok(Some(view)) => Ok(Some(view.time() as u64)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(AppError::Internal(e.to_string())),
-        }
+        // Counter only — NO time fallback here: the view probe costs ~60µs
+        // (measured), more than the decode it would save. Cold-boot docs
+        // still get post-fetch ETags from get_json (time is free there,
+        // the doc is already decoded); the zero-decode pre-check activates
+        // after the first post-boot write warms the map.
+        Ok(self.inner.current_version(id))
     }
 
     async fn get_json(
@@ -1182,8 +1173,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&sockdir);
     }
 
-    /// Version + raw fast path: live counter after a write, logical-time
-    /// fallback after a reopen (cold version map), None for the missing.
+    /// Version + raw fast path: live counter after a write, cold (None)
+    /// after a reopen (the view probe costs more than the decode it would
+    /// save — measured), time ETag from the decoded doc instead.
     /// get_json carries the same version the pre-check would see.
     #[tokio::test]
     async fn version_and_raw_json() {
@@ -1201,13 +1193,14 @@ mod tests {
         assert!(v1.is_some(), "counter version after write");
         assert!(db.doc_version("t", "nope").await.unwrap().is_none());
         drop(db);
-        // Reopen: version map is memory-only, so the counter is gone —
-        // the logical time (persisted in the doc bytes) takes over.
+        // Reopen: version map is memory-only, so the counter is gone and
+        // the pre-check stays cold — but get_json still ETags from the
+        // decoded doc's logical time (free, already in hand).
         let db2 = HakoDb::open(&p).unwrap();
-        let v2 = db2.doc_version("t", "v1").await.unwrap();
-        assert!(v2.is_some(), "time fallback after reopen");
+        assert!(db2.doc_version("t", "v1").await.unwrap().is_none());
         let raw = db2.get_json("t", "v1").await.unwrap().unwrap();
-        assert_eq!(raw.version, v2, "pre- and post-fetch agree");
+        let v2 = raw.version;
+        assert!(v2.is_some(), "time ETag post-fetch");
         // Framed fast-path body parses to exactly what the owned
         // get + serde path would emit (key order differs, JSON equal).
         let body = hakobackend_core::frame_doc_json("v1", &raw.json_inner);
