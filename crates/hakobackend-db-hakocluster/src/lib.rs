@@ -59,6 +59,15 @@ impl ClusterDb {
     pub fn read_counts(&self) -> Vec<u64> {
         self.cluster.read_counts()
     }
+
+    /// Flush every member to disk (durability fan-out for Manual mode and
+    /// deterministic tests — the socket tailer only sees flushed bytes).
+    pub async fn flush(&self) -> Result<(), AppError> {
+        for m in &self.members {
+            m.flush().await?;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -213,15 +222,25 @@ mod tests {
         let db = ClusterDb::open(&format!("{a},{b}")).unwrap();
         assert_eq!(db.instance_count(), 2);
         db.insert("c", doc("k1")).await.unwrap();
-        // Fan-out may hit the replica before the tail converges: poll
-        // until the write is visible everywhere, then measure spread.
+        // Flush so the socket tailer sees the write, then poll until the
+        // replica converged (fan-out reads may land anywhere).
+        db.flush().await.unwrap();
+        // Two consecutive hits cover both members under round-robin; a
+        // member that returned the doc keeps it (versions only advance,
+        // nothing deletes here), so from here every read hits.
         let t = std::time::Instant::now();
-        while t.elapsed() < std::time::Duration::from_secs(10) {
-            if db.get("c", "k1").await.unwrap().is_some() {
+        loop {
+            let a = db.get("c", "k1").await.unwrap().is_some();
+            let b = db.get("c", "k1").await.unwrap().is_some();
+            if a && b {
                 break;
             }
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(15),
+                "replica never converged"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        assert!(db.get("c", "k1").await.unwrap().is_some());
         for _ in 0..30 {
             assert!(db.get("c", "k1").await.unwrap().is_some());
         }
