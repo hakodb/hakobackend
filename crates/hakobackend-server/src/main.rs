@@ -1925,19 +1925,19 @@ async fn get_or_list(
                 Ok(Some(raw)) => {
                     if samp {
                         wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
-                        wstats::add(&wstats::G[4], ws_t.elapsed().as_nanos() as u64);
                         ws_t = std::time::Instant::now();
+                    }
+                    let body = hakobackend_core::frame_doc_json(&id, &raw.json_inner);
+                    if samp {
+                        wstats::add(&wstats::G[4], ws_t.elapsed().as_nanos() as u64);
                     }
                     if let Some(v) = raw.version {
                         if etag_match(&headers, v) {
                             return not_modified(v);
                         }
-                        return raw_json(
-                            hakobackend_core::frame_doc_json(&id, &raw.json_inner),
-                            Some(v),
-                        );
+                        return raw_json(body, Some(v));
                     }
-                    raw_json(hakobackend_core::frame_doc_json(&id, &raw.json_inner), None)
+                    raw_json(body, None)
                 }
                 // Driver can't pre-serialize (or doc missing): owned fallback.
                 _ => {

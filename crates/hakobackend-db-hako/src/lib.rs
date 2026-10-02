@@ -381,7 +381,21 @@ impl Database for HakoDb {
         // Bare-key space is shared across collections, but versions only
         // ever increase per mutation: equality still means unchanged (a
         // collision only causes a redundant 200, never a stale 304).
-        Ok(self.inner.current_version(id))
+        if let Some(v) = self.inner.current_version(id) {
+            return Ok(Some(v));
+        }
+        // Cold version map (fresh boot: versions are memory-only, so every
+        // restart starts empty): fall back to the doc's logical time via a
+        // decode-free view. Same-micro distinct writes can't happen on one
+        // node (WAL fsync serializes writers ~ms apart); replicated applies
+        // preserve origin ts+content together, so equal time still means
+        // equal bytes there. Residual hole (LWW time-travel to an exactly
+        // previously-seen micro) is documented, not fixed.
+        match self.inner.get_view(collection, id) {
+            Ok(Some(view)) => Ok(Some(view.time() as u64)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(AppError::Internal(e.to_string())),
+        }
     }
 
     async fn get_json(
@@ -392,11 +406,17 @@ impl Database for HakoDb {
         // ponytail: same direct-call rule as get (decode is µs-scale; the
         // hop costs more). write_json emits response bytes straight from
         // the decoded doc — no serde Value DOM, no HashMap, no to_vec.
+        // Version mirrors doc_version (counter, else logical time) so the
+        // ETag is identical whether it came pre- or post-fetch.
         match self.inner.get(collection, id) {
-            Ok(Some(h)) => Ok(Some(hakobackend_core::RawDoc {
-                version: self.inner.current_version(id),
-                json_inner: h.to_json_bytes(),
-            })),
+            Ok(Some(h)) => {
+                let version =
+                    self.inner.current_version(id).or_else(|| Some(h.get_logical_time() as u64));
+                Ok(Some(hakobackend_core::RawDoc {
+                    version,
+                    json_inner: h.to_json_bytes(),
+                }))
+            }
             Ok(None) => Ok(None),
             Err(e) => Err(AppError::Internal(e.to_string())),
         }
@@ -1009,7 +1029,6 @@ mod tests {
     /// composite/FTS unique stays a clear rejection.
     #[tokio::test]
     async fn unique_shadow_registry() {
-
         use hakobackend_core::{IndexKind, IndexSpec};
         let dir = std::env::temp_dir().join(format!("hakobackend_uniq_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1161,5 +1180,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir_a);
         let _ = std::fs::remove_dir_all(&dir_b);
         let _ = std::fs::remove_dir_all(&sockdir);
+    }
+
+    /// Version + raw fast path: live counter after a write, logical-time
+    /// fallback after a reopen (cold version map), None for the missing.
+    /// get_json carries the same version the pre-check would see.
+    #[tokio::test]
+    async fn version_and_raw_json() {
+        use hakobackend_core::Database as _;
+        let dir = std::env::temp_dir().join(format!("hakobackend_ver_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.to_string_lossy().into_owned();
+        let db = HakoDb::open(&p).unwrap();
+        let doc = hakobackend_core::Doc {
+            id: "v1".into(),
+            data: [("n".to_string(), serde_json::json!(1))].into_iter().collect(),
+        };
+        db.set("t", "v1", doc, false).await.unwrap();
+        let v1 = db.doc_version("t", "v1").await.unwrap();
+        assert!(v1.is_some(), "counter version after write");
+        assert!(db.doc_version("t", "nope").await.unwrap().is_none());
+        drop(db);
+        // Reopen: version map is memory-only, so the counter is gone —
+        // the logical time (persisted in the doc bytes) takes over.
+        let db2 = HakoDb::open(&p).unwrap();
+        let v2 = db2.doc_version("t", "v1").await.unwrap();
+        assert!(v2.is_some(), "time fallback after reopen");
+        let raw = db2.get_json("t", "v1").await.unwrap().unwrap();
+        assert_eq!(raw.version, v2, "pre- and post-fetch agree");
+        // Framed fast-path body parses to exactly what the owned
+        // get + serde path would emit (key order differs, JSON equal).
+        let body = hakobackend_core::frame_doc_json("v1", &raw.json_inner);
+        let framed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let owned = db2.get("t", "v1").await.unwrap().unwrap();
+        let classic: serde_json::Value = serde_json::to_value(&owned).unwrap();
+        assert_eq!(framed, classic);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
