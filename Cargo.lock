@@ -1452,7 +1452,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.2.25"
+version = "0.2.26"
 dependencies = [
  "axum",
  "axum-server",
@@ -1499,9 +1499,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b461498ffaaf09c40f15ec897ff48a4c0caff9e5e584afacf4185b5da51d5a7c"
+checksum = "14258c00dac022451c83ba8c0db3018f9fc2beaecbd07775dc0ffa5a68ac7ac4"
 dependencies = [
  "bincode",
  "cbindgen",
