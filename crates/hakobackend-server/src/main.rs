@@ -317,26 +317,33 @@ struct HotSnap {
     hot: Hot,
 }
 
+/// std RwLock, NOT tokio Mutex: the fast path takes a SHARED read guard
+/// (readers proceed in parallel, ~20 ns, no executor involvement). A tokio
+/// Mutex serializes all 20k+ acq/s through one exclusive queue and convoys
+/// past 800µs under load (measured 0.2.24). Refresh takes the write guard
+/// briefly with no await inside; the fresh fetch happens outside any guard
+/// (double-checked publish below), so the 1/sec writer never stalls readers
+/// past a microsecond.
 struct HotCache {
-    inner: tokio::sync::Mutex<HotSnap>,
+    inner: std::sync::RwLock<HotSnap>,
 }
 
 impl HotCache {
     fn new(hot: Hot) -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(HotSnap { at: Some(std::time::Instant::now()), hot }),
+            inner: std::sync::RwLock::new(HotSnap { at: Some(std::time::Instant::now()), hot }),
         }
     }
 
     async fn get(&self, s: &AppState) -> Hot {
         {
-            let g = self.inner.lock().await;
+            let g = self.inner.read().unwrap();
             if g.at.is_some_and(|t| t.elapsed() < SNAP_TTL) {
                 return g.hot.clone();
             }
         }
-        // Stale: refetch under no lock (awaits), then publish. Two
-        // concurrent refreshes both fetch; last write wins, harmless.
+        // Stale: fetch with no guard held (awaits), then publish only if
+        // still stale (a concurrent refresh may have beaten us).
         let hot = Hot {
             policy: s.policy.get().await,
             db: s.db.read().await.clone(),
@@ -344,14 +351,17 @@ impl HotCache {
             service: s.service.read().await.clone(),
             local: s.local.read().await.clone(),
         };
-        let mut g = self.inner.lock().await;
+        let mut g = self.inner.write().unwrap();
+        if g.at.is_some_and(|t| t.elapsed() < SNAP_TTL) {
+            return g.hot.clone();
+        }
         g.at = Some(std::time::Instant::now());
         g.hot = hot.clone();
         hot
     }
 
     async fn invalidate(&self) {
-        self.inner.lock().await.at = None;
+        self.inner.write().unwrap().at = None;
     }
 }
 
