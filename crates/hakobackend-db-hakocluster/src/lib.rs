@@ -35,8 +35,17 @@ impl ClusterDb {
         if paths.is_empty() {
             return Err(AppError::Internal("cluster driver needs ≥1 data dir".into()));
         }
-        let cluster =
-            hakocluster::Cluster::open(&paths).map_err(|e| AppError::Internal(e))?;
+        // ponytail: socket dir is a SIBLING named "<first-dir>.sync" -
+        // never inside a data dir (Hako lists child dirs as collections,
+        // so it would surface as a phantom collection), and unique per
+        // cluster (parallel tests + multi-tenant boxes share nothing).
+        let sock_dir = std::path::PathBuf::from(
+            format!("{}.sync", paths[0].trim_end_matches('/')),
+        );
+        let mut cfg = hakocluster::ClusterConfig::default();
+        cfg.sock_dir = sock_dir;
+        let cluster = hakocluster::Cluster::open_with_config(&paths, cfg)
+            .map_err(AppError::Internal)?;
         let members = cluster
             .instances()
             .into_iter()
@@ -210,6 +219,7 @@ mod tests {
         db.delete("c", "k1").await.unwrap();
         assert!(db.get("c", "k1").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(format!("{dir}.sync"));
     }
 
     /// Fan-out serves reads across members (distribution, not just
@@ -251,5 +261,6 @@ mod tests {
         assert!(counts.iter().all(|&c| c > 0), "reads spread: {counts:?}");
         let _ = std::fs::remove_dir_all(&a);
         let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(format!("{a}.sync"));
     }
 }
