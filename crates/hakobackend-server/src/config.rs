@@ -177,6 +177,9 @@ pub struct UbConfig {
     pub local_argon2_p_cost: u32,
     pub login_max_attempts: u32,
     pub login_lockout_secs: u64,
+    /// Firebase-style issuance (boot-time; see above).
+    pub local_token_response: bool,
+    pub local_cookies: bool,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -327,6 +330,14 @@ struct FileConfig {
     local_argon2_p_cost: Option<u32>,
     login_max_attempts: Option<u32>,
     login_lockout_secs: Option<u64>,
+    /// Firebase-style issuance (all file-only, boot-time): return tokens
+    /// in the JSON body alongside cookies (`local_token_response`, default
+    /// false) and/or stop setting cookies entirely (`local_cookies`,
+    /// default true). Cookies off without token response is a useless
+    /// login — refused at boot. OAuth callback needs cookies (redirect
+    /// flow carries no body) — that combo is refused at boot too.
+    local_token_response: Option<bool>,
+    local_cookies: Option<bool>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -364,6 +375,21 @@ struct FileConfig {
     #[serde(default)]
     database: LegacyDb,
     policy_file: Option<String>,
+}
+
+/// Issuance-mode guard for Firebase-style local auth (see the fields
+/// above): a cookies-off + tokens-off login would succeed server-side
+/// but hand the client nothing, and the GitHub OAuth callback can only
+/// complete through cookies (redirect carries no body). Both call sites
+/// must run this: boot and --validate (via validate()).
+pub(crate) fn validate_local_modes(cfg: &UbConfig) -> Result<(), String> {
+    if !cfg.local_cookies && !cfg.local_token_response {
+        return Err("local_cookies=false needs local_token_response=true (else logins are useless)".into());
+    }
+    if !cfg.local_cookies && cfg.auth.as_deref().is_some_and(|a| a.contains("github")) {
+        return Err("local_cookies=false breaks the github OAuth callback (redirect carries no body)".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -495,6 +521,8 @@ pub fn resolve(args: &Args) -> UbConfig {
         local_argon2_p_cost: file.local_argon2_p_cost.unwrap_or(1),
         login_max_attempts: file.login_max_attempts.unwrap_or(0),
         login_lockout_secs: file.login_lockout_secs.unwrap_or(300),
+        local_token_response: file.local_token_response.unwrap_or(false),
+        local_cookies: file.local_cookies.unwrap_or(true),
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -673,6 +701,16 @@ limit_auth_burst = 5
 # locked; success clears. Complements the per-IP rate limiter.
 # login_max_attempts = 10
 # login_lockout_secs = 300
+
+# Firebase-style local issuance (cross-origin without browser-cookie
+# surgery): login/refresh also return tokens in the JSON body
+# ({uid, access_token, refresh_token, expires_in, token_type:"Bearer"}),
+# and refresh/logout accept {refresh_token} in the body. Cookies are
+# still set (dual-mode). local_cookies=false stops Set-Cookie entirely
+# (pure-token mode) — requires token_response, and breaks the GitHub
+# OAuth callback (redirect carries no body); both refused at boot.
+# local_token_response = false
+# local_cookies = true
 
 # Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
 # wstats = false
