@@ -377,11 +377,11 @@ struct FileConfig {
     policy_file: Option<String>,
 }
 
-/// Issuance-mode guard for Firebase-style local auth (see the fields
-/// above): a cookies-off + tokens-off login would succeed server-side
-/// but hand the client nothing, and the GitHub OAuth callback can only
-/// complete through cookies (redirect carries no body). Both call sites
-/// must run this: boot and --validate (via validate()).
+/// Issuance-mode guard for Firebase-style local auth (see the FileConfig
+/// keys above): a cookies-off + tokens-off login would succeed
+/// server-side but hand the client nothing, and the GitHub OAuth callback
+/// can only complete through cookies (redirect carries no body). Both
+/// call sites must run this: boot and --validate (via validate()).
 pub(crate) fn validate_local_modes(cfg: &UbConfig) -> Result<(), String> {
     if !cfg.local_cookies && !cfg.local_token_response {
         return Err("local_cookies=false needs local_token_response=true (else logins are useless)".into());

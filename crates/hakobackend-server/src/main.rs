@@ -113,6 +113,10 @@ struct AppState {
     login_guard: Arc<loginguard::LoginGuard>,
     /// Self-service registration open (closed = admin-created users only).
     local_register: bool,
+    /// Firebase-style issuance: also return tokens in the JSON body.
+    local_token_response: bool,
+    /// Set session cookies (false = pure-token mode, no Set-Cookie).
+    local_cookies: bool,
 }
 
 /// Session cookie flags (config-file driven, boot-time). Defaults mirror
@@ -662,6 +666,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.login_lockout_secs,
         )),
         local_register: cfg.local_register,
+        local_token_response: cfg.local_token_response,
+        local_cookies: cfg.local_cookies,
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -3199,6 +3205,33 @@ fn clear_cookies(conf: &CookieConf) -> HeaderMap {
     h
 }
 
+/// Issuance rendering (Firebase-style dual-mode, all config-gated):
+/// cookies per `cookies_on`, JSON body tokens per `token_response`.
+/// Default (cookies on, tokens off): cookies only, body `{uid}` —
+/// byte-identical to the old shape. Pure function, tested below.
+fn render_issuance(
+    conf: &CookieConf,
+    local: &LocalAuth,
+    tokens: &hakobackend_auth_local::SessionTokens,
+    uid: &str,
+    token_response: bool,
+    cookies_on: bool,
+) -> (HeaderMap, serde_json::Value) {
+    let h = if cookies_on {
+        session_cookies(local, tokens, conf)
+    } else {
+        HeaderMap::new()
+    };
+    let mut body = serde_json::json!({ "uid": uid });
+    if token_response {
+        body["access_token"] = tokens.access_jwt.clone().into();
+        body["refresh_token"] = tokens.refresh_opaque.clone().into();
+        body["expires_in"] = local.access_ttl().into();
+        body["token_type"] = "Bearer".into();
+    }
+    (h, body)
+}
+
 async fn local_or_400(s: &AppState) -> Result<Arc<LocalAuth>, Response> {
     s.hot().await.local.clone().ok_or_else(|| {
         (StatusCode::BAD_REQUEST, "local auth is not active (see --auth)").into_response()
@@ -4277,6 +4310,8 @@ mod tests {
             csrf_check: true,
             login_guard: Arc::new(loginguard::LoginGuard::new(0, 300)),
             local_register: true,
+            local_token_response: false,
+            local_cookies: true,
         };
         (st, raw)
     }
