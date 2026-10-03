@@ -126,6 +126,28 @@ impl LocalAuth {
         self.cfg.refresh_ttl_secs
     }
 
+    /// Test-only constructor (no env, no db): enough for pure helpers
+    /// (TTL reads, cookie rendering). Panics nowhere; never use in prod.
+    #[cfg(test)]
+    pub fn build_test() -> Arc<Self> {
+        use std::sync::Mutex;
+        Arc::new(Self {
+            cfg: LocalConfig {
+                jwt_secret: vec![0u8; 32],
+                access_ttl_secs: 600,
+                refresh_ttl_secs: 30 * 86400,
+                password_min_length: 8,
+                argon2_m_kb: 19456,
+                argon2_t_cost: 2,
+                argon2_p_cost: 1,
+            },
+            db: Arc::new(TestDb),
+            identity: Identity::default(),
+            dpop_mode: Mutex::new(DpopMode::Off),
+            dpop_replay: Mutex::new(dpop::ReplayCache::default()),
+        })
+    }
+
     async fn find_user(&self, login: &str) -> Result<Doc, AppError> {
         if let Some(d) = self.db.get(self.users(), login).await.map_err(internal)? {
             return Ok(d);
@@ -436,6 +458,66 @@ impl LocalAuth {
                 Ok(Some(v.jkt))
             }
         }
+    }
+}
+
+/// Test-only empty database (all ops no-op/empty). Enough for
+/// constructors and pure helpers; real behavior lives in the FakeDb
+/// tests below.
+#[cfg(test)]
+pub struct TestDb;
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Database for TestDb {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            driver: "test",
+            supports_watch: false,
+            supports_transactions: false,
+            supports_composite: false,
+            supports_fts: false,
+            supports_drop_index: false,
+            supports_unique: false,
+            supports_named_index: false,
+            supports_native_aggregation: false,
+        }
+    }
+    async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
+        Ok(())
+    }
+    async fn list_collections(&self) -> Result<Vec<String>, AppError> {
+        Ok(vec![])
+    }
+    async fn get(&self, _c: &str, _i: &str) -> Result<Option<Doc>, AppError> {
+        Ok(None)
+    }
+    async fn list(&self, _c: &str, _q: &QueryOptions) -> Result<Vec<Doc>, AppError> {
+        Ok(vec![])
+    }
+    async fn insert(&self, _c: &str, doc: Doc) -> Result<Doc, AppError> {
+        Ok(doc)
+    }
+    async fn set(&self, _c: &str, _i: &str, doc: Doc, _m: bool) -> Result<Doc, AppError> {
+        Ok(doc)
+    }
+    async fn delete(&self, _c: &str, _i: &str) -> Result<Option<Doc>, AppError> {
+        Ok(None)
+    }
+    async fn count(&self, _c: &str, _q: &QueryOptions) -> Result<u64, AppError> {
+        Ok(0)
+    }
+    async fn subscribe(&self, _c: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
+        Ok(tokio::sync::broadcast::channel(1).0.subscribe())
+    }
+    async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
+        Err(AppError::BadRequest("test db".into()))
+    }
+    async fn list_indexes(&self, _c: &str) -> Result<Vec<hakobackend_core::IndexInfo>, AppError> {
+        Ok(vec![])
+    }
+    async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
+        Err(AppError::BadRequest("test db".into()))
     }
 }
 
