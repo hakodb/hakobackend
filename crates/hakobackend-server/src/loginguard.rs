@@ -59,8 +59,8 @@ impl LoginGuard {
         self.max_attempts == 0
     }
 
-    /// Full window seconds (for audit edge detection: a fresh lock has the
-    /// full window remaining; a pre-existing lock shows a remainder).
+    /// Full window seconds (kept for callers needing a duration; the
+    /// transition oracle is fail()'s return).
     pub fn window_secs(&self) -> u64 {
         self.window.as_secs()
     }
@@ -83,9 +83,12 @@ impl LoginGuard {
 
     /// Record a failed attempt (wrong password, unknown user, DPoP fail —
     /// all uniform: recording unknowns too avoids a lock oracle).
-    pub fn fail(&self, login: &str) {
+    /// Returns Some(full window secs) exactly on the open→locked
+    /// transition (emit one `auth.lockout`), None otherwise (still free
+    /// or already locked — those signals ride the 401/429 themselves).
+    pub fn fail(&self, login: &str) -> Option<u64> {
         if self.is_off() {
-            return;
+            return None;
         }
         let now = self.now();
         let mut g = self.entries.lock().unwrap();
@@ -105,8 +108,17 @@ impl LoginGuard {
         }
         e.fails += 1;
         e.last = now;
+        let was_locked = e.locked_until.is_some_and(|u| u > now);
         if e.fails >= self.max_attempts.max(1) {
             e.locked_until = Some(now + self.window);
+        }
+        // Transition edge only: open→locked returns Some (emit once),
+        // already-locked or still-free returns None (the 429 + locked=true
+        // fail carry those signals; no second probe, no race).
+        if !was_locked && e.locked_until.is_some_and(|u| u > now) {
+            Some(self.window.as_secs())
+        } else {
+            None
         }
     }
 
@@ -162,10 +174,11 @@ mod tests {
         let m = Manual::new();
         let g = guard(&m);
         assert_eq!(g.locked_secs("u"), None);
-        g.fail("u");
-        g.fail("u");
+        // fail() edge: Some only on the transition, None before/after.
+        assert_eq!(g.fail("u"), None);
+        assert_eq!(g.fail("u"), None);
         assert_eq!(g.locked_secs("u"), None, "2 < 3");
-        g.fail("u");
+        assert_eq!(g.fail("u"), Some(60), "transition emits once");
         let s = g.locked_secs("u").expect("locked");
         assert!((1..=60).contains(&s));
         // Correct password during lock still denied (caller checks first).
@@ -173,8 +186,8 @@ mod tests {
         // Window passes: free again, count reset.
         m.advance(Duration::from_secs(61));
         assert_eq!(g.locked_secs("u"), None);
-        g.fail("u");
-        assert_eq!(g.locked_secs("u"), None, "old strikes forgotten");
+        assert_eq!(g.fail("u"), None, "old strikes forgotten");
+        assert_eq!(g.locked_secs("u"), None);
     }
 
     #[test]
