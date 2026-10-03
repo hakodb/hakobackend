@@ -724,24 +724,24 @@ mod tests {
 
     #[test]
     fn doc_serializes_sorted_id_first() {
-        // Live DHP proof: 5 identical bodies, 5 md5s (HashMap order).
+        // Field report: 5 identical bodies, 5 md5s (HashMap order).
         // id first, data keys byte-sorted — byte-stable across requests.
         let doc = Doc {
-            id: "20251464".into(),
+            id: "S25000001".into(),
             data: [
-                ("nim".to_string(), serde_json::json!("F1251251023")),
+                ("sid".to_string(), serde_json::json!("S25000001")),
                 ("_time".to_string(), serde_json::json!(1)),
-                ("agama".to_string(), serde_json::json!("Islam")),
+                ("status".to_string(), serde_json::json!("aktif")),
             ]
             .into_iter()
             .collect(),
         };
         let bytes = serde_json::to_vec(&doc).unwrap();
         let s = std::str::from_utf8(&bytes).unwrap();
-        assert!(s.starts_with(r#"{"id":"20251464","_time":1,"agama":"Islam","nim":"F1251251023"}"#), "{s}");
+        assert!(s.starts_with(r#"{"id":"S25000001","_time":1,"sid":"S25000001","status":"aktif"}"#), "{s}");
         // Flat wire shape still deserializes (id + sibling fields).
         let back: Doc = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(back.id, "20251464");
+        assert_eq!(back.id, "S25000001");
         assert_eq!(back.data.len(), 3);
     }
 

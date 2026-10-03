@@ -1,6 +1,6 @@
 # Design Notes: Universal Backend (Rust + Axum) — successor to `rethink-firestore/backend`
 
-> Legacy backend status: ~90% mature, in production at `https://api.chemedu.site/api`.
+> Legacy backend status: ~90% mature, in production at `https://api.example.com/api`.
 > Problem: rigid security (`userrules.ts` + mandatory Firebase Auth) → hard for general developers to reuse.
 > This project's position: `hakodb` org candidate (`hakobackend`) — HakoDB as the default driver,
 > but HakoDB is **not** mandatory (other databases are plug-and-play).

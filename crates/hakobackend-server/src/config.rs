@@ -561,7 +561,7 @@ pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# universalbackend — config templ
 # CLI flags always win over this file.
 # host: IP literal binds as-is; a hostname resolves via DNS at startup
 # (unknown names refuse to boot). "0.0.0.0", "127.0.0.1",
-# "api.chemedu.site" all work — generic listen like any other service.
+# "api.example.com" all work — generic listen like any other service.
 host = "0.0.0.0"
 port = 3000
 
@@ -645,7 +645,7 @@ limit_auth_burst = 5
 # Domain designation: serve ONLY these Host values (plus loopback, which
 # always passes). Anything else is refused with 421 before limiter/auth.
 # Empty = serve all Hosts (yesterday's default). Boot-time like listen.
-# allowed_hosts = ["api.chemedu.site"]
+# allowed_hosts = ["api.example.com"]
 
 # Hako socket_sync peering (hako driver ONLY; other drivers refuse these
 # keys at startup). Serve this instance and/or dial peers over unix
@@ -811,16 +811,16 @@ mod tests {
         assert!(resolve(&args()).allowed_hosts.is_empty());
         let f = write_tmp(
             "hakobackend_hosts_test.toml",
-            "allowed_hosts = [\"api.chemedu.site\"]\n",
+            "allowed_hosts = [\"api.example.com\"]\n",
         );
         let mut a = args();
         a.config = Some(f.clone());
-        assert_eq!(resolve(&a).allowed_hosts, vec!["api.chemedu.site".to_string()]);
+        assert_eq!(resolve(&a).allowed_hosts, vec!["api.example.com".to_string()]);
         // Flags append to the file base.
         a.allowed_hosts = vec!["other.example".into()];
         assert_eq!(
             resolve(&a).allowed_hosts,
-            vec!["api.chemedu.site".to_string(), "other.example".to_string()]
+            vec!["api.example.com".to_string(), "other.example".to_string()]
         );
         let _ = std::fs::remove_file(f);
     }

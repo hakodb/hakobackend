@@ -751,7 +751,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Hostnames resolve here (IPs bind as-is): generic listen like any
     // other service — `host` accepts "0.0.0.0", "127.0.0.1",
-    // "api.chemedu.site", ...; DNS failure fails boot, loudly.
+    // "api.example.com", ...; DNS failure fails boot, loudly.
     // Multi-bind: comma-separated hosts (IPs or DNS names), one listener
     // per resolved address. Fail-closed before serving anything.
     let bind_ips = resolve_bind_ips(&cfg.host)
@@ -1601,7 +1601,7 @@ async fn health() -> impl IntoResponse {
 
 /// Readiness (LBs/K8s + browser dashboards): the driver answers, not
 /// just the socket. Hardcoded `Access-Control-Allow-Origin: *` (per
-/// fkip-234 monitoring report): the body is a public boolean (no auth,
+/// field monitoring report): the body is a public boolean (no auth,
 /// no credentials, nothing to leak), and probes must not depend on the
 /// CORS allowlist. health stays header-clean (hottest path, non-browser
 /// probes only).
@@ -3667,13 +3667,13 @@ mod tests {
     #[test]
     fn host_allowlist_matching() {
         // Empty = off (yesterday's default: everything passes).
-        assert!(host_allowed(&[], Some("api.chemedu.site")));
+        assert!(host_allowed(&[], Some("api.example.com")));
         assert!(host_allowed(&[], None));
-        let allowed = vec!["api.chemedu.site".to_string()];
+        let allowed = vec!["api.example.com".to_string()];
         // Exact, case-insensitive, port-stripped.
-        assert!(host_allowed(&allowed, Some("api.chemedu.site")));
-        assert!(host_allowed(&allowed, Some("API.CHEMEDU.SITE")));
-        assert!(host_allowed(&allowed, Some("api.chemedu.site:3010")));
+        assert!(host_allowed(&allowed, Some("api.example.com")));
+        assert!(host_allowed(&allowed, Some("API.EXAMPLE.COM")));
+        assert!(host_allowed(&allowed, Some("api.example.com:3010")));
         // Loopback ALWAYS passes (local probes, loopback svc, dev) even
         // with a list set — infra-local traffic is never gated.
         assert!(host_allowed(&allowed, Some("127.0.0.1:3005")));
@@ -3696,10 +3696,10 @@ mod tests {
         assert_eq!(request_host(&req), Some("evil.example"));
         // h2 shape: no Host header, :authority from the URI.
         let req = Request::builder()
-            .uri("https://api.chemedu.site:3005/api/ready")
+            .uri("https://api.example.com:3005/api/ready")
             .body(axum::body::Body::empty())
             .unwrap();
-        assert_eq!(request_host(&req), Some("api.chemedu.site:3005"));
+        assert_eq!(request_host(&req), Some("api.example.com:3005"));
         // Neither: refuse path (host_allowed handles).
         let req = Request::builder()
             .uri("/api/ready")
@@ -3713,7 +3713,7 @@ mod tests {
         use std::net::{IpAddr, SocketAddr};
         let lo4: IpAddr = "127.0.0.1".parse().unwrap();
         let any4: IpAddr = "0.0.0.0".parse().unwrap();
-        let pub4: IpAddr = "203.24.51.237".parse().unwrap();
+        let pub4: IpAddr = "203.0.113.237".parse().unwrap();
         let lo6: IpAddr = "::1".parse().unwrap();
         // TLS off: plain is already served wherever it binds - no companion.
         assert_eq!(plain_companion_for(false, true, &[pub4], 3005), None);
@@ -3753,10 +3753,10 @@ mod tests {
     fn cors_echoes_http_origins_only() {
         // Mirrors the nginx map it replaces: echo any http(s) Origin.
         let open: Vec<String> = vec![];
-        let h = cors_headers(Some("https://app.chemedu.site"), &open).unwrap();
+        let h = cors_headers(Some("https://app.example.com"), &open).unwrap();
         assert_eq!(
             h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
-            "https://app.chemedu.site"
+            "https://app.example.com"
         );
         assert_eq!(
             h.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(),
@@ -3807,30 +3807,30 @@ mod tests {
 
     #[test]
     fn csrf_strips_ports_both_sides() {
-        // DHP Temuan #4: portal :443 -> API :3000, same host. Origin as
+        // Cross-port same-host: app :443 -> API :3000. Origin as
         // browsers send it (default port omitted) vs Host with port.
         assert!(csrf_origin_ok(
-            Some("dhp.fkip.untan.ac.id:3000"),
-            Some("https://dhp.fkip.untan.ac.id")
+            Some("api.example.com:3000"),
+            Some("https://api.example.com")
         ));
         // Exact same + explicit port both sides.
         assert!(csrf_origin_ok(
-            Some("dhp.fkip.untan.ac.id:3000"),
-            Some("https://dhp.fkip.untan.ac.id:3000")
+            Some("api.example.com:3000"),
+            Some("https://api.example.com:3000")
         ));
         // True cross-site still fails (with and without ports).
         assert!(!csrf_origin_ok(
-            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("api.example.com:3000"),
             Some("https://evil.example.com")
         ));
         assert!(!csrf_origin_ok(
-            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("api.example.com:3000"),
             Some("https://evil.example.com:3000")
         ));
         // Subdomain games fail.
         assert!(!csrf_origin_ok(
-            Some("dhp.fkip.untan.ac.id:3000"),
-            Some("https://dhp.fkip.untan.ac.id.evil.com")
+            Some("api.example.com:3000"),
+            Some("https://api.example.com.evil.com")
         ));
         // Absent Origin (curl/scripts) passes; absent Host fails closed
         // against any Origin.
