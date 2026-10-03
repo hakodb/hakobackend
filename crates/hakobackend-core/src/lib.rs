@@ -14,11 +14,33 @@ pub mod ttl;
 
 /// One document: identical to the JSON shape used by the legacy wire protocol
 /// (`GET /api/collections/<path>/<id>` returns this object + `id`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialization is MANUAL (not derived): `id` first, then data keys in
+/// byte-sorted order, no DOM. A derived `flatten` would emit the HashMap
+/// in RANDOM order per request (live DHP proof: 5 identical bodies, 5
+/// md5s) — breaking byte-caches, signatures, and snapshots for zero
+/// benefit. Matches `frame_doc_json` (id-first) on the fast path.
+#[derive(Debug, Clone, Deserialize)]
 pub struct Doc {
     pub id: String,
+    // flatten kept for DEserialization only (flat wire shape: id lives
+    // alongside the fields). Serialization is manual above (sorted).
     #[serde(flatten)]
     pub data: HashMap<String, serde_json::Value>,
+}
+
+impl Serialize for Doc {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(self.data.len() + 1))?;
+        m.serialize_entry("id", &self.id)?;
+        let mut keys: Vec<&String> = self.data.keys().collect();
+        keys.sort();
+        for k in keys {
+            m.serialize_entry(k, &self.data[k])?;
+        }
+        m.end()
+    }
 }
 
 /// Numeric coercion for sum/avg: JSON numbers only (ints exact while small
@@ -698,6 +720,29 @@ mod tests {
         let odd = frame_doc_json("z", b"[1,2]");
         let v3: serde_json::Value = serde_json::from_slice(&odd).unwrap();
         assert_eq!(v3, serde_json::json!({"id": "z", "_value": [1, 2]}));
+    }
+
+    #[test]
+    fn doc_serializes_sorted_id_first() {
+        // Live DHP proof: 5 identical bodies, 5 md5s (HashMap order).
+        // id first, data keys byte-sorted — byte-stable across requests.
+        let doc = Doc {
+            id: "20251464".into(),
+            data: [
+                ("nim".to_string(), serde_json::json!("F1251251023")),
+                ("_time".to_string(), serde_json::json!(1)),
+                ("agama".to_string(), serde_json::json!("Islam")),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let bytes = serde_json::to_vec(&doc).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with(r#"{"id":"20251464","_time":1,"agama":"Islam","nim":"F1251251023"}"#), "{s}");
+        // Flat wire shape still deserializes (id + sibling fields).
+        let back: Doc = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.id, "20251464");
+        assert_eq!(back.data.len(), 3);
     }
 
     #[test]
