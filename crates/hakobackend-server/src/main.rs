@@ -773,9 +773,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Outermost: total-latency clock + sample flag (front_mw runs first).
     // alias_mw sits INSIDE front_mw (timed) but OUTSIDE host/limit/auth:
     // rewrites land before every gate, so downstream cannot distinguish
-    // an alias call from a direct one.
-    .layer(middleware::from_fn(front_mw))
+    // an alias call from a direct one. (Layer order: added LAST = runs
+    // FIRST — alias must precede front_mw, not follow it.)
     .layer(middleware::from_fn_with_state(state.clone(), alias_mw))
+    .layer(middleware::from_fn(front_mw))
     .with_state(state);
     if tls && hsts_max_age > 0 {
         // HSTS only meaningful via TLS (no effect on plain http).
