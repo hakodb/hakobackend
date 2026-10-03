@@ -3375,9 +3375,43 @@ async fn alias_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Re
     } else {
         format!("{target_path}?{merged}")
     };
-    parts.path_and_query = Some(pq.parse().expect("alias target is pre-validated ASCII"));
+    // Targets carry JSON in the query (options={...}): `{`, `}`, `"`,
+    // `[`, `]`, spaces are legal after axum decodes the query but NOT in
+    // a raw Uri string (InvalidUriChar -> worker crash, empty reply).
+    // Re-encode the query side (path side is already slot-encoded).
+    // allow: unreserved + sub-delims + :@/? (RFC 3986 query) + `%`
+    // (slot-encoded %XX from capture substitution, never double-encoded).
+    // Everything else (notably `{`, `}`, `"`) becomes %XX; downstream
+    // Query decoding restores the exact JSON bytes.
+    let pq = reencode_query(&pq);
+    parts.path_and_query = Some(pq.parse().expect("alias target re-encodes to valid URI"));
     *req.uri_mut() = axum::http::Uri::from_parts(parts).expect("alias target is a valid URI");
     next.run(req).await
+}
+
+/// Percent-encode a `path?query` string's query side for Uri parsing.
+/// Path passes through (slot-encoded at rewrite); every query byte
+/// outside the allowed set becomes %XX.
+fn reencode_query(pq: &str) -> String {
+    let Some(qi) = pq.find('?') else {
+        return pq.to_string();
+    };
+    let (path, query) = pq.split_at(qi);
+    let query = &query[1..]; // skip the `?` itself (split_at keeps it)
+    let mut out = String::with_capacity(pq.len() + 16);
+    out.push_str(path);
+    out.push('?');
+    for b in query.as_bytes() {
+        match b {
+            b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z'
+            | b'-' | b'_' | b'.' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')'
+            | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@' | b'/' | b'?' | b'%' => {
+                out.push(*b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// DPoP proof components for issuance (login/refresh): htu = absolute URI of this endpoint.
@@ -4082,6 +4116,22 @@ mod tests {
         assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]:3000")));
         assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]")));
         assert!(!csrf_origin_ok(Some("[::1]:3000"), Some("http://[::2]:3000")));
+    }
+
+    #[test]
+    fn reencode_query_keeps_json() {
+        // options={...} must survive Uri parsing (the #5 crash vector:
+        // `{`, `}`, `"` are InvalidUriChar raw) and decode back byte-identical.
+        let pq = "/api/collections/s?options={\"filters\":[],\"limit\":1}";
+        let out = reencode_query(pq);
+        // Structural chars are encoded, never raw.
+        assert!(out.contains("%7B") && out.contains("%7D") && out.contains("%22"));
+        // The encoded form parses as a Uri (this panicked before the fix).
+        let uri: axum::http::Uri = out.parse().expect("re-encoded alias target parses");
+        assert_eq!(uri.path(), "/api/collections/s");
+        // Spaces encode; paths without query pass through.
+        assert_eq!(reencode_query("/a?x=a b"), "/a?x=a%20b");
+        assert_eq!(reencode_query("/a"), "/a");
     }
 
     #[test]
