@@ -13,6 +13,7 @@ mod config;
 mod bench;
 mod realtime;
 mod tokcache;
+mod loginguard;
 
 use axum::{
     Json, Router,
@@ -107,6 +108,11 @@ struct AppState {
     ws_max_subs: usize,
     /// CSRF Origin-vs-Host gate on (boot-time, config).
     csrf_check: bool,
+    /// Per-account login lockout (brute-force backstop behind the IP
+    /// limiter; rotating IPs don't help against this).
+    login_guard: Arc<loginguard::LoginGuard>,
+    /// Self-service registration open (closed = admin-created users only).
+    local_register: bool,
 }
 
 /// Session cookie flags (config-file driven, boot-time). Defaults mirror
@@ -597,6 +603,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let policy = Arc::new(PolicyHot::new(cfg.rules.clone()));
+    bridge_local_env(&cfg);
     let (chain, local, github) = open_auth(cfg.auth.as_deref(), db.clone(), policy.identity_snapshot());
     auto_provision(&db, &policy.get().await, &cfg.indexes).await;
 
@@ -650,6 +657,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ws_max_msg: cfg.ws_max_msg_kb.saturating_mul(1024) as usize,
         ws_max_subs: cfg.ws_max_subs as usize,
         csrf_check: cfg.csrf_origin_check,
+        login_guard: Arc::new(loginguard::LoginGuard::new(
+            cfg.login_max_attempts,
+            cfg.login_lockout_secs,
+        )),
+        local_register: cfg.local_register,
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -1032,6 +1044,26 @@ fn open_auth(
     identity: Identity,
 ) -> (AuthChain, Option<Arc<LocalAuth>>, Option<Arc<GithubOAuth>>) {
     open_auth_result(value, db, identity).unwrap_or_else(|e| panic!("[ub] auth: {e}"))
+}
+
+/// Config-file → env bridge for local-auth knobs (env wins when set;
+/// same precedent as `UB_PUBLIC_URL`). Runs at boot AND reload so file
+/// values apply without restart. Env set once wins forever after (even
+/// if the file key is later removed) — documented, consistent.
+fn bridge_local_env(cfg: &config::UbConfig) {
+    let set = |k: &str, v: Option<String>| {
+        if std::env::var(k).is_err() {
+            if let Some(val) = v {
+                std::env::set_var(k, val);
+            }
+        }
+    };
+    set("UB_LOCAL_PASSWORD_MIN", Some(cfg.local_password_min_length.to_string()));
+    set("UB_LOCAL_ACCESS_TTL", Some(cfg.local_access_ttl_secs.to_string()));
+    set("UB_LOCAL_REFRESH_TTL", Some(cfg.local_refresh_ttl_secs.to_string()));
+    set("UB_LOCAL_ARGON2_M_KB", Some(cfg.local_argon2_m_kb.to_string()));
+    set("UB_LOCAL_ARGON2_T_COST", Some(cfg.local_argon2_t_cost.to_string()));
+    set("UB_LOCAL_ARGON2_P_COST", Some(cfg.local_argon2_p_cost.to_string()));
 }
 
 fn open_auth_result(
@@ -1635,6 +1667,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     let identity = s.hot().await.policy.identity.clone();
+    bridge_local_env(&cfg);
     let (chain, local, github) = match open_auth_result(cfg.auth.as_deref(), db.clone(), identity) {
         Ok(v) => v,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
@@ -3184,6 +3217,12 @@ async fn auth_register(
     State(s): State<AppState>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // Settled deployments close self-service (admin-created users only).
+    // 403, explicit: the endpoint's existence is not a secret (login
+    // pages link it), and silence would confuse legitimate users.
+    if !s.local_register {
+        return err(StatusCode::FORBIDDEN, "registration closed by administrator");
+    }
     let local = match issuance_local(&s).await {
         Ok(l) => l,
         Err(e) => return e,
@@ -3245,15 +3284,27 @@ async fn auth_login(
     let password = str_field(&owned, &["password"]);
     match (login, password) {
         (Some(l), Some(p)) => {
+            // Per-account lockout BEFORE verification: locked attempts
+            // never burn Argon2 CPU, and the 429 (with Retry-After) is
+            // uniform whether or not the account exists.
+            if let Some(retry) = s.login_guard.locked_secs(&l) {
+                let mut h = HeaderMap::new();
+                h.insert(header::RETRY_AFTER, retry.to_string().parse().unwrap());
+                return (StatusCode::TOO_MANY_REQUESTS, h, "too many login attempts").into_response();
+            }
             let (proof, uri) = issuance_parts(&s, &headers, "/api/auth/login");
             let dpop = proof.as_deref().map(|proof| DpopRequest { proof, method: "POST", uri: &uri });
             match local.login(&l, &p, dpop).await {
                 Ok((ctx, tokens)) => {
+                    s.login_guard.clear(&l);
                     let headers = session_cookies(&local, &tokens, &s.cookies);
                     (StatusCode::OK, headers, Json(serde_json::json!({ "uid": ctx.uid }))).into_response()
                 }
                 // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
-                Err(_) => err(StatusCode::UNAUTHORIZED, "invalid credentials"),
+                Err(_) => {
+                    s.login_guard.fail(&l);
+                    err(StatusCode::UNAUTHORIZED, "invalid credentials")
+                }
             }
         }
         _ => err(StatusCode::BAD_REQUEST, "login + password required"),
@@ -4196,6 +4247,7 @@ mod tests {
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
                 compress: false, body_limit_mb: None, cors_allowed_origins: vec![],
+                no_local_register: false,
                 wstats: false, benchmark: false, sock: None, http2: false,
                 sync_serve: None, sync_peer: vec![], allowed_hosts: vec![],
             }),
@@ -4223,6 +4275,8 @@ mod tests {
             ws_max_msg: 1024 * 1024,
             ws_max_subs: 100,
             csrf_check: true,
+            login_guard: Arc::new(loginguard::LoginGuard::new(0, 300)),
+            local_register: true,
         };
         (st, raw)
     }

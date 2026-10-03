@@ -101,6 +101,11 @@ pub struct Args {
     /// acks at merge time, driver failures surface in logs.
     #[arg(long, default_value_t = false)]
     pub coalesce_writes: bool,
+    /// Close self-service registration (admin-created users only).
+    /// Default open (today's behavior); file `local_register = false`
+    /// does the same without the flag.
+    #[arg(long = "no-local-register", default_value_t = false)]
+    pub no_local_register: bool,
     /// Gzip responses above 1 KB (default OFF: realtime backend optimizes
     /// latency + CPU; bandwidth is the proxy's job when one fronts this).
     #[arg(long, default_value_t = false)]
@@ -156,6 +161,22 @@ pub struct UbConfig {
     pub ws_max_subs: u64,
     /// CSRF Origin-vs-Host gate on (default true; file-only, boot-time).
     pub csrf_origin_check: bool,
+    /// Self-service registration open (default true; flag
+    /// --no-local-register closes). Boot-time.
+    pub local_register: bool,
+    /// Local-auth tuning (all file-only, boot-time; env wins when set —
+    /// see bridge_local_env): password minimum chars (default 8),
+    /// session TTLs seconds (defaults 600 / 30 days), Argon2id costs
+    /// (defaults m 19456 KB / t 2 / p 1), login lockout attempts (0 = off,
+    /// default) + lockout seconds (default 300).
+    pub local_password_min_length: u32,
+    pub local_access_ttl_secs: u64,
+    pub local_refresh_ttl_secs: u64,
+    pub local_argon2_m_kb: u32,
+    pub local_argon2_t_cost: u32,
+    pub local_argon2_p_cost: u32,
+    pub login_max_attempts: u32,
+    pub login_lockout_secs: u64,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -295,8 +316,17 @@ struct FileConfig {
     ws_max_msg_kb: Option<u64>,
     ws_max_subs: Option<u64>,
     /// CSRF Origin-vs-Host gate for cookie-authed mutations (default on).
-    /// Off only for debugging behind a sanitizing gateway (documented risk).
+    /// Off only behind a sanitizing gateway (documented risk).
     csrf_origin_check: Option<bool>,
+    local_register: Option<bool>,
+    local_password_min_length: Option<u32>,
+    local_access_ttl_secs: Option<u64>,
+    local_refresh_ttl_secs: Option<u64>,
+    local_argon2_m_kb: Option<u32>,
+    local_argon2_t_cost: Option<u32>,
+    local_argon2_p_cost: Option<u32>,
+    login_max_attempts: Option<u32>,
+    login_lockout_secs: Option<u64>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -456,6 +486,15 @@ pub fn resolve(args: &Args) -> UbConfig {
         ws_max_msg_kb: file.ws_max_msg_kb.unwrap_or(1024),
         ws_max_subs: file.ws_max_subs.unwrap_or(100),
         csrf_origin_check: file.csrf_origin_check.unwrap_or(true),
+        local_register: !args.no_local_register && file.local_register.unwrap_or(true),
+        local_password_min_length: file.local_password_min_length.unwrap_or(8),
+        local_access_ttl_secs: file.local_access_ttl_secs.unwrap_or(600),
+        local_refresh_ttl_secs: file.local_refresh_ttl_secs.unwrap_or(30 * 86400),
+        local_argon2_m_kb: file.local_argon2_m_kb.unwrap_or(19456),
+        local_argon2_t_cost: file.local_argon2_t_cost.unwrap_or(2),
+        local_argon2_p_cost: file.local_argon2_p_cost.unwrap_or(1),
+        login_max_attempts: file.login_max_attempts.unwrap_or(0),
+        login_lockout_secs: file.login_lockout_secs.unwrap_or(300),
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -617,6 +656,24 @@ limit_auth_burst = 5
 # from both sides before compare. Off only behind a sanitizing gateway.
 # csrf_origin_check = true
 
+# Local-auth hardening (all file-only, boot-time; UB_LOCAL_* env wins
+# when set). Defaults = today's behavior.
+# Self-service registration (default open; false = admin-created only).
+# local_register = true  # or --no-local-register
+# Password minimum chars (default 8) + Argon2id costs (m KiB / t / p).
+# local_password_min_length = 8
+# local_argon2_m_kb = 19456
+# local_argon2_t_cost = 2
+# local_argon2_p_cost = 1
+# Session TTLs seconds (defaults 600 / 30 days).
+# local_access_ttl_secs = 600
+# local_refresh_ttl_secs = 2592000
+# Per-account login lockout: N consecutive fails within the window lock
+# the login for the same window (0 = off, default). Uniform 429 while
+# locked; success clears. Complements the per-IP rate limiter.
+# login_max_attempts = 10
+# login_lockout_secs = 300
+
 # Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
 # wstats = false
 # Internal per-driver benchmark (same as --benchmark): fixed shapes,
@@ -707,6 +764,7 @@ mod tests {
             validate: false,
             print_default_config: false,
             coalesce_writes: false,
+            no_local_register: false,
             compress: false,
             wstats: false,
             benchmark: false,
@@ -873,6 +931,33 @@ mod tests {
             vec!["https://a.example".to_string(), "https://b.example".to_string()]
         );
         assert_eq!(cfg.body_limit_mb, 32);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn auth_hardening_defaults_and_overrides() {
+        // Defaults = today's behavior (open register, min 8, no lockout).
+        let cfg = resolve(&args());
+        assert!(cfg.local_register);
+        assert_eq!(cfg.local_password_min_length, 8);
+        assert_eq!((cfg.local_access_ttl_secs, cfg.local_refresh_ttl_secs), (600, 30 * 86400));
+        assert_eq!((cfg.local_argon2_m_kb, cfg.local_argon2_t_cost, cfg.local_argon2_p_cost), (19456, 2, 1));
+        assert_eq!((cfg.login_max_attempts, cfg.login_lockout_secs), (0, 300));
+        // File closes register + tightens policy + enables lockout.
+        let f = write_tmp(
+            "hakobackend_authn_test.toml",
+            "local_register = false\nlocal_password_min_length = 12\nlogin_max_attempts = 5\nlogin_lockout_secs = 120\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert!(!cfg.local_register);
+        assert_eq!(cfg.local_password_min_length, 12);
+        assert_eq!((cfg.login_max_attempts, cfg.login_lockout_secs), (5, 120));
+        // Flag closes too (file stays open).
+        let mut a2 = args();
+        a2.no_local_register = true;
+        assert!(!resolve(&a2).local_register);
         let _ = std::fs::remove_file(f);
     }
 

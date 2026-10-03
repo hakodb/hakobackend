@@ -6,7 +6,12 @@
 //! Argon2id passwords; sessions in the internal `__sessions` collection (see SECURITY_RULES §4).
 //! Env: `UB_LOCAL_JWT_SECRET` (required), `UB_LOCAL_USERS` (default `users`),
 //! `UB_LOCAL_ACCESS_TTL` (secs, default 600),
-//! `UB_LOCAL_REFRESH_TTL` (secs, default 30 days).
+//! `UB_LOCAL_REFRESH_TTL` (secs, default 30 days),
+//! `UB_LOCAL_PASSWORD_MIN` (chars, default 8),
+//! `UB_LOCAL_ARGON2_M_KB` (default 19456), `UB_LOCAL_ARGON2_T_COST`
+//! (default 2), `UB_LOCAL_ARGON2_P_COST` (default 1).
+//! The server bridges config-file keys into these when the env is absent
+//! (env wins — same precedent as `UB_PUBLIC_URL`).
 
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use argon2::password_hash::rand_core::OsRng;
@@ -37,6 +42,10 @@ pub struct LocalConfig {
     pub jwt_secret: Vec<u8>,
     pub access_ttl_secs: u64,
     pub refresh_ttl_secs: u64,
+    pub password_min_length: usize,
+    pub argon2_m_kb: u32,
+    pub argon2_t_cost: u32,
+    pub argon2_p_cost: u32,
 }
 
 impl LocalConfig {
@@ -49,10 +58,22 @@ impl LocalConfig {
         let num = |k: &str, d: u64| {
             std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
         };
+        // Fail closed on absurd Argon2 tuning (a typo'd 1 TB memory cost
+        // would OOM the box on the next login, not just slow it).
+        let m_kb = num("UB_LOCAL_ARGON2_M_KB", 19456);
+        let t_cost = num("UB_LOCAL_ARGON2_T_COST", 2);
+        let p_cost = num("UB_LOCAL_ARGON2_P_COST", 1);
+        if !(8..=1_048_576).contains(&m_kb) || !(1..=16).contains(&t_cost) || !(1..=16).contains(&p_cost) {
+            return Err("UB_LOCAL_ARGON2_* out of range (m 8..=1048576 KB, t/p 1..=16)".into());
+        }
         Ok(Self {
             jwt_secret: jwt_secret.into_bytes(),
             access_ttl_secs: num("UB_LOCAL_ACCESS_TTL", 600),
             refresh_ttl_secs: num("UB_LOCAL_REFRESH_TTL", 30 * 86400),
+            password_min_length: num("UB_LOCAL_PASSWORD_MIN", 8) as usize,
+            argon2_m_kb: m_kb as u32,
+            argon2_t_cost: t_cost as u32,
+            argon2_p_cost: p_cost as u32,
         })
     }
 }
@@ -190,8 +211,10 @@ impl LocalAuth {
         profile: HashMap<String, serde_json::Value>,
     ) -> Result<Doc, AppError> {
         let id = id.or(email.clone()).filter(|s| !s.is_empty()).ok_or_else(|| AppError::BadRequest("id/email required".into()))?;
-        if password.len() < 8 {
-            return Err(AppError::BadRequest("password must be at least 8 characters".into()));
+        if password.len() < self.cfg.password_min_length {
+            return Err(AppError::BadRequest(
+                format!("password must be at least {} characters", self.cfg.password_min_length).into(),
+            ));
         }
         if self.db.get(self.users(), &id).await.map_err(internal)?.is_some() {
             return Err(AppError::AlreadyExists);
@@ -217,7 +240,7 @@ impl LocalAuth {
                 return Err(AppError::AlreadyExists);
             }
         }
-        let hash = hash_password(password.to_string()).await?;
+        let hash = hash_password(password.to_string(), &self.cfg).await?;
         let mut data = profile;
         data.remove(PASSWORD_FIELD);
         // ponytail: one loop, not a per-field policy — claim fields are
@@ -240,7 +263,7 @@ impl LocalAuth {
     ) -> Result<(AuthContext, SessionTokens), AppError> {
         let doc = self.find_user(login).await?;
         let stored = doc.data.get(PASSWORD_FIELD).and_then(|v| v.as_str()).ok_or(AppError::PermissionDenied)?.to_string();
-        if !verify_password(password.to_string(), stored).await {
+        if !verify_password(password.to_string(), stored, &self.cfg).await {
             return Err(AppError::PermissionDenied);
         }
         let email = doc.data.get("email").and_then(|v| v.as_str()).map(str::to_string);
@@ -506,16 +529,34 @@ fn rand_hex(nbytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-async fn hash_password(password: String) -> Result<String, AppError> {
-    // Argon2id (~19 MiB, t=2) is deliberately CPU/RAM-heavy: cap concurrent
-    // hashes process-wide so a login flood can't saturate the pool (the
-    // per-IP rate limit is the first line; this is the second).
+/// Argon2id instance from config (fail-closed at startup on bad tuning —
+/// `Params::new` rejects out-of-range combos; the env gate above already
+/// bounds the sane range).
+fn argon2_hasher(cfg: &LocalConfig) -> Result<Argon2<'static>, AppError> {
+    use argon2::{Algorithm, Params, Version};
+    // 0.5 Params take m/t/p plus an optional output len (None would
+    // mean library default; pass 32 explicitly = the historical shape).
+    let params = Params::new(
+        cfg.argon2_m_kb,
+        cfg.argon2_t_cost,
+        cfg.argon2_p_cost,
+        Some(32),
+    )
+    .map_err(|_| AppError::Internal("argon2 params rejected".into()))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+async fn hash_password(password: String, cfg: &LocalConfig) -> Result<String, AppError> {
+    // Argon2id is deliberately CPU/RAM-heavy: cap concurrent hashes
+    // process-wide so a login flood can't saturate the pool (the per-IP
+    // rate limit is the first line; this is the second).
     static HASH_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     let sem = HASH_SEM.get_or_init(|| tokio::sync::Semaphore::new(4));
     let _permit = sem.acquire().await.map_err(|_| AppError::Internal("hash failed".into()))?;
+    let hasher = argon2_hasher(cfg)?;
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
-        Argon2::default()
+        hasher
             .hash_password(password.as_bytes(), &salt)
             .map(|h| h.to_string())
             .map_err(|_| AppError::Internal("hash failed".into()))
@@ -524,7 +565,7 @@ async fn hash_password(password: String) -> Result<String, AppError> {
     .map_err(|_| AppError::Internal("hash failed".into()))?
 }
 
-async fn verify_password(password: String, hash: String) -> bool {
+async fn verify_password(password: String, hash: String, cfg: &LocalConfig) -> bool {
     // Same semaphore as hashing: verification burns identical CPU.
     static VERIFY_SEM: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
     let sem = VERIFY_SEM.get_or_init(|| tokio::sync::Semaphore::new(8));
@@ -532,9 +573,12 @@ async fn verify_password(password: String, hash: String) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
+    let Ok(hasher) = argon2_hasher(cfg) else {
+        return false;
+    };
     tokio::task::spawn_blocking(move || {
         PasswordHash::new(&hash)
-            .map(|p| Argon2::default().verify_password(password.as_bytes(), &p).is_ok())
+            .map(|p| hasher.verify_password(password.as_bytes(), &p).is_ok())
             .unwrap_or(false)
     })
     .await
@@ -869,5 +913,73 @@ mod tests {
         a.set_dpop_mode(DpopMode::Accept);
         let (_, tp) = a.login("dpop", "rahasia123", None).await.unwrap();
         assert!(a.bound_jkt(&tp.access_jwt).unwrap().is_none());
+    }
+
+    #[test]
+    fn tuning_env_defaults_and_bounds() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        let cfg = LocalConfig::from_env().unwrap();
+        std::env::remove_var("UB_LOCAL_JWT_SECRET");
+        drop(_g);
+        assert_eq!(cfg.password_min_length, 8);
+        assert_eq!((cfg.argon2_m_kb, cfg.argon2_t_cost, cfg.argon2_p_cost), (19456, 2, 1));
+        assert_eq!((cfg.access_ttl_secs, cfg.refresh_ttl_secs), (600, 30 * 86400));
+        // Absurd tuning fails closed at load (no OOM-able config).
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        std::env::set_var("UB_LOCAL_ARGON2_M_KB", "999999999");
+        assert!(LocalConfig::from_env().is_err());
+        std::env::remove_var("UB_LOCAL_ARGON2_M_KB");
+        std::env::remove_var("UB_LOCAL_JWT_SECRET");
+    }
+
+    #[tokio::test]
+    async fn password_min_length_enforced() {
+        let db: Arc<dyn Database> = Arc::new(FakeDb::new());
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        std::env::set_var("UB_LOCAL_PASSWORD_MIN", "12");
+        let cfg = LocalConfig::from_env().unwrap();
+        std::env::remove_var("UB_LOCAL_PASSWORD_MIN");
+        std::env::remove_var("UB_LOCAL_JWT_SECRET");
+        drop(_g);
+        let a = Arc::new(LocalAuth {
+            cfg,
+            db,
+            identity: Identity::default(),
+            dpop_mode: std::sync::Mutex::new(DpopMode::Off),
+            dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+        });
+        assert!(a.register(Some("u".into()), None, "pendek8c", HashMap::new()).await.is_err());
+        a.register(Some("u".into()), None, "cukup-panjang-12", HashMap::new()).await.unwrap();
+        assert!(a.login("u", "cukup-panjang-12", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn argon2_custom_params_roundtrip() {
+        // Tiny params for test speed; proves the plumbing (not the KDF).
+        let db: Arc<dyn Database> = Arc::new(FakeDb::new());
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("UB_LOCAL_JWT_SECRET", "0123456789abcdef0123456789abcdef");
+        std::env::set_var("UB_LOCAL_ARGON2_M_KB", "32");
+        std::env::set_var("UB_LOCAL_ARGON2_T_COST", "1");
+        std::env::set_var("UB_LOCAL_ARGON2_P_COST", "1");
+        let cfg = LocalConfig::from_env().unwrap();
+        std::env::remove_var("UB_LOCAL_ARGON2_M_KB");
+        std::env::remove_var("UB_LOCAL_ARGON2_T_COST");
+        std::env::remove_var("UB_LOCAL_ARGON2_P_COST");
+        std::env::remove_var("UB_LOCAL_JWT_SECRET");
+        drop(_g);
+        let a = Arc::new(LocalAuth {
+            cfg,
+            db,
+            identity: Identity::default(),
+            dpop_mode: std::sync::Mutex::new(DpopMode::Off),
+            dpop_replay: std::sync::Mutex::new(dpop::ReplayCache::default()),
+        });
+        a.register(Some("v".into()), None, "rahasia123", HashMap::new()).await.unwrap();
+        assert!(a.login("v", "rahasia123", None).await.is_ok());
+        assert!(a.login("v", "salah", None).await.is_err());
     }
 }
