@@ -31,7 +31,7 @@ use axum::extract::connect_info::Connected;
 #[cfg(unix)]
 use axum::serve::{IncomingStream, Listener};
 use clap::Parser;
-use config::{Args, DEFAULT_CONFIG_TEMPLATE, resolve, validate};
+use config::{Args, DEFAULT_CONFIG_TEMPLATE, resolve, validate, validate_local_modes};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -582,6 +582,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => Err(e.into()),
         };
     }
+    // Fail closed before opening anything (useless/broken issuance shapes).
+    validate_local_modes(&cfg).map_err(|e| format!("[ub] {e}"))?;
     let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await.expect("open database");
     println!("[ub] driver={} data={} config={}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source });
     // Flags are read here: `cli` moves into AppState below.
@@ -3330,8 +3332,15 @@ async fn auth_login(
             match local.login(&l, &p, dpop).await {
                 Ok((ctx, tokens)) => {
                     s.login_guard.clear(&l);
-                    let headers = session_cookies(&local, &tokens, &s.cookies);
-                    (StatusCode::OK, headers, Json(serde_json::json!({ "uid": ctx.uid }))).into_response()
+                    let (headers, body) = render_issuance(
+                        &s.cookies,
+                        &local,
+                        &tokens,
+                        &ctx.uid,
+                        s.local_token_response,
+                        s.local_cookies,
+                    );
+                    (StatusCode::OK, headers, Json(body)).into_response()
                 }
                 // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
                 Err(_) => {
@@ -3347,12 +3356,23 @@ async fn auth_login(
 async fn auth_refresh(
     State(s): State<AppState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let local = match issuance_local(&s).await {
         Ok(l) => l,
         Err(e) => return e,
     };
-    let presented = match read_cookie(&headers, REFRESH_COOKIE) {
+    // Cookie first; JSON body `{refresh_token}` when the token-response
+    // knob is on (Firebase-style, no-cookie clients). Bytes (not Json):
+    // malformed bodies must stay 401, never 422 — identical to before
+    // when the knob is off (the body is not even looked at).
+    let mut presented = read_cookie(&headers, REFRESH_COOKIE);
+    if presented.is_none() && s.local_token_response {
+        presented = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("refresh_token").and_then(|t| t.as_str()).map(str::to_string));
+    }
+    let presented = match presented {
         Some(t) => t,
         None => return unauthorized(),
     };
@@ -3360,31 +3380,61 @@ async fn auth_refresh(
     let dpop = proof.as_deref().map(|proof| DpopRequest { proof, method: "POST", uri: &uri });
     match local.refresh(&presented, dpop).await {
         Ok((ctx, tokens)) => {
-            let h = session_cookies(&local, &tokens, &s.cookies);
-            (StatusCode::OK, h, Json(serde_json::json!({ "uid": ctx.uid }))).into_response()
+            let (h, body) = render_issuance(
+                &s.cookies,
+                &local,
+                &tokens,
+                &ctx.uid,
+                s.local_token_response,
+                s.local_cookies,
+            );
+            (StatusCode::OK, h, Json(body)).into_response()
         }
         // Reuse/expired/foreign: clear cookies + reject (fail-closed).
-        Err(_) => (StatusCode::UNAUTHORIZED, clear_cookies(&s.cookies), Json(serde_json::json!({ "error": "invalid session" }))).into_response(),
+        // Pure-token mode has no cookies to clear (empty headers).
+        Err(_) => {
+            let h = if s.local_cookies {
+                clear_cookies(&s.cookies)
+            } else {
+                HeaderMap::new()
+            };
+            (StatusCode::UNAUTHORIZED, h, Json(serde_json::json!({ "error": "invalid session" }))).into_response()
+        }
     }
 }
 
 async fn auth_logout(
     State(s): State<AppState>,
     headers: HeaderMap,
+    body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    // Best-effort revoke; clearing cookies is the real logout.
-    if let Some(t) = read_cookie(&headers, REFRESH_COOKIE) {
+    // Best-effort revoke; clearing cookies is the real logout. Body token
+    // accepted under the same knob as refresh (pure-token clients hold no
+    // cookies); Bearer access token evicted from the resolve cache either
+    // way (cookie and header share the key space).
+    let mut presented = read_cookie(&headers, REFRESH_COOKIE);
+    if presented.is_none() && s.local_token_response {
+        presented = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("refresh_token").and_then(|t| t.as_str()).map(str::to_string));
+    }
+    if let Some(t) = presented {
         if let Some(local) = s.hot().await.local.clone() {
             let _ = local.logout(&t).await;
         }
         // The access token may be cached: kill it now, TTL notwithstanding.
         // (Refresh-token logout above kills future issuance; this kills the
         // live bearer. Cookie tokens share the same cache key space.)
-        if let Some(a) = read_cookie(&headers, ACCESS_COOKIE) {
+        if let Some(a) = read_cookie(&headers, ACCESS_COOKIE).or_else(|| bearer(&headers)) {
             s.tokcache.remove(&a);
         }
     }
-    (StatusCode::OK, clear_cookies(&s.cookies), Json(serde_json::json!({ "success": true }))).into_response()
+    let h = if s.local_cookies {
+        clear_cookies(&s.cookies)
+    } else {
+        HeaderMap::new()
+    };
+    (StatusCode::OK, h, Json(serde_json::json!({ "success": true }))).into_response()
 }
 
 async fn auth_me(Extension(auth): Extension<Option<AuthContext>>) -> impl IntoResponse {
@@ -3924,6 +3974,38 @@ mod tests {
         assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]:3000")));
         assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]")));
         assert!(!csrf_origin_ok(Some("[::1]:3000"), Some("http://[::2]:3000")));
+    }
+
+    #[test]
+    fn render_issuance_matrix() {
+        // render_issuance needs a LocalAuth for access_ttl; build one over
+        // the auth crate's empty test db (no env, no behavior).
+        let conf = CookieConf {
+            secure: true,
+            samesite: "Strict".into(),
+            path: "/".into(),
+            domain: None,
+        };
+        let local = LocalAuth::build_test();
+        let tokens = || hakobackend_auth_local::SessionTokens {
+            access_jwt: "ACC".into(),
+            refresh_opaque: "REF".into(),
+        };
+        // Default: cookies only, body {uid} — byte-identical to the old shape.
+        let (h, b) = render_issuance(&conf, &local, &tokens(), "u1", false, true);
+        assert_eq!(b, serde_json::json!({ "uid": "u1" }));
+        assert!(h.contains_key(header::SET_COOKIE));
+        // Dual-mode: cookies + body tokens.
+        let (h2, b2) = render_issuance(&conf, &local, &tokens(), "u1", true, true);
+        assert!(h2.contains_key(header::SET_COOKIE));
+        assert_eq!(b2["access_token"], serde_json::json!("ACC"));
+        assert_eq!(b2["refresh_token"], serde_json::json!("REF"));
+        assert_eq!(b2["token_type"], serde_json::json!("Bearer"));
+        assert!(b2["expires_in"].as_u64().is_some());
+        // Pure-token: body tokens, NO cookies.
+        let (h3, b3) = render_issuance(&conf, &local, &tokens(), "u1", true, false);
+        assert!(!h3.contains_key(header::SET_COOKIE));
+        assert_eq!(b3["access_token"], serde_json::json!("ACC"));
     }
 
     #[test]

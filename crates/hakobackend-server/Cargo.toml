@@ -9,7 +9,7 @@ hakobackend-db-hako = { path = "../hakobackend-db-hako" }
 hakobackend-db-hakocluster = { path = "../hakobackend-db-hakocluster" }
 hakobackend-policy = { path = "../hakobackend-policy" }
 hakobackend-auth-core = { path = "../hakobackend-auth-core" }
-hakobackend-auth-local = { path = "../hakobackend-auth-local" }
+hakobackend-auth-local = { path = "../hakobackend-auth-local", features = ["test-utils"] }
 hakobackend-auth-github = { path = "../hakobackend-auth-github" }
 hakobackend-auth-firebase = { path = "../hakobackend-auth-firebase" }
 hakobackend-auth-oidc = { path = "../hakobackend-auth-oidc" }

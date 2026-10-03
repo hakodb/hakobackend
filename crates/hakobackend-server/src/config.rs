@@ -382,7 +382,9 @@ struct FileConfig {
 /// server-side but hand the client nothing, and the GitHub OAuth callback
 /// can only complete through cookies (redirect carries no body). Both
 /// call sites must run this: boot and --validate (via validate()).
-pub(crate) fn validate_local_modes(cfg: &UbConfig) -> Result<(), String> {
+/// `pub` (not pub(crate)): the binary's `main.rs` and the unit tests both
+/// call it (separate crates under the hood for test targets).
+pub fn validate_local_modes(cfg: &UbConfig) -> Result<(), String> {
     if !cfg.local_cookies && !cfg.local_token_response {
         return Err("local_cookies=false needs local_token_response=true (else logins are useless)".into());
     }
@@ -593,6 +595,7 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     if !KNOWN_DRIVERS.contains(&cfg.driver.as_str()) {
         return Err(format!("driver `{}` unknown (choices: {})", cfg.driver, KNOWN_DRIVERS.join(", ")));
     }
+    validate_local_modes(cfg).map_err(|e| format!("[ub] {e}"))?;
     if let Some(r) = &cfg.rules {
         hakobackend_policy::PolicyFile::load(r)?;
     }
@@ -997,6 +1000,36 @@ mod tests {
         a2.no_local_register = true;
         assert!(!resolve(&a2).local_register);
         let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn token_modes_validate_at_config() {
+        // Defaults: cookies only (today's shape).
+        let cfg = resolve(&args());
+        assert!(!cfg.local_token_response && cfg.local_cookies);
+        assert!(validate_local_modes(&cfg).is_ok());
+        // Dual-mode ok; pure-token ok.
+        let f = write_tmp("hakobackend_token_test.toml", "local_token_response = true\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert!(cfg.local_token_response && cfg.local_cookies);
+        assert!(validate_local_modes(&cfg).is_ok());
+        let f2 = write_tmp(
+            "hakobackend_token2_test.toml",
+            "local_token_response = true\nlocal_cookies = false\n",
+        );
+        let mut b = args();
+        b.config = Some(f2.clone());
+        assert!(validate_local_modes(&resolve(&b)).is_ok());
+        // Cookies off without tokens: useless login, refused.
+        let f3 = write_tmp("hakobackend_token3_test.toml", "local_cookies = false\n");
+        let mut c = args();
+        c.config = Some(f3.clone());
+        assert!(validate_local_modes(&resolve(&c)).is_err());
+        let _ = std::fs::remove_file(f);
+        let _ = std::fs::remove_file(f2);
+        let _ = std::fs::remove_file(f3);
     }
 
     #[test]

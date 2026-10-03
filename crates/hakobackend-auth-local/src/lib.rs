@@ -128,7 +128,10 @@ impl LocalAuth {
 
     /// Test-only constructor (no env, no db): enough for pure helpers
     /// (TTL reads, cookie rendering). Panics nowhere; never use in prod.
-    #[cfg(test)]
+    /// `#[cfg(any(test, feature = "test-utils"))]` so downstream crates
+    /// (the server's issuance tests) can use it: unit tests always enable
+    /// `cfg(test)` for their own crate, not for dependencies.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn build_test() -> Arc<Self> {
         use std::sync::Mutex;
         Arc::new(Self {
@@ -464,14 +467,14 @@ impl LocalAuth {
 /// Test-only empty database (all ops no-op/empty). Enough for
 /// constructors and pure helpers; real behavior lives in the FakeDb
 /// tests below.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub struct TestDb;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 #[async_trait::async_trait]
 impl Database for TestDb {
-    fn capabilities(&self) -> Capabilities {
-        Capabilities {
+    fn capabilities(&self) -> hakobackend_core::Capabilities {
+        hakobackend_core::Capabilities {
             driver: "test",
             supports_watch: false,
             supports_transactions: false,
@@ -507,7 +510,7 @@ impl Database for TestDb {
     async fn count(&self, _c: &str, _q: &QueryOptions) -> Result<u64, AppError> {
         Ok(0)
     }
-    async fn subscribe(&self, _c: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError> {
+    async fn subscribe(&self, _c: &str) -> Result<tokio::sync::broadcast::Receiver<hakobackend_core::Change>, AppError> {
         Ok(tokio::sync::broadcast::channel(1).0.subscribe())
     }
     async fn create_index(&self, _c: &str, _s: &hakobackend_core::IndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
