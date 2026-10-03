@@ -3385,8 +3385,12 @@ async fn auth_login(
                     s.login_guard.fail(&l);
                     // Lock transition edge only (not every strike): one
                     // `auth.lockout` per lock, then `locked=true` fails.
+                    // Edge = this fail just locked (retry window is fresh:
+                    // full window remaining, not a partial remainder).
                     if let Some(retry) = s.login_guard.locked_secs(&l) {
-                        audit::lockout(&l, &ip, retry);
+                        if retry >= s.login_guard.window_secs() {
+                            audit::lockout(&l, &ip, retry);
+                        }
                     }
                     audit::login_fail(&l, &ip, false);
                     err(StatusCode::UNAUTHORIZED, "invalid credentials")

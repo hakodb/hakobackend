@@ -59,6 +59,12 @@ impl LoginGuard {
         self.max_attempts == 0
     }
 
+    /// Full window seconds (for audit edge detection: a fresh lock has the
+    /// full window remaining; a pre-existing lock shows a remainder).
+    pub fn window_secs(&self) -> u64 {
+        self.window.as_secs()
+    }
+
     /// Seconds until retry when locked, None when free. Locked attempts
     /// must not reach password verification (CPU + timing).
     pub fn locked_secs(&self, login: &str) -> Option<u64> {
