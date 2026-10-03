@@ -15,6 +15,7 @@ mod realtime;
 mod tokcache;
 mod loginguard;
 mod audit;
+mod alias;
 
 use axum::{
     Json, Router,
@@ -118,6 +119,11 @@ struct AppState {
     local_token_response: bool,
     /// Set session cookies (false = pure-token mode, no Set-Cookie).
     local_cookies: bool,
+    /// Path alias table (compiled at boot/reload; empty = off).
+    /// Interior mutability (no lock in the hot path): the table is an
+    /// Arc-swap like the hot snapshot's contents, not a RwLock — readers
+    /// clone the Arc (~20 ns), reload swaps it.
+    aliases: Arc<std::sync::RwLock<Arc<alias::AliasTable>>>,
 }
 
 /// Session cookie flags (config-file driven, boot-time). Defaults mirror
@@ -675,6 +681,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_register: cfg.local_register,
         local_token_response: cfg.local_token_response,
         local_cookies: cfg.local_cookies,
+        aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::new(
+            cfg.aliases.clone(),
+        )))),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -762,7 +771,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         body_limit as usize,
     ))
     // Outermost: total-latency clock + sample flag (front_mw runs first).
+    // alias_mw sits INSIDE front_mw (timed) but OUTSIDE host/limit/auth:
+    // rewrites land before every gate, so downstream cannot distinguish
+    // an alias call from a direct one.
     .layer(middleware::from_fn(front_mw))
+    .layer(middleware::from_fn_with_state(state.clone(), alias_mw))
     .with_state(state);
     if tls && hsts_max_age > 0 {
         // HSTS only meaningful via TLS (no effect on plain http).
@@ -1737,6 +1750,9 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     s.limits.auth.set_quota(Quota::per_minute(cfg.limit_auth.0, cfg.limit_auth.1));
     // Service keys rotate the same way (add new, reload, drop old).
     *s.service.write().await = ServiceAuth::build(&cfg.service_keys, &cfg.service_allow);
+    // Alias table swaps atomically (Arc): in-flight requests keep the old
+    // table, new ones get the new — same discipline as the hot snapshot.
+    *s.aliases.write().unwrap() = Arc::new(alias::AliasTable::new(cfg.aliases.clone()));
     auto_provision(&s.hot().await.db.clone(), &s.hot().await.policy, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
@@ -3330,6 +3346,39 @@ async fn auth_register(
     }
 }
 
+/// Path-alias rewrite (issue #5): runs BEFORE host/limit/auth so the
+/// rewritten request is indistinguishable downstream (same gates, same
+/// wstats, same policy on the TARGET). Empty table = one read lock
+/// and out (~20 ns; the issue's zero-cost requirement). Non-alias paths
+/// pass through untouched, including /api/alias/* with no match (404
+/// from the router as usual — an unmatched alias is not a route).
+async fn alias_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+    let table = s.aliases.read().unwrap().clone();
+    if table.is_empty() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path().to_string();
+    if !path.starts_with("/api/alias/") {
+        return next.run(req).await;
+    }
+    // Patterns compile WITHOUT the prefix (see compile): strip it here
+    // so matching sees `students/:sid`, never the router mount.
+    let sub = path.strip_prefix("/api/alias").unwrap_or(&path);
+    let Some((target_path, target_q)) = table.rewrite(sub) else {
+        return next.run(req).await;
+    };
+    let merged = alias::merge_query(&target_q, req.uri().query());
+    let mut parts = req.uri().clone().into_parts();
+    let pq = if merged.is_empty() {
+        target_path
+    } else {
+        format!("{target_path}?{merged}")
+    };
+    parts.path_and_query = Some(pq.parse().expect("alias target is pre-validated ASCII"));
+    *req.uri_mut() = axum::http::Uri::from_parts(parts).expect("alias target is a valid URI");
+    next.run(req).await
+}
+
 /// DPoP proof components for issuance (login/refresh): htu = absolute URI of this endpoint.
 /// Missing Host / broken proof → fails in bind_dpop (fail-closed).
 fn issuance_parts(s: &AppState, headers: &HeaderMap, path: &str) -> (Option<String>, String) {
@@ -4452,6 +4501,7 @@ mod tests {
             local_register: true,
             local_token_response: false,
             local_cookies: true,
+            aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::default()))),
         };
         (st, raw)
     }

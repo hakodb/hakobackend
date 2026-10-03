@@ -180,6 +180,8 @@ pub struct UbConfig {
     /// Firebase-style issuance (boot-time; see above).
     pub local_token_response: bool,
     pub local_cookies: bool,
+    /// Compiled alias table (hot-reload via /api/admin/reload).
+    pub aliases: Vec<crate::alias::Alias>,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -209,6 +211,18 @@ pub struct UbConfig {
     pub service_allow: Vec<String>,
     /// Which file it came from (for /api/admin/reload); "" when pure default+flags.
     pub source: String,
+}
+
+/// One alias declaration (`[[aliases]]`): pattern with `:param`
+/// segments, target path + query with `{param}` slots.
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+pub struct AliasDecl {
+    #[serde(default)]
+    pub pattern: String,
+    #[serde(default)]
+    pub target_path: String,
+    #[serde(default)]
+    pub target_query: String,
 }
 
 /// Default for `plain_loopback` (serde default fn): on unless opted out.
@@ -338,6 +352,11 @@ struct FileConfig {
     /// flow carries no body) — that combo is refused at boot too.
     local_token_response: Option<bool>,
     local_cookies: Option<bool>,
+    /// Path aliases (issue #5): `[[aliases]]` table, hot-reloaded like
+    /// policy. Pure rewrites (no scripts) — the target flows through the
+    /// same auth/policy/limit as a direct call.
+    #[serde(default)]
+    aliases: Vec<AliasDecl>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -525,6 +544,14 @@ pub fn resolve(args: &Args) -> UbConfig {
         login_lockout_secs: file.login_lockout_secs.unwrap_or(300),
         local_token_response: file.local_token_response.unwrap_or(false),
         local_cookies: file.local_cookies.unwrap_or(true),
+        aliases: crate::alias::compile_all(
+            &file
+                .aliases
+                .iter()
+                .map(|d| (d.pattern.clone(), d.target_path.clone(), d.target_query.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|e| panic!("[ub] aliases: {e}")),
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -714,6 +741,17 @@ limit_auth_burst = 5
 # OAuth callback (redirect carries no body); both refused at boot.
 # local_token_response = false
 # local_cookies = true
+
+# Path aliases (issue #5): short client shapes rewritten to regular
+# endpoints — pure syntax sugar, no scripts. The rewritten request flows
+# through the SAME auth/policy/limit as a direct call (policy applies to
+# the TARGET). Exact segments + :param captures only (no regex);
+# {param} slots in target; request query merges (request wins).
+# Hot-reloaded like policy. Empty (default) = zero behavior change.
+# [[aliases]]
+# pattern = "/api/alias/students/:sid/:pin"
+# target_path = "/api/collections/students"
+# target_query = "options={\"filters\":[{\"field\":\"sid\",\"op\":\"==\",\"value\":\"{sid}\"},{\"field\":\"pin\",\"op\":\"==\",\"value\":\"{pin}\"}],\"limit\":1}"
 
 # Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
 # wstats = false
