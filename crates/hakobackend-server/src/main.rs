@@ -3277,15 +3277,17 @@ fn audit_ip(headers: &HeaderMap, trust_proxy: bool) -> String {
 async fn auth_register(
     State(s): State<AppState>,
     headers: HeaderMap,
+    Extension(auth): Extension<Option<AuthContext>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     // No ConnectInfo extractor (unix arrivals would 500 — see limit_mw):
     // audit peer falls back to "unix" when no TCP peer is present.
     let ip = audit_ip(&headers, s.limits.trust_proxy);
-    // Settled deployments close self-service (admin-created users only).
-    // 403, explicit: the endpoint's existence is not a secret (login
-    // pages link it), and silence would confuse legitimate users.
-    if !s.local_register {
+    // Settled deployments close self-service — but admins can still
+    // create users ("admin-created users only", Temuan #5 fixed).
+    // Anonymous + closed = 403; admin + closed = through (audited why).
+    let admin = is_admin(auth.as_ref(), &s.admin_uids);
+    if !s.local_register && !admin {
         audit::register("-", &ip, false, "closed");
         return err(StatusCode::FORBIDDEN, "registration closed by administrator");
     }
@@ -3305,7 +3307,7 @@ async fn auth_register(
     };
     match local.register(id.clone(), email, &password, body).await {
         Ok(doc) => {
-            audit::register(&doc.id, &ip, true, "ok");
+            audit::register(&doc.id, &ip, true, if admin && !s.local_register { "admin" } else { "ok" });
             // Gateway bus: user creates are CRUD events too.
             let users = s.hot().await.policy.identity.users_collection.clone();
             let stored = stored(&users);
