@@ -105,6 +105,8 @@ struct AppState {
     compress_min_bytes: u16,
     ws_max_msg: usize,
     ws_max_subs: usize,
+    /// CSRF Origin-vs-Host gate on (boot-time, config).
+    csrf_check: bool,
 }
 
 /// Session cookie flags (config-file driven, boot-time). Defaults mirror
@@ -647,6 +649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         compress_min_bytes: cfg.compress_min_bytes.min(u16::MAX as u64) as u16,
         ws_max_msg: cfg.ws_max_msg_kb.saturating_mul(1024) as usize,
         ws_max_subs: cfg.ws_max_subs as usize,
+        csrf_check: cfg.csrf_origin_check,
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
@@ -1388,19 +1391,23 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     // CSRF: cookie-authenticated state-changing requests must prove origin.
     // Browsers always send Origin/Referer; its absence (curl) is allowed,
     // a mismatch is not — the context drops to anonymous (policy denies).
-    if from_cookie.is_some() && ctx.is_some() && matches!(req.method(), &axum::http::Method::POST | &axum::http::Method::PUT | &axum::http::Method::PATCH | &axum::http::Method::DELETE) {
-        let host = req.headers().get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    // Host comparison strips ports on BOTH sides: portal on :443 talking
+    // to API on :3000 (same host, ports differ) is legitimate same-site
+    // traffic (DHP Temuan #4 killed all browser writes before this).
+    if s.csrf_check
+        && from_cookie.is_some()
+        && ctx.is_some()
+        && matches!(req.method(), &axum::http::Method::POST | &axum::http::Method::PUT | &axum::http::Method::PATCH | &axum::http::Method::DELETE)
+    {
         let origin_ok = req
             .headers()
             .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .map(|o| {
-                let o = o.trim_start_matches("https://").trim_start_matches("http://");
-                let o_host = o.split('/').next().unwrap_or("");
-                o_host.eq_ignore_ascii_case(host)
-            })
-            .unwrap_or(true);
-        if !origin_ok {
+            .and_then(|v| v.to_str().ok());
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok());
+        if !csrf_origin_ok(host, origin_ok) {
             ctx = None;
         }
     }
@@ -1409,6 +1416,34 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
         wstats::add(&wstats::F[1], ws_t0.elapsed().as_nanos() as u64);
     }
     next.run(req).await
+}
+
+/// Pure CSRF verdict (DHP Temuan #4): same host passes with ports stripped
+/// on both sides (portal :443 -> API :3000); anything else fails; absent
+/// Origin (curl/scripts) passes. Tested below; auth_mw only threads it.
+fn csrf_origin_ok(host: Option<&str>, origin: Option<&str>) -> bool {
+    let Some(o) = origin else { return true };
+    let o = o.trim_start_matches("https://").trim_start_matches("http://");
+    let o_host = o.split('/').next().unwrap_or("");
+    strip_port(o_host).eq_ignore_ascii_case(strip_port(host.unwrap_or("")))
+}
+
+/// Host without port for the Origin-vs-Host CSRF gate (DHP Temuan #4):
+/// "a.com:3000" -> "a.com", "[::1]:3000" -> "[::1]". Bare hosts/IPs and
+/// malformed multi-colon values pass through (fail-closed downstream:
+/// they won't match a legitimate peer either).
+fn strip_port(h: &str) -> &str {
+    if let Some(rest) = h.strip_prefix('[') {
+        // Bracketed v6: cut after "]" (Origin keeps brackets too).
+        match rest.find(']') {
+            Some(i) => &h[..i + 1],
+            None => h,
+        }
+    } else if h.matches(':').count() == 1 {
+        h.split(':').next().unwrap_or(h)
+    } else {
+        h
+    }
 }
 
 /// `?token=` fallback is a URL-leak vector: honor it only over TLS or
@@ -3771,6 +3806,43 @@ mod tests {
     }
 
     #[test]
+    fn csrf_strips_ports_both_sides() {
+        // DHP Temuan #4: portal :443 -> API :3000, same host. Origin as
+        // browsers send it (default port omitted) vs Host with port.
+        assert!(csrf_origin_ok(
+            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("https://dhp.fkip.untan.ac.id")
+        ));
+        // Exact same + explicit port both sides.
+        assert!(csrf_origin_ok(
+            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("https://dhp.fkip.untan.ac.id:3000")
+        ));
+        // True cross-site still fails (with and without ports).
+        assert!(!csrf_origin_ok(
+            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("https://evil.example.com")
+        ));
+        assert!(!csrf_origin_ok(
+            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("https://evil.example.com:3000")
+        ));
+        // Subdomain games fail.
+        assert!(!csrf_origin_ok(
+            Some("dhp.fkip.untan.ac.id:3000"),
+            Some("https://dhp.fkip.untan.ac.id.evil.com")
+        ));
+        // Absent Origin (curl/scripts) passes; absent Host fails closed
+        // against any Origin.
+        assert!(csrf_origin_ok(Some("h:3000"), None));
+        assert!(!csrf_origin_ok(None, Some("https://h")));
+        // Bracketed v6 with ports.
+        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]:3000")));
+        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]")));
+        assert!(!csrf_origin_ok(Some("[::1]:3000"), Some("http://[::2]:3000")));
+    }
+
+    #[test]
     fn incoming_doc_honors_explicit_body_id() {
 
         // create() passes "": a valid body id becomes the primary id and
@@ -4150,6 +4222,7 @@ mod tests {
             compress_min_bytes: 1024,
             ws_max_msg: 1024 * 1024,
             ws_max_subs: 100,
+            csrf_check: true,
         };
         (st, raw)
     }

@@ -154,6 +154,8 @@ pub struct UbConfig {
     /// (default 100). Boot-time.
     pub ws_max_msg_kb: u64,
     pub ws_max_subs: u64,
+    /// CSRF Origin-vs-Host gate on (default true; file-only, boot-time).
+    pub csrf_origin_check: bool,
     /// Socket_sync serve path (None = not serving). Boot-time like sock.
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
@@ -292,6 +294,9 @@ struct FileConfig {
     compress_min_bytes: Option<u64>,
     ws_max_msg_kb: Option<u64>,
     ws_max_subs: Option<u64>,
+    /// CSRF Origin-vs-Host gate for cookie-authed mutations (default on).
+    /// Off only for debugging behind a sanitizing gateway (documented risk).
+    csrf_origin_check: Option<bool>,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -450,6 +455,7 @@ pub fn resolve(args: &Args) -> UbConfig {
         compress_min_bytes: file.compress_min_bytes.unwrap_or(1024),
         ws_max_msg_kb: file.ws_max_msg_kb.unwrap_or(1024),
         ws_max_subs: file.ws_max_subs.unwrap_or(100),
+        csrf_origin_check: file.csrf_origin_check.unwrap_or(true),
         sync_serve: args.sync_serve.clone().or(file.sync_serve),
         sync_peer: {
             // ponytail: peers append (file base + flag extras), serve
@@ -581,8 +587,11 @@ limit_auth_burst = 5
 # trust_proxy = false  # true ONLY behind a proxy that strips X-Forwarded-For
 
 # CORS strict origin allowlist (same as --cors-allowed-origins, appends).
-# Empty (default) = legacy echo-any http(s) Origin + credentials. Set this
-# in production when browsers from fixed origins are the only clients.
+# Empty (default) = legacy echo-any http(s) Origin + credentials. That is
+# INTENTIONALLY loose: one backend serves many apps on many ports, often
+# TLS-direct without a proxy to normalize origins. Lock it down only when
+# the client set is fixed and known (exact match: scheme + host + port —
+# "https://app.example.com" does NOT cover ":8443" or subdomains).
 # cors_allowed_origins = ["https://app.example.com"]
 
 # Session cookie flags (defaults = today's behavior). SameSite=None
@@ -603,6 +612,10 @@ limit_auth_burst = 5
 # (default 100, over-budget subscribes are rejected, never silently dropped).
 # ws_max_msg_kb = 1024
 # ws_max_subs = 100
+# CSRF Origin-vs-Host gate for cookie-authed mutations (default on).
+# Same-host cross-port (portal :443 -> API :3000) passes: ports strip
+# from both sides before compare. Off only behind a sanitizing gateway.
+# csrf_origin_check = true
 
 # Stage profiler: same as UB_WSTATS=1 / --wstats (GET /api/__wstats).
 # wstats = false
