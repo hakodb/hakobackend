@@ -14,6 +14,7 @@ mod bench;
 mod realtime;
 mod tokcache;
 mod loginguard;
+mod audit;
 
 use axum::{
     Json, Router,
@@ -484,9 +485,13 @@ impl PolicyHot {
                 match PolicyFile::load(path) {
                     Ok(f) => {
                         eprintln!("[ub] policy reload: {path}");
+                        audit::policy_reload(path, true);
                         *w = (current, Arc::new(f));
                     }
-                    Err(e) => eprintln!("[ub] policy reload FAILED ({e}); keeping old policy"),
+                    Err(e) => {
+                        eprintln!("[ub] policy reload FAILED ({e}); keeping old policy");
+                        audit::policy_reload(path, false);
+                    }
                 }
             }
             return w.1.clone();
@@ -1660,8 +1665,11 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
 /// Re-read config + driver + auth chain. "Hot-swap while running":
 /// edit the file, POST here (admin role), done — CLI flags still win.
 /// Failure at any step = 400 and the old config is fully retained.
-async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>) -> impl IntoResponse {
+async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>, headers: HeaderMap) -> impl IntoResponse {
+    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     if !is_admin(auth.as_ref(), &s.admin_uids) {
+        audit::reload(&admin, &ip, false, "forbidden");
         return forbidden();
     }
     let cfg = resolve(&s.cli);
@@ -1672,13 +1680,19 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     }
     let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await {
         Ok(db) => db,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        Err(e) => {
+            audit::reload(&admin, &ip, false, &e);
+            return err(StatusCode::BAD_REQUEST, e);
+        }
     };
     let identity = s.hot().await.policy.identity.clone();
     bridge_local_env(&cfg);
     let (chain, local, github) = match open_auth_result(cfg.auth.as_deref(), db.clone(), identity) {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        Err(e) => {
+            audit::reload(&admin, &ip, false, &e);
+            return err(StatusCode::BAD_REQUEST, e);
+        }
     };
     *s.db.write().await = db;
     *s.auth.write().await = Arc::new(chain);
@@ -1726,6 +1740,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     auto_provision(&s.hot().await.db.clone(), &s.hot().await.policy, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
+    audit::reload(&admin, &ip, true, &msg);
     msg.into_response()
 }
 
@@ -3248,14 +3263,30 @@ async fn issuance_local(s: &AppState) -> Result<Arc<LocalAuth>, Response> {
     local_or_400(s).await
 }
 
+/// Client IP for audit records without an extractor: axum's
+/// `ConnectInfo` is only available to handlers that declare it, and the
+/// auth handlers deliberately don't (unix arrivals would 500 — the peer
+/// there is UnixPeer, not SocketAddr; see limit_mw). So: trusted proxy
+/// header when enabled, else the client-facing port's own address is
+/// unknowable here — record "direct". Proxy deployments set trust_proxy
+/// and get the real client; direct deployments share one box anyway.
+fn audit_ip(headers: &HeaderMap, trust_proxy: bool) -> String {
+    audit::peer_ip(headers, trust_proxy, None).replace("unix", "direct")
+}
+
 async fn auth_register(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // No ConnectInfo extractor (unix arrivals would 500 — see limit_mw):
+    // audit peer falls back to "unix" when no TCP peer is present.
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     // Settled deployments close self-service (admin-created users only).
     // 403, explicit: the endpoint's existence is not a secret (login
     // pages link it), and silence would confuse legitimate users.
     if !s.local_register {
+        audit::register("-", &ip, false, "closed");
         return err(StatusCode::FORBIDDEN, "registration closed by administrator");
     }
     let local = match issuance_local(&s).await {
@@ -3272,8 +3303,9 @@ async fn auth_register(
         Some(p) => p,
         None => return err(StatusCode::BAD_REQUEST, "password required"),
     };
-    match local.register(id, email, &password, body).await {
+    match local.register(id.clone(), email, &password, body).await {
         Ok(doc) => {
+            audit::register(&doc.id, &ip, true, "ok");
             // Gateway bus: user creates are CRUD events too.
             let users = s.hot().await.policy.identity.users_collection.clone();
             let stored = stored(&users);
@@ -3289,7 +3321,10 @@ async fn auth_register(
             );
             (StatusCode::CREATED, Json(serde_json::json!({ "id": doc.id }))).into_response()
         }
-        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+        Err(e) => {
+            audit::register(id.as_deref().unwrap_or("-"), &ip, false, &e.to_string());
+            err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code())
+        }
     }
 }
 
@@ -3306,6 +3341,7 @@ async fn auth_login(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     let local = match issuance_local(&s).await {
         Ok(l) => l,
         Err(e) => return e,
@@ -3325,6 +3361,7 @@ async fn auth_login(
             if let Some(retry) = s.login_guard.locked_secs(&l) {
                 let mut h = HeaderMap::new();
                 h.insert(header::RETRY_AFTER, retry.to_string().parse().unwrap());
+                audit::login_fail(&l, &ip, true);
                 return (StatusCode::TOO_MANY_REQUESTS, h, "too many login attempts").into_response();
             }
             let (proof, uri) = issuance_parts(&s, &headers, "/api/auth/login");
@@ -3332,6 +3369,7 @@ async fn auth_login(
             match local.login(&l, &p, dpop).await {
                 Ok((ctx, tokens)) => {
                     s.login_guard.clear(&l);
+                    audit::login_ok(&l, &ip);
                     let (headers, body) = render_issuance(
                         &s.cookies,
                         &local,
@@ -3345,6 +3383,12 @@ async fn auth_login(
                 // Obfuscate: wrong login vs password vs dpop are not distinguished (anti-enumeration).
                 Err(_) => {
                     s.login_guard.fail(&l);
+                    // Lock transition edge only (not every strike): one
+                    // `auth.lockout` per lock, then `locked=true` fails.
+                    if let Some(retry) = s.login_guard.locked_secs(&l) {
+                        audit::lockout(&l, &ip, retry);
+                    }
+                    audit::login_fail(&l, &ip, false);
                     err(StatusCode::UNAUTHORIZED, "invalid credentials")
                 }
             }
@@ -3358,6 +3402,7 @@ async fn auth_refresh(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     let local = match issuance_local(&s).await {
         Ok(l) => l,
         Err(e) => return e,
@@ -3378,7 +3423,7 @@ async fn auth_refresh(
     };
     let (proof, uri) = issuance_parts(&s, &headers, "/api/auth/refresh");
     let dpop = proof.as_deref().map(|proof| DpopRequest { proof, method: "POST", uri: &uri });
-    match local.refresh(&presented, dpop).await {
+    match local.refresh_classified(&presented, dpop).await {
         Ok((ctx, tokens)) => {
             let (h, body) = render_issuance(
                 &s.cookies,
@@ -3390,9 +3435,20 @@ async fn auth_refresh(
             );
             (StatusCode::OK, h, Json(body)).into_response()
         }
-        // Reuse/expired/foreign: clear cookies + reject (fail-closed).
-        // Pure-token mode has no cookies to clear (empty headers).
-        Err(_) => {
+        // Reuse (revocation + revoke-all) audits distinctly from plain
+        // expiry: the former is an attack signal, the latter routine.
+        // Both fail closed identically (401 + cleared cookies).
+        Err(hakobackend_auth_local::RefreshDeny::ReuseRevoked) => {
+            audit::refresh_reuse("-", &ip);
+            let h = if s.local_cookies {
+                clear_cookies(&s.cookies)
+            } else {
+                HeaderMap::new()
+            };
+            (StatusCode::UNAUTHORIZED, h, Json(serde_json::json!({ "error": "invalid session" }))).into_response()
+        }
+        Err(hakobackend_auth_local::RefreshDeny::Gone) => {
+            audit::refresh_fail(&ip);
             let h = if s.local_cookies {
                 clear_cookies(&s.cookies)
             } else {
@@ -3428,6 +3484,7 @@ async fn auth_logout(
         if let Some(a) = read_cookie(&headers, ACCESS_COOKIE).or_else(|| bearer(&headers)) {
             s.tokcache.remove(&a);
         }
+        audit::logout("-", &audit_ip(&headers, s.limits.trust_proxy), "refresh");
     }
     let h = if s.local_cookies {
         clear_cookies(&s.cookies)

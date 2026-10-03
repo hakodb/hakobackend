@@ -297,37 +297,72 @@ impl LocalAuth {
         Ok((self.ctx_of(&ctx_uid, &doc), tokens))
     }
 
-    /// Refresh rotation. An old token showing up again = reuse → revoke ALL user sessions.
-    pub async fn refresh(
+    /// Refresh rotation with a classified deny. An old token showing up
+    /// again = reuse → revoke ALL user sessions. Reuse vs expiry/foreign
+    /// need different operator responses, hence the outcome enum (the
+    /// verdict stays allow/deny; this only labels WHICH deny for audit).
+    pub async fn refresh_classified(
         &self,
         presented: &str,
         dpop: Option<DpopRequest<'_>>,
-    ) -> Result<(AuthContext, SessionTokens), AppError> {
+    ) -> Result<(AuthContext, SessionTokens), RefreshDeny> {
         let h = sha_hex(presented);
-        if let Some(sess) = self.session_by("refresh_hash", &h).await? {
-            let uid = sess.data.get("uid").and_then(|v| v.as_str()).ok_or(AppError::PermissionDenied)?.to_string();
+        if let Ok(Some(sess)) = self.session_by("refresh_hash", &h).await {
             if expired(&sess, now_secs()) {
-                self.db.delete(SESSIONS_COLLECTION, &sess.id).await.map_err(internal)?;
-                return Err(AppError::PermissionDenied);
+                let _ = self.db.delete(SESSIONS_COLLECTION, &sess.id).await;
+                return Err(RefreshDeny::Gone);
             }
+            let uid = match sess.data.get("uid").and_then(|v| v.as_str()) {
+                Some(u) => u.to_string(),
+                None => return Err(RefreshDeny::Gone),
+            };
             // Rotation: keep the old hash as a reuse trap.
             let new_refresh = rand_hex(32);
             let mut data = sess.data.clone();
             data.insert("prev_hash".into(), serde_json::Value::String(h));
             data.insert("refresh_hash".into(), serde_json::Value::String(sha_hex(&new_refresh)));
-            self.db.set(SESSIONS_COLLECTION, &sess.id, Doc { id: sess.id.clone(), data }, true).await.map_err(internal)?;
-            let doc = self.db.get(self.users(), &uid).await.map_err(internal)?.ok_or(AppError::PermissionDenied)?;
+            if self
+                .db
+                .set(SESSIONS_COLLECTION, &sess.id, Doc { id: sess.id.clone(), data }, true)
+                .await
+                .is_err()
+            {
+                return Err(RefreshDeny::Gone);
+            }
+            let doc = match self.db.get(self.users(), &uid).await {
+                Ok(Some(d)) => d,
+                _ => return Err(RefreshDeny::Gone),
+            };
             let email = doc.data.get("email").and_then(|v| v.as_str()).map(str::to_string);
-            let access = self.mint_access(&uid, email, self.bind_dpop(dpop)?, Self::attrs_of(&self.identity, &doc))?;
+            let cnf = match self.bind_dpop(dpop) {
+                Ok(c) => c,
+                Err(_) => return Err(RefreshDeny::Gone),
+            };
+            let access = match self.mint_access(&uid, email, cnf, Self::attrs_of(&self.identity, &doc)) {
+                Ok(a) => a,
+                Err(_) => return Err(RefreshDeny::Gone),
+            };
             let ctx_uid = sess.data.get("ctx_uid").and_then(|v| v.as_str()).unwrap_or(&uid).to_string();
             return Ok((self.ctx_of(&ctx_uid, &doc), SessionTokens { access_jwt: access, refresh_opaque: new_refresh }));
         }
-        if let Some(sess) = self.session_by("prev_hash", &h).await? {
+        if let Ok(Some(sess)) = self.session_by("prev_hash", &h).await {
             let uid = sess.data.get("uid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            self.revoke_user(&uid).await?;
-            return Err(AppError::PermissionDenied);
+            let _ = self.revoke_user(&uid).await;
+            return Err(RefreshDeny::ReuseRevoked);
         }
-        Err(AppError::PermissionDenied)
+        Err(RefreshDeny::Gone)
+    }
+
+    /// Refresh rotation (unclassified shorthand; audit uses classified).
+    /// An old token showing up again = reuse → revoke ALL user sessions.
+    pub async fn refresh(
+        &self,
+        presented: &str,
+        dpop: Option<DpopRequest<'_>>,
+    ) -> Result<(AuthContext, SessionTokens), AppError> {
+        self.refresh_classified(presented, dpop)
+            .await
+            .map_err(|_| AppError::PermissionDenied)
     }
 
     pub async fn logout(&self, presented: &str) -> Result<(), AppError> {
@@ -522,6 +557,15 @@ impl Database for TestDb {
     async fn drop_index(&self, _c: &str, _n: &str) -> Result<(), AppError> {
         Err(AppError::BadRequest("test db".into()))
     }
+}
+
+/// Refresh outcome for audit labeling (the verdict is always allow/deny;
+/// this only tells the gateway WHICH deny happened). Reuse (attack) vs
+/// expiry/foreign (routine) need different operator responses.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefreshDeny {
+    ReuseRevoked,
+    Gone,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1066,5 +1110,25 @@ mod tests {
         a.register(Some("v".into()), None, "rahasia123", HashMap::new()).await.unwrap();
         assert!(a.login("v", "rahasia123", None).await.is_ok());
         assert!(a.login("v", "salah", None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn refresh_classified_labels_reuse_vs_gone() {
+        let db: Arc<dyn Database> = Arc::new(FakeDb::new());
+        let a = local(db);
+        a.register(Some("w".into()), None, "rahasia123", HashMap::new()).await.unwrap();
+        let (_, t1) = a.login("w", "rahasia123", None).await.unwrap();
+        // Rotation ok.
+        assert!(a.refresh_classified(&t1.refresh_opaque, None).await.is_ok());
+        // Old token = reuse (revoked).
+        assert_eq!(
+            a.refresh_classified(&t1.refresh_opaque, None).await.map(|_| ()),
+            Err(RefreshDeny::ReuseRevoked)
+        );
+        // Garbage = gone (no revocation).
+        assert_eq!(
+            a.refresh_classified("tidak-ada", None).await.map(|_| ()),
+            Err(RefreshDeny::Gone)
+        );
     }
 }
