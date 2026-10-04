@@ -16,6 +16,7 @@ mod tokcache;
 mod loginguard;
 mod audit;
 mod alias;
+mod files;
 
 use axum::{
     Json, Router,
@@ -120,6 +121,9 @@ struct AppState {
     read_only: Arc<std::sync::atomic::AtomicBool>,
     /// Batch/transaction op cap (larger payloads 400). Atomic: reload swaps it.
     max_batch_ops: Arc<std::sync::atomic::AtomicU64>,
+    /// Managed-file config (issue #11). Arc: heap data, not per-connection
+    /// copies. Boot-time like body_limit (reload ignores it).
+    files: Arc<files::FileConf>,
     /// Realtime guards (snapshot/event/poll/conn caps). RwLock: reload
     /// swaps it; already-running pollers keep their spawn-time interval.
     rt_caps: Arc<std::sync::RwLock<realtime::RtCaps>>,
@@ -618,6 +622,10 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/indexes", post(index_create).get(index_list).delete(index_drop))
         .route("/api/batch", post(batch))
         .route("/api/transaction", post(transaction))
+        // Managed files (issue #11): bytes on disk, metadata docs in the
+        // addressed collection. In the bare table too, so /api/alias/*
+        // targets reach them exactly like direct calls.
+        .route("/api/files/{*path}", post(files::upload).get(files::download).delete(files::remove))
         .route("/api/collectionGroup/{name}", get(collection_group))
         .route("/api/aggregate/{*path}", post(aggregate))
         .route("/api/admin/reload", post(reload))
@@ -821,6 +829,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_register: cfg.local_register,
         read_only: Arc::new(std::sync::atomic::AtomicBool::new(cfg.read_only)),
         max_batch_ops: Arc::new(std::sync::atomic::AtomicU64::new(cfg.max_batch_ops)),
+        files: Arc::new(files::FileConf::from_cfg(
+            cfg.file_dir.clone(),
+            cfg.file_max_mb,
+            cfg.file_max_batch,
+            cfg.file_mime_allow.clone(),
+            cfg.file_sign_secret.clone(),
+        )),
         rt_caps: Arc::new(std::sync::RwLock::new(realtime::RtCaps {
             snapshot_docs: cfg.realtime_snapshot_docs as usize,
             events_per_sec: cfg.realtime_events_per_sec,
@@ -836,6 +851,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
+    }
+    // Managed files (issue #11): dir must exist before serving; the
+    // sweeper follows reloads via the hot snapshot (no respawn needed).
+    if let Some(dir) = &cfg.file_dir {
+        std::fs::create_dir_all(dir).map_err(|e| format!("[ub] file_dir {dir} unwritable: {e}"))?;
+        let sweep_secs = if cfg.ttl_sweep_secs > 0 { cfg.ttl_sweep_secs } else { 300 };
+        files::spawn(state.clone(), std::time::Duration::from_secs(sweep_secs));
     }
 
     // main() continues: TLS/bind/serve below share this router.
@@ -1716,7 +1738,10 @@ fn strip_write(
 /// over HTTP — fail-closed even under an open policy (S1 audit).
 fn denied_internal(logical: &str) -> Option<Response> {
     if logical.split('/').next().is_some_and(|s| s.starts_with("__")) {
-        Some(err(StatusCode::FORBIDDEN, "internal collection"))
+        // Explicit reservation (issue #11): the `__` prefix is the
+        // server's namespace. User collections must not use it; names
+        // created out-of-band 403 here by design, not by accident.
+        Some(err(StatusCode::FORBIDDEN, "reserved __ prefix"))
     } else {
         None
     }
@@ -1953,6 +1978,10 @@ mod wstats {
     pub static G: [T; 5] = [T::new(), T::new(), T::new(), T::new(), T::new()];
     // LIST: authz / eng_list / filter / serdom
     pub static L: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
+    // FILES (issue #11): upload stream+store / upload meta-commit /
+    // download meta+authz / download response build (the byte send
+    // streams after the handler returns, so this is headers+open).
+    pub static B: [T; 4] = [T::new(), T::new(), T::new(), T::new()];
     // Per-shape LIST split (same 3 inner stages): order / filter /
     // filter-order / cursor / paged / plain. L stays as the blended total
     // (recorded baselines keep comparing); S isolates the shape.
@@ -2035,6 +2064,10 @@ mod wstats {
             &["authz", "eng_list", "filter", "serdom"],
             &[&L[0], &L[1], &L[2], &L[3]],
         ) + &tab(
+            "file",
+            &["up_stream", "up_meta", "dn_meta", "dn_send"],
+            &[&B[0], &B[1], &B[2], &B[3]],
+        ) + &tab(
             "front",
             &["total", "mw_auth", "mw_limit", "collect", "parse"],
             &[&F[0], &F[1], &F[2], &F[3], &F[4]],
@@ -2054,7 +2087,7 @@ mod wstats {
 // middlewares, extractors and handlers with zero signature changes.
 // Absent (tests, direct calls) = unsampled.
 tokio::task_local! {
-    static WSAMP: bool;
+    pub(crate) static WSAMP: bool;
 }
 
 /// Outermost timing layer (registered last = runs first): total server-side
@@ -2259,13 +2292,37 @@ where
     // (stream frames are already tiny; WS upgrades carry no body).
     // min_bytes (default 1024): gzip below ~1 KB costs more than it saves
     // (measured 13-33% overhead on small docs when clients compress).
+    // Binary (SSE + file bytes) never compresses: re-gzipping
+    // already-compressed bytes burns CPU for zero or negative gain.
+    // ponytail: prefix match, not an allowlist copy — custom file MIME
+    // types stay excluded too, with no list to keep in sync.
     router.layer(
         tower_http::compression::CompressionLayer::new().compress_when(
-            tower_http::compression::predicate::SizeAbove::new(min_bytes).and(
-                tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
-            ),
+            tower_http::compression::predicate::SizeAbove::new(min_bytes)
+                .and(tower_http::compression::predicate::NotForContentType::new("text/event-stream"))
+                .and(NoBinary),
         ),
     )
+}
+
+/// Compression predicate: skip already-compressed / streaming bytes.
+#[derive(Clone, Copy)]
+struct NoBinary;
+impl tower_http::compression::predicate::Predicate for NoBinary {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool {
+        let t = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        !(t.starts_with("image/")
+            || t.starts_with("video/")
+            || t.starts_with("audio/")
+            || t == "application/octet-stream"
+            || t == "application/pdf"
+            || t == "application/zip"
+            || t == "application/gzip")
+    }
 }
 
 async fn get_or_list(
@@ -4500,6 +4557,112 @@ mod tests {
         assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
     }
 
+    /// Files end-to-end (issue #11): upload -> metadata -> bytes ->
+    /// range/etag -> signed URL -> delete, plus the 415/400/403 edges.
+    #[tokio::test]
+    async fn files_end_to_end() {
+        use tower::ServiceExt;
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "files_e2e").await;
+        fn part(boundary: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
+            let mut o = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .into_bytes();
+            o.extend_from_slice(bytes);
+            o.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            o
+        }
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            content_type: Option<&str>,
+            body: Vec<u8>,
+            headers: Vec<(&str, &str)>,
+        ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+            let mut b = Request::builder().method(method).uri(uri);
+            if let Some(ct) = content_type {
+                b = b.header("content-type", ct);
+            }
+            for (k, v) in headers {
+                b = b.header(k, v);
+            }
+            let req = b.body(axum::body::Body::from(body)).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let h = res.headers().clone();
+            let body = axum::body::to_bytes(res.into_body(), 64 * 1024 * 1024).await.unwrap().to_vec();
+            (status, h, body)
+        }
+        let app = build_router(st.clone(), vec![], false);
+        let png: Vec<u8> = b"\x89PNG\r\n\x1a\n".iter().chain(std::iter::repeat(&7u8).take(100)).copied().collect();
+        let bd = "BOUNDARY";
+        let ct = format!("multipart/form-data; boundary={bd}");
+        // Upload single.
+        let (s, _, b) = call(app.clone(), "POST", "/api/files/avatars/u1", Some(&ct), part(bd, "image/png", &png), vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let sha = v["file"]["sha256"].as_str().unwrap().to_string();
+        assert_eq!(v["file"]["state"], "ready");
+        assert_eq!(v["file"]["size"], png.len() as u64);
+        // Metadata readable as an ordinary doc.
+        let (s, _, b) = call(app.clone(), "GET", "/api/collections/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains(&sha));
+        // Bytes back, byte-identical, with ETag.
+        let (s, h, b) = call(app.clone(), "GET", "/api/files/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b, png);
+        assert_eq!(h["content-type"], "image/png");
+        let etag = h["etag"].to_str().unwrap().to_string();
+        assert!(etag.contains(&sha));
+        // Conditional + range.
+        let (s, _, _) = call(app.clone(), "GET", "/api/files/avatars/u1", None, vec![], vec![("if-none-match", &etag)]).await;
+        assert_eq!(s, StatusCode::NOT_MODIFIED);
+        let (s, h, b) = call(app.clone(), "GET", "/api/files/avatars/u1", None, vec![], vec![("range", "bytes=0-7")]).await;
+        assert_eq!(s, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(b, &png[..8]);
+        assert!(h["content-range"].to_str().unwrap().starts_with("bytes 0-7/"));
+        // Signed URL mint + consume (parses + verifies; policy here is
+        // public so the MAC leg is also proven by the tamper case in
+        // files::tests::sig_roundtrip_and_expiry).
+        let (s, _, b) = call(app.clone(), "GET", "/api/files/avatars/u1?sign=60", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        let url = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["url"].as_str().unwrap().to_string();
+        assert!(url.contains("exp=") && url.contains("sig="));
+        let (s, _, b) = call(app.clone(), "GET", &url, None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(b, png);
+        // Edges: unlisted mime, lying magic, batch cap (test max_batch=4).
+        let (s, _, _) = call(app.clone(), "POST", "/api/files/avatars/u2", Some(&ct), part(bd, "text/plain", b"hi"), vec![]).await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let (s, _, _) = call(app.clone(), "POST", "/api/files/avatars/u2", Some(&ct), part(bd, "image/png", b"not a png at all"), vec![]).await;
+        assert_eq!(s, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let mut big = Vec::new();
+        for _ in 0..5 {
+            big.extend_from_slice(format!("--{bd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+            big.extend_from_slice(&png);
+            big.extend_from_slice(b"\r\n");
+        }
+        big.extend_from_slice(format!("--{bd}--\r\n").as_bytes());
+        let (s, _, _) = call(app.clone(), "POST", "/api/files/many", Some(&ct), big, vec![]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        // Delete: bytes 404 after, metadata-only doc dropped entirely.
+        let (s, _, _) = call(app.clone(), "DELETE", "/api/files/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, _) = call(app.clone(), "GET", "/api/files/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _, _) = call(app.clone(), "GET", "/api/collections/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        // Deny policy: bytes 403 without a signature.
+        let (st2, _r2) = rbw_state("[defaults]\nread = \"deny\"\nwrite = \"public\"\n", "files_deny").await;
+        let app2 = build_router(st2.clone(), vec![], false);
+        let (s, _, _) = call(app2.clone(), "POST", "/api/files/avatars/u1", Some(&ct), part(bd, "image/png", &png), vec![]).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _, _) = call(app2.clone(), "GET", "/api/files/avatars/u1", None, vec![], vec![]).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+
     /// Minimal percent-decoder for the transform test (no new deps).
     fn percent_decode(s: &str) -> String {
         let mut out = Vec::with_capacity(s.len());
@@ -4951,6 +5114,15 @@ mod tests {
             local_cookies: true,
             aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::default()))),
             bare: Arc::new(std::sync::OnceLock::new()),
+            // Files on with a temp dir (per-test tag dir above); small
+            // caps keep the suite fast, secret enables the signed-URL leg.
+            files: Arc::new(files::FileConf::from_cfg(
+                Some(dir.join("files").to_string_lossy().into_owned()),
+                8,
+                4,
+                vec!["image/png".into(), "image/jpeg".into()],
+                "test-secret".into(),
+            )),
         };
         (st, raw)
     }

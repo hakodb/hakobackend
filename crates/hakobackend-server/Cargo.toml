@@ -19,6 +19,7 @@ hakobackend-db-mysql = { path = "../hakobackend-db-mysql" }
 hakobackend-db-rethinkdb = { path = "../hakobackend-db-rethinkdb" }
 hakobackend-ratelimit = { path = "../hakobackend-ratelimit" }
 tokio = { workspace = true }
+futures = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
