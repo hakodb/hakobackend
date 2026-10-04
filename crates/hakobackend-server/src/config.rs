@@ -352,9 +352,9 @@ struct FileConfig {
     /// flow carries no body) — that combo is refused at boot too.
     local_token_response: Option<bool>,
     local_cookies: Option<bool>,
-    /// Path aliases (issue #5): `[[aliases]]` table, hot-reloaded like
-    /// policy. Pure rewrites (no scripts) — the target flows through the
-    /// same auth/policy/limit as a direct call.
+    /// Path aliases (issue #5): `[[aliases]]` table, reloaded via
+    /// POST /api/admin/reload. Pure rewrites (no scripts) — the target
+    /// flows through the same auth/policy/limit as a direct call.
     #[serde(default)]
     aliases: Vec<AliasDecl>,
     sync_serve: Option<String>,
@@ -747,7 +747,8 @@ limit_auth_burst = 5
 # through the SAME auth/policy/limit as a direct call (policy applies to
 # the TARGET). Exact segments + :param captures only (no regex);
 # {param} slots in target; request query merges (request wins).
-# Hot-reloaded like policy. Empty (default) = zero behavior change.
+# Reloaded via POST /api/admin/reload (like the rest of this file).
+# Empty (default) = zero behavior change.
 # [[aliases]]
 # pattern = "/api/alias/students/:sid/:pin"
 # target_path = "/api/collections/students"

@@ -1,6 +1,6 @@
 [package]
 name = "hakobackend-server"
-version = "0.2.31"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]

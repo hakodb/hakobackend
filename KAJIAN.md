@@ -40,7 +40,8 @@
   ArrayContainsAny + Match/Contains/StartsWith` ⊇ legacy `FILTER_OPS`. Mapping is trivial.
 - **`Query` already has** collection, filters, or_groups, order_by, limit/offset,
   projection, aggregations (Count/Sum/Avg), cursor bounds — **more complete** than
-  the legacy `RethinkDBOptions`. `defer_blobs` comes free for image collections (`sc_images`).
+  the legacy `RethinkDBOptions`. `defer_blobs` comes free for blob-heavy
+  collections (e.g. an image gallery).
 - **Subcollections** are prefix-based — consistent with the flat-table `_collectionPath` pattern.
 - **Integration note:** the HakoDB API is **synchronous** → wrap in `tokio::task::spawn_blocking`
   in the adapter; `watch_collection -> Receiver` → bridge to `tokio::sync::broadcast`.
