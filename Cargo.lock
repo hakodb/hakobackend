@@ -1488,9 +1488,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b0d8299fb42806f0230660f3a0f011f2dea116f25665a4eee443de227b952ea"
+checksum = "9f67f0605477b1fdb9d9149ff68015d172e50116bad4af8f18757377f4d2fa54"
 dependencies = [
  "hakodb",
  "serde_json",
