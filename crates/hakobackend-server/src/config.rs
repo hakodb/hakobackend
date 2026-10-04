@@ -192,6 +192,20 @@ pub struct UbConfig {
     /// Batch/transaction op cap (default 1000, cloudserver parity).
     /// Larger payloads 400; align with body_limit_mb on big writes.
     pub max_batch_ops: u64,
+    /// File endpoints (issue #11): None = off (uploads 503). Byte files
+    /// under dir, metadata docs in the addressed collection. Boot-time.
+    pub file_dir: Option<String>,
+    /// Per-file MB cap (default = body_limit_mb; that layer is the hard
+    /// ceiling regardless). Boot-time.
+    pub file_max_mb: u64,
+    /// Batch upload part cap (default 1, same idiom as max_batch_ops).
+    /// Larger counts 400. Boot-time.
+    pub file_max_batch: u64,
+    /// MIME allowlist (default images + pdf). The declared part type must
+    /// be listed AND magic bytes must agree where known. Boot-time.
+    pub file_mime_allow: Vec<String>,
+    /// Signed-URL HMAC secret (empty = signed URLs off). Boot-time.
+    pub file_sign_secret: String,
     /// Realtime guards for small boxes (defaults = today's constants):
     /// per-subscription snapshot doc cap, deliveries per sub per second
     /// (overflow resyncs, never queues), shared poller interval seconds,
@@ -375,6 +389,21 @@ struct FileConfig {
     read_only: bool,
     ttl_sweep_secs: Option<u64>,
     max_batch_ops: Option<u64>,
+    /// File endpoints (issue #11, all file-only, boot-time): storage dir
+    /// (None = off, uploads 503); per-file MB cap (default body_limit_mb,
+    /// the hard ceiling anyway); batch part cap (default 1); MIME
+    /// allowlist (default images + pdf); signed-URL HMAC secret (empty =
+    /// signed URLs off; env UB_FILE_SIGN_SECRET wins, never logged).
+    file_dir: Option<String>,
+    file_max_mb: Option<u64>,
+    file_max_batch: Option<u64>,
+    file_mime_allow: Option<Vec<String>>,
+    file_sign_secret: Option<String>,
+    /// Config references (issue #11): TOML fragments holding [[aliases]]
+    /// / [[indexes]] tables, merged after inline (inline matches first,
+    /// so inline wins). Re-read by /api/admin/reload like the main file.
+    alias_file: Option<String>,
+    index_file: Option<String>,
     realtime_snapshot_docs: Option<u64>,
     realtime_events_per_sec: Option<u64>,
     realtime_poll_secs: Option<u64>,
@@ -467,6 +496,42 @@ struct LegacyDb {
     policy_file: Option<String>,
 }
 
+/// One `[[aliases]]` / `[[indexes]]` fragment file (see alias_file /
+/// index_file): same table shapes as the main config, merged after
+/// inline. Explicit path = parse failure panics (fail-closed, same
+/// discipline as the main file).
+#[derive(Debug, Default, serde::Deserialize)]
+struct AliasFragment {
+    #[serde(default)]
+    aliases: Vec<AliasDecl>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct IndexFragment {
+    #[serde(default)]
+    indexes: Vec<IndexDecl>,
+}
+
+fn load_alias_fragment(path: &str) -> Vec<AliasDecl> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match toml::from_str::<AliasFragment>(&raw) {
+            Ok(f) => f.aliases,
+            Err(e) => panic!("[ub] failed to parse alias_file {path}: {e}"),
+        },
+        Err(e) => panic!("[ub] could not read alias_file {path}: {e}"),
+    }
+}
+
+fn load_index_fragment(path: &str) -> Vec<IndexDecl> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match toml::from_str::<IndexFragment>(&raw) {
+            Ok(f) => f.indexes,
+            Err(e) => panic!("[ub] failed to parse index_file {path}: {e}"),
+        },
+        Err(e) => panic!("[ub] could not read index_file {path}: {e}"),
+    }
+}
+
 /// Config path: --config > UB_CONFIG > ./hakobackend.toml > ./ub.toml (legacy) > no file.
 pub fn config_path(args: &Args) -> Option<String> {
     if let Some(p) = &args.config {
@@ -504,7 +569,15 @@ fn load_file(path: &str, explicit: bool) -> FileConfig {
 pub fn resolve(args: &Args) -> UbConfig {
     let path = config_path(args);
     let explicit = args.config.is_some() || std::env::var("UB_CONFIG").map(|v| !v.is_empty()).unwrap_or(false);
-    let file: FileConfig = path.as_deref().map(|p| load_file(p, explicit)).unwrap_or_default();
+    let mut file: FileConfig = path.as_deref().map(|p| load_file(p, explicit)).unwrap_or_default();
+    // Config references (issue #11): fragments appended AFTER inline, so
+    // inline tables match first (inline wins). Fail-closed on bad path.
+    if let Some(p) = file.alias_file.clone() {
+        file.aliases.extend(load_alias_fragment(&p));
+    }
+    if let Some(p) = file.index_file.clone() {
+        file.indexes.extend(load_index_fragment(&p));
+    }
 
     if file.server.listen.is_some()
         || file.database.driver.is_some()
@@ -521,6 +594,10 @@ pub fn resolve(args: &Args) -> UbConfig {
         }
     }
 
+
+    // ponytail: one binding for both body caps — file_max_mb defaults
+    // to the body layer that hard-ceilings it anyway (see files.rs).
+    let body_mb = args.body_limit_mb.or(file.body_limit_mb).unwrap_or(8);
 
     UbConfig {
         host: args.host.clone().or(file.host).or(file.server.host).unwrap_or(host),
@@ -563,7 +640,7 @@ pub fn resolve(args: &Args) -> UbConfig {
         cookie_samesite: file.cookie_samesite.unwrap_or_else(|| "Strict".into()),
         cookie_path: file.cookie_path.unwrap_or_else(|| "/".into()),
         cookie_domain: file.cookie_domain,
-        body_limit_mb: args.body_limit_mb.or(file.body_limit_mb).unwrap_or(8),
+        body_limit_mb: body_mb,
         hsts_max_age_secs: file.hsts_max_age_secs.unwrap_or(31_536_000),
         compress_min_bytes: file.compress_min_bytes.unwrap_or(1024),
         ws_max_msg_kb: file.ws_max_msg_kb.unwrap_or(1024),
@@ -581,6 +658,23 @@ pub fn resolve(args: &Args) -> UbConfig {
         read_only: args.read_only || file.read_only,
         ttl_sweep_secs: file.ttl_sweep_secs.unwrap_or(300),
         max_batch_ops: file.max_batch_ops.unwrap_or(1000),
+        file_dir: file.file_dir,
+        file_max_mb: file.file_max_mb.unwrap_or(body_mb),
+        file_max_batch: file.file_max_batch.unwrap_or(1),
+        file_mime_allow: file.file_mime_allow.unwrap_or_else(|| {
+            ["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        }),
+        file_sign_secret: {
+            // Rotation-friendly secret path: env wins, never logged (same
+            // discipline as UB_SVC_KEYS above).
+            match std::env::var("UB_FILE_SIGN_SECRET") {
+                Ok(v) if !v.trim().is_empty() => v,
+                _ => file.file_sign_secret.unwrap_or_default(),
+            }
+        },
         realtime_snapshot_docs: file.realtime_snapshot_docs.unwrap_or(5000),
         realtime_events_per_sec: file.realtime_events_per_sec.unwrap_or(200),
         realtime_poll_secs: file.realtime_poll_secs.unwrap_or(2),
@@ -687,6 +781,9 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     }
     if cfg.max_batch_ops < 1 {
         return Err("max_batch_ops must be >= 1".into());
+    }
+    if cfg.file_max_batch < 1 {
+        return Err("file_max_batch must be >= 1".into());
     }
     match tls_pair(cfg)? {
         Some((c, k)) => {
@@ -798,6 +895,21 @@ limit_auth_burst = 5
 # Batch/transaction op cap (larger payloads 400; align with
 # body_limit_mb on big writes).
 # max_batch_ops = 1000
+# File endpoints (issue #11; all commented = feature off). Bytes land
+# under file_dir, metadata docs in the addressed collection; uploads 503
+# without file_dir. Per-file cap defaults to body_limit_mb (that layer
+# hard-ceilings regardless); batch part cap default 1; MIME allowlist
+# default images + pdf; signed URLs off without file_sign_secret
+# (or UB_FILE_SIGN_SECRET env, which wins and is never logged).
+# file_dir = "./data/files"
+# file_max_mb = 8
+# file_max_batch = 1
+# file_mime_allow = ["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]
+# file_sign_secret = "change-me"
+# Config references: fragments holding [[aliases]] / [[indexes]],
+# merged after inline (inline wins). Re-read by /api/admin/reload.
+# alias_file = "./aliases.toml"
+# index_file = "./indexes.toml"
 # Realtime guards for small boxes: per-subscription snapshot doc cap
 # (over-budget subscribes 400, never silent drops), deliveries per
 # sub per second (overflow resyncs, never queues), shared poller
@@ -1166,8 +1278,54 @@ mod tests {
     }
 
     #[test]
-    fn token_modes_validate_at_config() {
-        // Defaults: cookies only (today's shape).
+    fn file_endpoints_and_references() {
+        // Defaults: files off, batch 1, images+pdf, no secret.
+        let cfg = resolve(&args());
+        assert!(cfg.file_dir.is_none());
+        assert_eq!(cfg.file_max_mb, 8);
+        assert_eq!(cfg.file_max_batch, 1);
+        assert!(cfg.file_sign_secret.is_empty());
+        assert!(cfg.file_mime_allow.contains(&"image/png".to_string()));
+        // Floor enforced like max_batch_ops.
+        let f = write_tmp("hakobackend_file0_test.toml", "file_max_batch = 0\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert!(validate(&resolve(&a)).is_err());
+        let _ = std::fs::remove_file(f);
+        // Fragments merge after inline (inline wins = matched first).
+        let fa = write_tmp(
+            "hakobackend_aliasfrag_test.toml",
+            "[[aliases]]\npattern = \"/api/alias/x\"\ntarget_path = \"/api/files/y\"\n",
+        );
+        let fi = write_tmp(
+            "hakobackend_indexfrag_test.toml",
+            "[[indexes]]\ncollection = \"avatars\"\nfields = [\"file.sha256\"]\n",
+        );
+        let f = write_tmp(
+            "hakobackend_file_test.toml",
+            &format!(
+                "file_dir = \"/tmp/ub_files_test\"\nfile_max_mb = 16\nfile_max_batch = 3\nfile_sign_secret = \"s\"\nalias_file = '{fa}'\nindex_file = '{fi}'\n[[aliases]]\npattern = \"/api/alias/w\"\ntarget_path = \"/api/collections/w\"\n"
+            ),
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert_eq!(cfg.file_dir.as_deref(), Some("/tmp/ub_files_test"));
+        assert_eq!((cfg.file_max_mb, cfg.file_max_batch), (16, 3));
+        assert_eq!(cfg.file_sign_secret, "s");
+        assert_eq!(cfg.aliases.len(), 2);
+        // Inline first, fragment second.
+        assert!(cfg.aliases[0].pattern.contains("/api/alias/w"));
+        assert!(cfg.aliases[1].pattern.contains("/api/alias/x"));
+        assert_eq!(cfg.indexes.len(), 1);
+        assert!(validate(&cfg).is_ok());
+        let _ = std::fs::remove_file(f);
+        let _ = std::fs::remove_file(fa);
+        let _ = std::fs::remove_file(fi);
+    }
+
+    #[test]
+    fn token_modes_validate_at_config() {        // Defaults: cookies only (today's shape).
         let cfg = resolve(&args());
         assert!(!cfg.local_token_response && cfg.local_cookies);
         assert!(validate_local_modes(&cfg).is_ok());

@@ -73,6 +73,11 @@ Endpoints (same as the legacy backend):
 - `DELETE /api/indexes?collection=&name=` — drop index
 - `GET /ws` — realtime websocket (subscribe/unsubscribe/ping/auth)
 - `GET /api/stream/{collection}?options=&group=` — realtime SSE
+- `POST /api/files/{coll}/{id}[/{field}]` — upload single (multipart `file` part);
+  `POST /api/files/{coll}` — batch (auto ids, `file_max_batch` cap)
+- `GET /api/files/{coll}/{id}[/{field}]` — bytes (ETag, single-range 206);
+  `?sign=<secs>` mints a signed URL, `?exp=&sig=` consumes it
+- `DELETE /api/files/{coll}/{id}[/{field}]` — metadata (bytes via sweeper)
 - TLS: `--tls-cert/--tls-key` (HSTS automatic); DPoP scheme follows
 
 ## Build notes

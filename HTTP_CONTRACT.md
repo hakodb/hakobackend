@@ -157,7 +157,11 @@ batch/transaction, indexes, aggregates, collection groups, and WS/SSE
 subscriptions. Multi-tenancy (if ever needed) lives OUTSIDE this backend.
 
 - Internal `__*` collections are never addressable over HTTP, even
-  under an open policy.
+  under an open policy. The `__` prefix is the server's reserved
+  namespace (issue #11): user collections MUST NOT use it. The charset
+  gate legally allows the name, so enforcement is a 403 ("reserved __
+  prefix") on every verb — names created out-of-band (legacy imports,
+  direct driver access) stay unreachable by design, not by accident.
 - Admin endpoints (`/api/admin/*`) require a UID in `admin_uids`
   (config/flag, repeatable) — UIDs, not roles.
 
@@ -214,3 +218,34 @@ maps one client shape onto one target path + query, e.g.
   duplicates refused. Realtime lanes (`/ws`, `/api/stream/*`) cannot be
   targets (long-lived subscriptions cannot survive a redispatch).
 - No match = empty 404 (same as an unknown route).
+
+## 15. Managed files (`/api/files/...`, issue #11)
+
+Byte files on a local volume + metadata docs in the addressed user
+collection (no hidden collections, no driver changes). Off without
+`file_dir` (uploads 503). One file per doc-id + field (default field
+`file`); metadata is an ordinary doc, so policy slots, indexes and
+aliases apply unchanged.
+
+- `POST /api/files/{coll}/{id}[/{field}]` — single replace (multipart,
+  one `file` part). `POST /api/files/{coll}` — batch (repeated `file`
+  parts, auto ids, per-file array back; `file_max_batch`, default 1).
+  Upload = Create (new id) or Update (existing) on that collection.
+- `GET /api/files/{coll}/{id}[/{field}]` — bytes (Get slot) with ETag
+  (content sha), `Accept-Ranges` + single-range 206, 304 on match.
+  Metadata needs no new path: `GET /api/collections/{coll}/{id}`.
+- `DELETE` — metadata only (Delete slot); bytes reclaimed by the
+  sweeper (no refcounting). Emptied docs are deleted whole.
+- Signed URLs: `GET ...?sign=<1..=3600>` mints
+  `{url, exp}` (needs Get, same as downloading); `?exp=&sig=` consumes
+  anonymously (HMAC-SHA256, `file_sign_secret` / `UB_FILE_SIGN_SECRET`;
+  off without a secret). TLS-only warning applies, same as the SSE
+  `?token=` fallback.
+- Guards: per-file cap (`file_max_mb`, default = `body_limit_mb`,
+  which hard-ceilings regardless); declared MIME must be allowlisted
+  (default images + pdf) AND magic bytes must agree where known;
+  `read_only` 503s writes; binary content-types never gzip.
+- Crash ordering is pending-meta → bytes → ready-meta; non-ready reads
+  404. The sweeper (same interval as TTL) reaps temp files, stale
+  pendings and unreferenced bytes (mtime-guarded against in-flight
+  uploads). Metadata-without-bytes 404s loudly (repair signal).
