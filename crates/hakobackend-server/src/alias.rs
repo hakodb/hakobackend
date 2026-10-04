@@ -184,6 +184,12 @@ pub fn compile(pattern: &str, target_path: &str, target_query: &str) -> Result<A
     if !target_path.starts_with("/api/") {
         return Err(format!("alias target must stay under /api/: {target_path}"));
     }
+    // Realtime lanes (WS/SSE) hold long-lived subscriptions that cannot
+    // survive an internal redispatch: refuse them fail-closed at load.
+    // Aliases cover the regular request/response endpoints (issue #5).
+    if target_path == "/ws" || target_path.starts_with("/api/stream/") {
+        return Err(format!("alias target must not be a realtime lane: {target_path}"));
+    }
     check_template(target_path, &params, "target_path")?;
     check_template(target_query, &params, "target_query")?;
     Ok(Alias {
@@ -445,6 +451,10 @@ mod tests {
         assert!(compile("/api/alias/a/:x", "/other", "").is_err());
         assert!(compile("/api/alias/a/:x", "/api/x/{y}", "").is_err());
         assert!(compile("/api/alias/a/:x", "/api/x", "{unclosed").is_err());
+        // Realtime lanes cannot be alias targets (no redispatch for
+        // long-lived subscriptions).
+        assert!(compile("/api/alias/a/:x", "/ws", "").is_err());
+        assert!(compile("/api/alias/a/:x", "/api/stream/c", "").is_err());
         assert!(compile_all(&[
             ("/api/alias/a/:x".into(), "/api/x".into(), "".into()),
             ("/api/alias/a/:x".into(), "/api/y".into(), "".into()),

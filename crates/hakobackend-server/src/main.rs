@@ -23,7 +23,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response, sse},
-    routing::{get, post},
+    routing::{any, get, post},
 };
 use axum::extract::{ConnectInfo, Request, ws};
 // Unix-listener plumbing only (no tokio UDS on Windows; the flag
@@ -124,6 +124,12 @@ struct AppState {
     /// Arc-swap like the hot snapshot's contents, not a RwLock — readers
     /// clone the Arc (~20 ns), reload swaps it.
     aliases: Arc<std::sync::RwLock<Arc<alias::AliasTable>>>,
+    /// Bare route table (no layers) for alias redispatch (issue #5).
+    /// Router::layer wraps endpoints post-match, so a rewrite middleware
+    /// can never affect routing; the alias *route* therefore rewrites the
+    /// URI and re-enters here. Gates already ran on the outer pass (once);
+    /// handlers self-gate on the rewritten target. Set once in build_router.
+    bare: Arc<std::sync::OnceLock<Router>>,
 }
 
 /// Session cookie flags (config-file driven, boot-time). Defaults mirror
@@ -576,6 +582,116 @@ async fn open_driver(
     Ok(db)
 }
 
+/// Full HTTP surface: routes + every layer, exactly as served.
+/// Extracted from main() (pure code motion) so tests can oneshot the
+/// production stack byte-for-byte.
+fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool) -> Router {
+    // Layered flood protection (before any expensive work):
+    // /health open (LB probes), /api/auth/* strict, rest loose global.
+    let global = LimitScope { limiter: state.limits.global.clone(), trust_proxy: state.limits.trust_proxy };
+    let strict = LimitScope { limiter: state.limits.auth.clone(), trust_proxy: state.limits.trust_proxy };
+    // Bare route table (no layers): alias redispatch lands here. Gates
+    // already ran on the outer pass; handlers self-gate on the target.
+    let api_routes = Router::new()
+        .route("/api/collections", get(list_collections).post(create_collection))
+        .route(
+            "/api/collections/{*path}",
+            get(get_or_list).post(create).put(put).patch(patch).delete(remove),
+        )
+        .route("/api/indexes", post(index_create).get(index_list).delete(index_drop))
+        .route("/api/batch", post(batch))
+        .route("/api/transaction", post(transaction))
+        .route("/api/collectionGroup/{name}", get(collection_group))
+        .route("/api/aggregate/{*path}", post(aggregate))
+        .route("/api/admin/reload", post(reload))
+        .route("/ws", get(ws_handler))
+        .route("/api/stream/{*path}", get(sse_handler));
+    let api = api_routes
+        .clone()
+        // Path aliases (issue #5): owner-declared rewrites. The handler
+        // rewrites the URI and re-enters routing via the bare table, so
+        // downstream (auth/policy/limits) sees the TARGET exactly like a
+        // direct call. any(): targets span every REST method; realtime
+        // lanes are refused at load (see compile).
+        .route("/api/alias/{*path}", any(alias_dispatch))
+        .layer(middleware::from_fn_with_state(global, limit_mw));
+    let auth_routes_only = Router::new()
+        .route("/api/auth/register", post(auth_register))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/refresh", post(auth_refresh))
+        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/auth/me", get(auth_me))
+        .route("/api/auth/github/login", get(github_login))
+        .route("/api/auth/github/callback", get(github_callback));
+    let auth_routes = auth_routes_only
+        .clone()
+        .layer(middleware::from_fn_with_state(strict.clone(), limit_mw));
+
+    // ponytail: health/ready merge AFTER auth_mw — both are open by
+    // policy and neither reads the auth context (health is static JSON,
+    // ready takes State only). Skips hint parsing, cookie/token reads,
+    // DPoP checks and 2-3 String allocs per probe. wstats stays under
+    // auth (operational surface, unchanged behavior).
+    let open = Router::new()
+        .route("/api/health", get(health))
+        .route("/api/ready", get(ready));
+    // Bare table install (once per state): alias redispatch re-enters
+    // routing here, past the already-run gates, straight at the handlers.
+    let bare = Router::new()
+        .route("/api/__wstats", get(wstats_dump))
+        .merge(api_routes)
+        .merge(auth_routes_only)
+        .merge(open.clone())
+        .with_state(state.clone());
+    state.bare.set(bare).expect("bare router installs once");
+    // ponytail: host gate wraps api + auth only (health/ready in `open`
+    // stay ungated). host_mw is outermost (added last): off-domain
+    // traffic dies before CORS/limit/auth do any work. Legit preflights
+    // pass the gate, then cors_mw attaches headers / short-circuits 204.
+    let hosts = Arc::new(allowed_hosts);
+    let gated = Router::new()
+        .merge(api)
+        .merge(auth_routes)
+        .layer(middleware::from_fn_with_state(state.cors_allowed.clone(), cors_mw))
+        .layer(middleware::from_fn_with_state(hosts, host_mw));
+    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
+    // backend (latency + CPU first) and compression cost 6.5x throughput
+    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
+    // the edge proxy's job when one fronts this. Opt-in only.
+    let compress = compress_cfg;
+    if compress {
+        eprintln!("[ub] compress on: gzip responses above 1 KB");
+    }
+    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
+    // backend (latency + CPU first) and compression cost 6.5x throughput
+    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
+    // the edge proxy's job when one fronts this. Opt-in only.
+    let compress = compress_cfg;
+    if compress {
+        eprintln!(
+            "[ub] compress on: gzip responses above {} bytes",
+            state.compress_min_bytes
+        );
+    }
+    let body_limit = state.body_limit;
+    maybe_compress(
+        Router::new()
+            .route("/api/__wstats", get(wstats_dump))
+            .merge(gated)
+            .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+            .merge(open),
+        compress,
+        state.compress_min_bytes,
+    )
+    // Body cap (legacy 8 MB json-limit parity); larger payloads 413.
+    .layer(axum::extract::DefaultBodyLimit::max(
+        body_limit as usize,
+    ))
+    // Outermost: total-latency clock + sample flag (front_mw runs first).
+    .layer(middleware::from_fn(front_mw))
+    .with_state(state)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Args::parse();
@@ -684,100 +800,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::new(
             cfg.aliases.clone(),
         )))),
+        bare: Arc::new(std::sync::OnceLock::new()),
     };
     if cfg.coalesce_writes {
         state.coalescer.spawn_flusher(state.db.clone());
     }
 
-    // Layered flood protection (before any expensive work):
-    // /health open (LB probes), /api/auth/* strict, rest loose global.
-    let global = LimitScope { limiter: limits.global.clone(), trust_proxy: limits.trust_proxy };
-    let strict = LimitScope { limiter: limits.auth.clone(), trust_proxy: limits.trust_proxy };
-    let api = Router::new()
-        .route("/api/collections", get(list_collections).post(create_collection))
-        .route(
-            "/api/collections/{*path}",
-            get(get_or_list).post(create).put(put).patch(patch).delete(remove),
-        )
-        .route("/api/indexes", post(index_create).get(index_list).delete(index_drop))
-        .route("/api/batch", post(batch))
-        .route("/api/transaction", post(transaction))
-        .route("/api/collectionGroup/{name}", get(collection_group))
-        .route("/api/aggregate/{*path}", post(aggregate))
-        .route("/api/admin/reload", post(reload))
-        .route("/ws", get(ws_handler))
-        .route("/api/stream/{*path}", get(sse_handler))
-        .layer(middleware::from_fn_with_state(global, limit_mw));
-    let auth_routes = Router::new()
-        .route("/api/auth/register", post(auth_register))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/refresh", post(auth_refresh))
-        .route("/api/auth/logout", post(auth_logout))
-        .route("/api/auth/me", get(auth_me))
-        .route("/api/auth/github/login", get(github_login))
-        .route("/api/auth/github/callback", get(github_callback))
-        .layer(middleware::from_fn_with_state(strict.clone(), limit_mw));
-
-    // ponytail: health/ready merge AFTER auth_mw — both are open by
-    // policy and neither reads the auth context (health is static JSON,
-    // ready takes State only). Skips hint parsing, cookie/token reads,
-    // DPoP checks and 2-3 String allocs per probe. wstats stays under
-    // auth (operational surface, unchanged behavior).
-    let open = Router::new()
-        .route("/api/health", get(health))
-        .route("/api/ready", get(ready));
-    // ponytail: host gate wraps api + auth only (health/ready in `open`
-    // stay ungated). host_mw is outermost (added last): off-domain
-    // traffic dies before CORS/limit/auth do any work. Legit preflights
-    // pass the gate, then cors_mw attaches headers / short-circuits 204.
-    let hosts = Arc::new(cfg.allowed_hosts.clone());
-    let gated = Router::new()
-        .merge(api)
-        .merge(auth_routes)
-        .layer(middleware::from_fn_with_state(state.cors_allowed.clone(), cors_mw))
-        .layer(middleware::from_fn_with_state(hosts, host_mw));
-    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
-    // backend (latency + CPU first) and compression cost 6.5x throughput
-    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
-    // the edge proxy's job when one fronts this. Opt-in only.
-    let compress = cfg.compress;
-    if compress {
-        eprintln!("[ub] compress on: gzip responses above 1 KB");
-    }
-    // Gzip is OFF by default (`compress`, flag/config): this is a realtime
-    // backend (latency + CPU first) and compression cost 6.5x throughput
-    // on 8 KB docs (measured 20.5k identity vs 3.2k gzip). Bandwidth is
-    // the edge proxy's job when one fronts this. Opt-in only.
-    let compress = cfg.compress;
-    if compress {
-        eprintln!(
-            "[ub] compress on: gzip responses above {} bytes",
-            cfg.compress_min_bytes
-        );
-    }
-    let body_limit = state.body_limit;
+    // main() continues: TLS/bind/serve below share this router.
     let hsts_max_age = state.hsts_max_age;
-    let mut app = maybe_compress(
-        Router::new()
-            .route("/api/__wstats", get(wstats_dump))
-            .merge(gated)
-            .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
-            .merge(open),
-        compress,
-        state.compress_min_bytes,
-    )
-    // Body cap (legacy 8 MB json-limit parity); larger payloads 413.
-    .layer(axum::extract::DefaultBodyLimit::max(
-        body_limit as usize,
-    ))
-    // Outermost: total-latency clock + sample flag (front_mw runs first).
-    // alias_mw sits INSIDE front_mw (timed) but OUTSIDE host/limit/auth:
-    // rewrites land before every gate, so downstream cannot distinguish
-    // an alias call from a direct one. (Layer order: added LAST = runs
-    // FIRST — alias must precede front_mw, not follow it.)
-    .layer(middleware::from_fn_with_state(state.clone(), alias_mw))
-    .layer(middleware::from_fn(front_mw))
-    .with_state(state);
+    let mut app = build_router(state, cfg.allowed_hosts.clone(), cfg.compress);
     if tls && hsts_max_age > 0 {
         // HSTS only meaningful via TLS (no effect on plain http).
         let hsts = format!("max-age={hsts_max_age}; includeSubDomains");
@@ -3347,29 +3378,37 @@ async fn auth_register(
     }
 }
 
-/// Path-alias rewrite (issue #5): runs BEFORE host/limit/auth so the
-/// rewritten request is indistinguishable downstream (same gates, same
-/// wstats, same policy on the TARGET). Empty table = one read lock
-/// and out (~20 ns; the issue's zero-cost requirement). Non-alias paths
-/// pass through untouched, including /api/alias/* with no match (404
-/// from the router as usual — an unmatched alias is not a route).
-async fn alias_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Response {
+/// Path-alias endpoint (issue #5): `GET|POST|PUT|PATCH|DELETE /api/alias/*`.
+///
+/// Owner-declared rewrites for regular endpoints (htaccess-RewriteRule
+/// spirit, not a script engine). The handler rewrites the URI to the
+/// TARGET and re-enters routing via the bare table, so downstream (auth,
+/// policy, limits, wstats) sees the call exactly like a direct one and
+/// policy evaluates the TARGET (one rule surface).
+///
+/// Why a route and not middleware: axum's `Router::layer` wraps endpoints
+/// post-match, so a rewrite middleware can never affect routing (the
+/// request would already have missed). The route matches first; the
+/// redispatch routes again on the rewritten URI.
+///
+/// Gates run once, on the outer pass (limit/auth/host/cors are
+/// path-independent anyway); the bare redispatch carries method/headers/
+/// body plus the auth context, so handlers self-gate on the target.
+/// Unmatched alias = empty 404 (same as an unknown route).
+async fn alias_dispatch(State(s): State<AppState>, req: Request) -> Response {
+    // The router matched `/api/alias/{*path}`; patterns compile WITHOUT
+    // the prefix (see compile), so strip it before matching.
+    let path = req.uri().path().to_string();
+    let sub = path.strip_prefix("/api/alias").unwrap_or(&path);
     let table = s.aliases.read().unwrap().clone();
     if table.is_empty() {
-        return next.run(req).await;
+        // No aliases declared: an /api/alias/* path matches nothing.
+        return StatusCode::NOT_FOUND.into_response();
     }
-    let path = req.uri().path().to_string();
-    if !path.starts_with("/api/alias/") {
-        return next.run(req).await;
-    }
-    // Patterns compile WITHOUT the prefix (see compile): strip it here
-    // so matching sees `students/:sid`, never the router mount.
-    let sub = path.strip_prefix("/api/alias").unwrap_or(&path);
     let Some((target_path, target_q)) = table.rewrite(sub) else {
-        return next.run(req).await;
+        return StatusCode::NOT_FOUND.into_response();
     };
     let merged = alias::merge_query(&target_q, req.uri().query());
-    let mut parts = req.uri().clone().into_parts();
     let pq = if merged.is_empty() {
         target_path
     } else {
@@ -3384,9 +3423,36 @@ async fn alias_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Re
     // Everything else (notably `{`, `}`, `"`) becomes %XX; downstream
     // Query decoding restores the exact JSON bytes.
     let pq = reencode_query(&pq);
-    parts.path_and_query = Some(pq.parse().expect("alias target re-encodes to valid URI"));
-    *req.uri_mut() = axum::http::Uri::from_parts(parts).expect("alias target is a valid URI");
-    next.run(req).await
+    let (mut parts, body) = req.into_parts();
+    // Fresh request, cherry-picked extensions. Rationale: axum APPENDS
+    // route params (UrlParams) on every match instead of replacing, so
+    // forwarding the outer match's extensions would poison the inner
+    // `Path` extractor ("expected 1 but got 2"). Carried: auth context
+    // (handlers require it; note axum's `Extension<T>` extractor reads
+    // the BARE `T`, so carry `Option<AuthContext>` unwrapped),
+    // OriginalUri (still the client-facing URI). Left behind: UrlParams
+    // + MatchedPath (inner match re-inserts both), ConnectInfo (no inner
+    // consumer; audit is header-based).
+    let auth = parts.extensions.remove::<Option<AuthContext>>();
+    let original_uri = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .cloned();
+    let mut fresh = Request::new(body);
+    *fresh.method_mut() = parts.method;
+    *fresh.uri_mut() = pq.parse().expect("alias target re-encodes to valid URI");
+    *fresh.version_mut() = parts.version;
+    *fresh.headers_mut() = parts.headers;
+    if let Some(auth) = auth {
+        fresh.extensions_mut().insert(auth);
+    }
+    if let Some(original_uri) = original_uri {
+        fresh.extensions_mut().insert(original_uri);
+    }
+    let bare = s.bare.get().expect("bare router installs at boot").clone();
+    tower::ServiceExt::oneshot(bare, fresh)
+        .await
+        .unwrap()
 }
 
 /// Percent-encode a `path?query` string's query side for Uri parsing.
@@ -4135,6 +4201,111 @@ mod tests {
     }
 
     #[test]
+    fn alias_e2e_transform() {
+        // Full middleware transform (minus tower): the exact pq the router sees.
+        let table = alias::AliasTable::new(
+            alias::compile_all(&[(
+                "/api/alias/students/:sid/:pin".into(),
+                "/api/collections/students".into(),
+                "options={\"filters\":[{\"field\":\"sid\",\"op\":\"==\",\"value\":\"{sid}\"},{\"field\":\"pin\",\"op\":\"==\",\"value\":\"{pin}\"}],\"limit\":1}".into(),
+            )])
+            .unwrap(),
+        );
+        let sub = "/students/S1/987";
+        let (target_path, target_q) = table.rewrite(sub).expect("match");
+        let merged = alias::merge_query(&target_q, None);
+        let pq = format!("{target_path}?{merged}");
+        let pq = reencode_query(&pq);
+        let uri: axum::http::Uri = pq.parse().expect("parses");
+        assert_eq!(uri.path(), "/api/collections/students");
+        // The decoded query must equal the direct-call query byte-for-byte.
+        let decoded: String = percent_decode(uri.query().unwrap());
+        assert_eq!(
+            decoded,
+            "options={\"filters\":[{\"field\":\"sid\",\"op\":\"==\",\"value\":\"S1\"},{\"field\":\"pin\",\"op\":\"==\",\"value\":\"987\"}],\"limit\":1}"
+        );
+    }
+
+    /// Full-stack alias proof (issue #5): alias and direct call travel
+    /// the production router + all layers and return byte-identical bodies.
+    #[tokio::test]
+    async fn alias_routes_end_to_end() {
+        use tower::ServiceExt;
+        let (st, raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "alias_stack").await;
+        raw.set(
+            "students",
+            "S1",
+            incoming_doc("S1", serde_json::json!({"sid": "S1", "pin": "987"})),
+            false,
+        )
+        .await
+        .unwrap();
+        *st.aliases.write().unwrap() = Arc::new(alias::AliasTable::new(
+            alias::compile_all(&[(
+                "/api/alias/students/:sid/:pin".into(),
+                "/api/collections/students".into(),
+                "options={\"filters\":[{\"field\":\"sid\",\"op\":\"==\",\"value\":\"{sid}\"},{\"field\":\"pin\",\"op\":\"==\",\"value\":\"{pin}\"}],\"limit\":1}".into(),
+            )])
+            .unwrap(),
+        ));
+        async fn get(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+            let req = Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        // Raw `{ } "` never hit the wire: clients percent-encode, exactly
+        // like reencode_query does for rewritten targets.
+        let direct_uri = reencode_query("/api/collections/students?options={\"filters\":[{\"field\":\"sid\",\"op\":\"==\",\"value\":\"S1\"},{\"field\":\"pin\",\"op\":\"==\",\"value\":\"987\"}],\"limit\":1}");
+        // SAME router instance for every call below.
+        let app = build_router(st.clone(), vec![], false);
+        let (as_, via_alias) = get(app.clone(), "/api/alias/students/S1/987").await;
+        let (ds, direct) = get(app.clone(), &direct_uri).await;
+        assert_eq!(as_, StatusCode::OK);
+        assert_eq!(ds, StatusCode::OK);
+        assert_eq!(via_alias, direct);
+        // Wrong pin: same shape, empty result (never a leak, never an error).
+        let (ws, wrong) = get(app.clone(), "/api/alias/students/S1/000").await;
+        assert_eq!(ws, StatusCode::OK);
+        assert_eq!(wrong, b"[]");
+        // Unmatched alias pattern: empty 404, like an unknown route.
+        let (ns, _) = get(app, "/api/alias/students/only-one").await;
+        assert_eq!(ns, StatusCode::NOT_FOUND);
+    }
+
+    /// Minimal percent-decoder for the transform test (no new deps).
+    fn percent_decode(s: &str) -> String {
+        let mut out = Vec::with_capacity(s.len());
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                    out.push(h << 4 | l);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+
+    #[test]
     fn render_issuance_matrix() {
         // render_issuance needs a LocalAuth for access_ttl; build one over
         // the auth crate's empty test db (no env, no behavior).
@@ -4553,6 +4724,7 @@ mod tests {
             local_token_response: false,
             local_cookies: true,
             aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::default()))),
+            bare: Arc::new(std::sync::OnceLock::new()),
         };
         (st, raw)
     }
