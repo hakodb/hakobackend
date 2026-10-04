@@ -1483,7 +1483,7 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     // a mismatch is not — the context drops to anonymous (policy denies).
     // Host comparison strips ports on BOTH sides: portal on :443 talking
     // to API on :3000 (same host, ports differ) is legitimate same-site
-    // traffic (DHP Temuan #4 killed all browser writes before this).
+    // traffic (field report: port-strict comparison killed all such writes).
     if s.csrf_check
         && from_cookie.is_some()
         && ctx.is_some()
@@ -1508,8 +1508,8 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
     next.run(req).await
 }
 
-/// Pure CSRF verdict (DHP Temuan #4): same host passes with ports stripped
-/// on both sides (portal :443 -> API :3000); anything else fails; absent
+/// Pure CSRF verdict (field report: same host, split ports): same host
+/// passes with ports stripped on both sides (portal :443 -> API :3000); anything else fails; absent
 /// Origin (curl/scripts) passes. Tested below; auth_mw only threads it.
 fn csrf_origin_ok(host: Option<&str>, origin: Option<&str>) -> bool {
     let Some(o) = origin else { return true };

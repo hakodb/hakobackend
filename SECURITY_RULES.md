@@ -37,7 +37,7 @@ the user collection in `[identity]` in `policy.toml`:
 
 ```toml
 [identity]
-users_collection = "members"  # default "users"; free choice: sc_users, members, …
+users_collection = "members"  # default "users"; free choice: members, accounts, …
 ```
 
 Admin access = caller UID in server `admin_uids` (config/flag). No roles,
@@ -47,10 +47,10 @@ no owner checks, no tenant claims anywhere in the stack.
 
 | Class | Policy pattern | Example |
 |---|---|---|
-| Public-read | `read = "public"`, `write = "deny"` | `posts`, `pages`, `sc_configs` |
+| Public-read | `read = "public"`, `write = "deny"` | `posts`, `pages`, `site_configs` |
 | Authenticated-write | `create/update = "auth"` | `media`, `tags` |
 | Authenticated-only | `read/write = "auth"` | `profiles`, user notifications |
-| Claim-gated | `claim:role=maintainer`, `claim:uid=self !role` | self-edit, role writes |
+| Claim-gated | `claim:role=editor`, `claim:uid=self !role` | self-edit, role writes |
 | Field-validated | `fields:unit=auth.unit,score=int:0..100` | scoped + typed writes |
 | Admin-only | `deny` + UID allowlist (`admin_uids`) | `ai_configs`, credentials |
 | Internal collections | `__` prefix **not exposed** over HTTP (unless explicit) | `__users` (refresh tokens), audit |
