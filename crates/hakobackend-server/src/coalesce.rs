@@ -172,20 +172,38 @@ impl Coalescer {
     }
 
     /// Background flusher: every tick, store due entries via `write`.
-    /// `db` is read fresh per entry so driver reloads keep working.
+    /// `dbs` is read fresh per tick so driver reloads keep working.
+    /// Keys are dotted (db.collection); each entry routes to its own
+    /// database (unknown prefix = default + full key, same fallback as
+    /// the reload drain — a stale map never strands entries elsewhere).
     pub fn spawn_flusher(
         self: &Arc<Self>,
-        db: Arc<tokio::sync::RwLock<Arc<dyn hakobackend_core::Database>>>,
+        dbs: Arc<tokio::sync::RwLock<Arc<std::collections::HashMap<String, Arc<dyn hakobackend_core::Database>>>>>,
     ) {
         let this = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(FLUSH_TICK);
             loop {
                 tick.tick().await;
-                let dbh = db.read().await.clone();
+                let map = dbs.read().await.clone();
                 this.flush_due(|coll, id, body| {
-                    let dbh = dbh.clone();
+                    let map = map.clone();
                     async move {
+                        let (stored, dbh) = match coll.split_once('.') {
+                            Some((d, rest)) if map.contains_key(d) => {
+                                (rest.to_string(), map[d].clone())
+                            }
+                            // ponytail: missing-default is a broken
+                            // constructor invariant (open_dbs always
+                            // inserts it) — Err requeues (then drops
+                            // loudly at MAX_FLUSH_FAILS), never unwrap:
+                            // a panic here would silently stop the
+                            // flusher while the process lives on.
+                            _ => match map.get("default") {
+                                Some(h) => (coll.clone(), h.clone()),
+                                None => return Err("coalescer: no default database".into()),
+                            },
+                        };
                         // createdAt survives (merge keeps existing fields);
                         // updatedAt refreshes here since we bypass write_doc.
                         let mut body = body;
@@ -197,7 +215,7 @@ impl Coalescer {
                         );
                         let out = dbh
                             .set(
-                                &coll,
+                                &stored,
                                 &id,
                                 hakobackend_core::Doc { id: id.clone(), data: body },
                                 true,
@@ -208,7 +226,7 @@ impl Coalescer {
                         // the writes saved). Partial bodies must never hit
                         // subscribers (filter misclassification).
                         if out.is_ok() {
-                            if let Ok(Some(doc)) = dbh.get(&coll, &id).await {
+                            if let Ok(Some(doc)) = dbh.get(&stored, &id).await {
                                 crate::realtime::emit(
                                     &coll,
                                     hakobackend_core::Change {

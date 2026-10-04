@@ -168,6 +168,10 @@ pub struct SubSpec {
     pub options: QueryOptions,
     #[serde(default)]
     pub group: bool,
+    /// Multidatabase (issue #13): bare collection + this db select the
+    /// namespace. Absent = default. Validated in subscribe().
+    #[serde(default)]
+    pub db: String,
 }
 
 #[derive(Debug, Clone)]
@@ -253,13 +257,14 @@ async fn resync_collection(
     db: &Arc<dyn Database>,
     snap_q: &QueryOptions,
     snapshot: &mut HashMap<String, Doc>,
-    coll: &str,
+    bus: &str,
+    stored: &str,
 ) {
-    if let Ok(docs) = db.list(coll, snap_q).await {
-        let prefix = format!("{coll}\0");
+    if let Ok(docs) = db.list(stored, snap_q).await {
+        let prefix = format!("{bus}\0");
         snapshot.retain(|k, _| !k.starts_with(&prefix));
         for doc in docs {
-            snapshot.insert(format!("{coll}\0{}", doc.id), doc);
+            snapshot.insert(format!("{bus}\0{}", doc.id), doc);
         }
     }
 }
@@ -290,32 +295,57 @@ pub async fn subscribe(
     if !hakobackend_core::valid_collection_path(&spec.collection) {
         return Err(AppError::BadRequest("invalid collection name".into()));
     }
-    if !policy.allow(auth.as_ref(), &spec.collection, Method::List, None) {
+    // Multidatabase (issue #13): empty db = default. Triple namespace
+    // from here on — bus names (dotted, match dotted emits), driver
+    // names (bare, storage), policy names (dotted). Default collapses
+    // all three to the bare collection (today's behavior exactly).
+    let dbname = if spec.db.is_empty() { "default" } else { spec.db.as_str() };
+    if !hakobackend_core::valid_db_name(dbname) {
+        return Err(AppError::BadRequest("invalid db name".into()));
+    }
+    let pol = if dbname == "default" {
+        spec.collection.clone()
+    } else {
+        format!("{dbname}.{}", spec.collection)
+    };
+    if !policy.allow(auth.as_ref(), &pol, Method::List, None) {
         return Err(AppError::PermissionDenied);
     }
-    // (stored, logical) pairs downstream; policy always sees logical.
-    // Identical here (no prefix); kept as pairs for the snapshot keys.
+    // (bus, stored) pairs downstream; policy always sees logical (= bus).
+    // `stored_of` feeds every driver touch; bus keys feed streams/snapshots.
     let pairs: Vec<(String, String)> = if spec.group {
         let all = db.list_collections().await?;
         all.into_iter()
             .filter(|c| matches_group(c, &spec.collection))
-            .map(|c| (c.clone(), c))
+            .map(|c| {
+                let bus = if dbname == "default" { c.clone() } else { format!("{dbname}.{c}") };
+                (bus, c)
+            })
             .collect()
     } else {
-        vec![(spec.collection.clone(), spec.collection.clone())]
+        vec![(pol.clone(), spec.collection.clone())]
     };
     let mut collections: Vec<String> = pairs.iter().map(|(s, _)| s.clone()).collect();
-    let mut logical_of: HashMap<String, String> = pairs.into_iter().collect();
+    // Bus names feed streams/snapshots/policy; stored names feed the
+    // driver. Identical on default (today's behavior exactly).
+    let mut stored_of: HashMap<String, String> =
+        pairs.iter().map(|(b, s)| (b.clone(), s.clone())).collect();
+    // Logical == bus (dotted policy namespace); the map stays so
+    // run_source/apply_diff keep one lookup shape.
+    let mut logical_of: HashMap<String, String> =
+        pairs.iter().map(|(b, _)| (b.clone(), b.clone())).collect();
     if collections.is_empty() {
-        logical_of.insert(spec.collection.clone(), spec.collection.clone());
-        collections.push(spec.collection.clone());
+        logical_of.insert(pol.clone(), pol.clone());
+        stored_of.insert(pol.clone(), spec.collection.clone());
+        collections.push(pol.clone());
     }
     // Initial snapshot (no burst to client — client GETs first like legacy).
     let snap_q = snapshot_options(&spec.options);
     let mut snapshot: HashMap<String, Doc> = HashMap::new();
     for coll in &collections {
-        let _ = db.ensure_collection(coll).await;
-        for doc in db.list(coll, &snap_q).await? {
+        let stored = stored_of.get(coll).map(|s| s.as_str()).unwrap_or(coll);
+        let _ = db.ensure_collection(stored).await;
+        for doc in db.list(stored, &snap_q).await? {
             snapshot.insert(format!("{coll}\0{}", doc.id), doc);
         }
     }
@@ -335,7 +365,7 @@ pub async fn subscribe(
     // (never hang a subscribe on a dying source).
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_source(
-        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx, ready_tx, caps,
+        db, policy, auth, spec.options, collections, stored_of, logical_of, snapshot, watch, tx, ready_tx, caps,
     ));
     if tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
         .await
@@ -353,6 +383,7 @@ async fn run_source(
     auth: Option<AuthContext>,
     options: QueryOptions,
     collections: Vec<String>,
+    stored_of: HashMap<String, String>,
     logical_of: HashMap<String, String>,
     mut snapshot: HashMap<String, Doc>,
     watch: bool,
@@ -362,6 +393,11 @@ async fn run_source(
 ) {
     // Policy sees logical names; storage/snapshot use stored names.
     let lf = &logical_of;
+    // ponytail: one closure, not repeated get() chains — every driver
+    // touch below resolves bus→stored in exactly one place. Owned
+    // String (not borrowed): the borrow would not survive the awaits
+    // below, and these are cold paths (setup/resync, never hot reads).
+    let stored = |coll: &str| stored_of.get(coll).cloned().unwrap_or_else(|| coll.to_string());
     if watch {
         // One stream per collection in a StreamMap: true push (no polling
         // sleep, no added latency), keyed so a lagged collection resyncs
@@ -371,7 +407,7 @@ async fn run_source(
         use tokio_stream::StreamMap;
         let mut map = StreamMap::new();
         for coll in &collections {
-            if let Ok(rx) = db.subscribe(coll).await {
+            if let Ok(rx) = db.subscribe(&stored(coll)).await {
                 map.insert(coll.clone(), BroadcastStream::new(rx));
             }
             map.insert(format!("bus\0{coll}"), BroadcastStream::new(bus_stream(coll).await));
@@ -401,12 +437,12 @@ async fn run_source(
                     .await;
                     // Flood: drop the burst, resync, keep consistency.
                     if sent && gate.observe(1) {
-                        resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
+                        resync_collection(&db, &snap_q, &mut snapshot, &coll, &stored(&coll)).await;
                     }
                 }
                 // Lagged: we missed broadcasts; resync instead of drifting.
                 Some((coll, Err(_))) => {
-                    resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
+                    resync_collection(&db, &snap_q, &mut snapshot, &coll, &stored(&coll)).await;
                 }
                 // All streams closed (bridges torn down): nothing left to hear.
                 None => return,
@@ -431,7 +467,7 @@ async fn run_source(
         let mut gate = RateGate::new(caps.events_per_sec);
         let mut map: StreamMap<String, Boxed> = StreamMap::new();
         for coll in &collections {
-            let ticks = BroadcastStream::new(shared_poll_stream(db.clone(), coll, caps.poll_secs).await).map(|r| match r {
+            let ticks = BroadcastStream::new(shared_poll_stream(db.clone(), &stored(coll), caps.poll_secs).await).map(|r| match r {
                 Ok(docs) => Lane::Tick(docs),
                 Err(_) => Lane::TickLagged,
             });
@@ -450,7 +486,7 @@ async fn run_source(
                 Some((key, Lane::Tick(docs))) => {
                     let coll = key.as_str();
                     let sent =
-                        apply_diff(&db, &policy, auth.as_ref(), &options, &mut snapshot, &logical_of, {
+                        apply_diff(&db, &policy, auth.as_ref(), &options, &mut snapshot, &logical_of, &stored_of, {
                             let mut fresh: HashMap<String, Doc> = HashMap::new();
                             for doc in docs {
                                 fresh.insert(format!("{coll}\0{}", doc.id), doc);
@@ -483,7 +519,7 @@ async fn run_source(
                     )
                     .await;
                     if sent && gate.observe(1) {
-                        resync_collection(&db, &snap_q, &mut snapshot, &coll).await;
+                        resync_collection(&db, &snap_q, &mut snapshot, &coll, &stored(&coll)).await;
                     }
                 }
                 // Lagged bus: a poll tick is at most 2 s away and carries
@@ -513,6 +549,7 @@ async fn apply_diff(
     options: &QueryOptions,
     snapshot: &mut HashMap<String, Doc>,
     logical_of: &HashMap<String, String>,
+    stored_of: &HashMap<String, String>,
     fresh: HashMap<String, Doc>,
     tx: &tokio::sync::mpsc::UnboundedSender<OutEvent>,
 ) -> u64 {
@@ -539,7 +576,8 @@ async fn apply_diff(
         let id = key.split('\0').nth(1).unwrap_or("");
         // Verify before removing: a stale tick must not drop a doc
         // committed concurrently (bus already delivered it).
-        match db.get(coll, id).await {
+        let stored = stored_of.get(key.split('\0').next().unwrap_or("")).map(|s| s.as_str()).unwrap_or("");
+        match db.get(stored, id).await {
             Ok(Some(current)) => {
                 // Converge silently — content decides on the next diff.
                 snapshot.insert(key.clone(), current);
@@ -690,7 +728,7 @@ mod tests {
             db.clone(),
             policy,
             None,
-            SubSpec { collection: "rt".into(), options: QueryOptions::default(), group: false },
+            SubSpec { collection: "rt".into(), options: QueryOptions::default(), group: false, db: String::new() },
             RtCaps::default(),
         )
         .await
@@ -735,7 +773,7 @@ mod tests {
         let path = dir.join("t.db");
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
-        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false, db: String::new() };
         let mut s1 = subscribe(db.clone(), policy.clone(), None, spec.clone(), RtCaps::default()).await.unwrap();
         let mut s2 = subscribe(db.clone(), policy, None, spec, RtCaps::default()).await.unwrap();
 
@@ -763,7 +801,7 @@ mod tests {
         let path = dir.join("t.db");
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
-        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false, db: String::new() };
         db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false)
             .await
             .unwrap();
@@ -806,7 +844,7 @@ mod tests {
         let path = dir.join("t.db");
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
-        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false, db: String::new() };
         let mut sub = subscribe(db, policy, None, spec, RtCaps::default()).await.unwrap();
         emit(
             "ev",
@@ -831,7 +869,7 @@ mod tests {
         let path = dir.join("t.db");
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
-        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false, db: String::new() };
         let mut sub = subscribe(db.clone(), policy, None, spec, RtCaps::default()).await.unwrap();
         // Commit through the driver AND emit (what write_doc does).
         db.set("ev", "a", Doc { id: "a".into(), data: [("age".to_string(), serde_json::json!(1))].into_iter().collect() }, false)
@@ -865,17 +903,18 @@ mod tests {
         let policy = Arc::new(PolicyFile::open());
         let options = QueryOptions::default();
         let logical_of: HashMap<String, String> = [("ev".to_string(), "ev".to_string())].into_iter().collect();
+        let stored_of: HashMap<String, String> = [("ev".to_string(), "ev".to_string())].into_iter().collect();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false).await.unwrap();
         // Stale tick: list missed the just-committed doc.
         let mut snapshot = HashMap::new();
         snapshot.insert("ev\0a".to_string(), doc("a", 1));
-        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, HashMap::new(), &tx).await;
+        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, &stored_of, HashMap::new(), &tx).await;
         assert_eq!(sent, 0, "verified-present must not emit Remove");
         assert!(snapshot.contains_key("ev\0a"), "snapshot keeps converged doc");
         // Genuine delete: get finds nothing → Remove delivered.
         db.delete("ev", "a").await.unwrap();
-        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, HashMap::new(), &tx).await;
+        let sent = apply_diff(&db, &policy, None, &options, &mut snapshot, &logical_of, &stored_of, HashMap::new(), &tx).await;
         assert_eq!(sent, 1);
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.kind, ChangeKind::Remove);

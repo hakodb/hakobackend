@@ -208,6 +208,16 @@ pub fn valid_collection_path(s: &str) -> bool {
     segs > 0
 }
 
+/// Database name gate (issue #13; multidatabase `?db=`): same charset
+/// as one collection segment, no `__` prefix (server namespace).
+/// Mirrors hakocluster's `valid_db_name` (separate crates, same rule —
+/// noted, not deduplicated: no shared crate exists).
+pub fn valid_db_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+        && !s.starts_with("__")
+}
 /// Document id charset: anything except `/`, control chars, and emptiness
 /// (≤512 chars). Unicode ids stay legal; traversal is impossible.
 pub fn valid_doc_id(s: &str) -> bool {

@@ -249,3 +249,30 @@ aliases apply unchanged.
   404. The sweeper (same interval as TTL) reaps temp files, stale
   pendings and unreferenced bytes (mtime-guarded against in-flight
   uploads). Metadata-without-bytes 404s loudly (repair signal).
+
+## 16. Multidatabase (`?db=`, issue #13)
+
+One backend serves N named databases. `data` is always `default`;
+`[databases]` adds extras (name → driver `data`). Absent = single-db,
+today's behavior exactly.
+
+- Uniform channel: `?db=` on every route, all verbs (bodies never
+  carry db). Absent = `default`. `POST /api/batch?db=akademik` keeps
+  today's body shape; cross-db batches are structurally impossible.
+- Embedded drivers (hako/sqlite) serve `default` only: explicit
+  non-default is 400, unknown on multi-db is 404.
+- Policy namespace is dotted (`akademik.mahasiswa`); `default` stays
+  bare (existing files keep working). Dots are illegal in collection
+  segments, so no subcollection collision. In TOML, quote dotted
+  keys: `[collections."akademik.mahasiswa"]`.
+- `db` and `?options=` are siblings (envelope stays query-shaping
+  only). Alias merge is per-key: `db` = alias-wins (pinned db cannot
+  be escaped via the request query), `options` = request-wins.
+  Cursors are db-scoped by contract.
+- Realtime lanes partition by database (dotted bus names); WS
+  subscribe takes a per-message `db`, SSE reads URL `?db=`.
+- Files: metadata lives in the addressed db's collection; bytes are
+  content-addressed and shared; the sweeper unions all databases.
+- Unknown-db auto-create: SQL drivers (operator pre-creates or a
+  follow-up CREATEDB convenience); cluster names must pre-exist
+  (explicit registry, reload to add).

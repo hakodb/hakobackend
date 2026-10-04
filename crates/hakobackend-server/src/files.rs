@@ -22,8 +22,8 @@ use hakobackend_policy::PolicyFile;
 use sha2::{Digest, Sha256};
 
 use super::{
-    denied_internal, deny_if_read_only, err, forbidden, realtime, stored, valid_names, wstats, AppState,
-    WSAMP,
+    denied_internal, deny_if_read_only, dotted, err, forbidden, realtime, resolve_db_name, stored,
+    valid_names, wstats, AppState, WSAMP,
 };
 
 /// Boot-time file config (restart to change, same discipline as
@@ -91,19 +91,22 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn sig_msg(collection: &str, id: &str, field: &str, exp: u64) -> String {
-    format!("{collection}\n{id}\n{field}\n{exp}")
+fn sig_msg(db: &str, collection: &str, id: &str, field: &str, exp: u64) -> String {
+    // ponytail: db inside the MAC — without it a URL minted for db A
+    // replays on db B's same collection/id (different bytes). Old sigs
+    // (pre-db) fail verify: fail-closed direction, acceptable.
+    format!("{db}\n{collection}\n{id}\n{field}\n{exp}")
 }
 
-fn mint_sig(secret: &[u8], collection: &str, id: &str, field: &str, exp: u64) -> String {
-    hex(&hmac_sha256(secret, sig_msg(collection, id, field, exp).as_bytes()))
+fn mint_sig(secret: &[u8], db: &str, collection: &str, id: &str, field: &str, exp: u64) -> String {
+    hex(&hmac_sha256(secret, sig_msg(db, collection, id, field, exp).as_bytes()))
 }
 
-fn verify_sig(secret: &[u8], collection: &str, id: &str, field: &str, exp: u64, sig: &str) -> bool {
+fn verify_sig(secret: &[u8], db: &str, collection: &str, id: &str, field: &str, exp: u64, sig: &str) -> bool {
     if secret.is_empty() || now_secs() > exp {
         return false;
     }
-    let want = mint_sig(secret, collection, id, field, exp);
+    let want = mint_sig(secret, db, collection, id, field, exp);
     // ponytail: byte loop instead of the subtle crate — one call site,
     // and == on Strings would early-exit (timing oracle on the MAC).
     want.len() == sig.len() && want.bytes().zip(sig.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0
@@ -339,7 +342,6 @@ async fn promote(dir: &str, tmp: &std::path::Path, sha: &str) -> Result<(), Resp
 async fn commit_file(
     s: &AppState,
     auth: &Option<AuthContext>,
-    collection: &str,
     stored_coll: &str,
     id: &str,
     field: &str,
@@ -347,13 +349,14 @@ async fn commit_file(
     existing: Option<Doc>,
     policy: &Arc<PolicyFile>,
     db: &Arc<dyn Database>,
+    pol: &str,
 ) -> Result<(String, serde_json::Value), Response> {
     let conf = s.files.clone();
     let dir = conf.dir.clone().unwrap_or_default();
     let need = if existing.is_some() { Method::Update } else { Method::Create };
     // pre-bytes shell check: fail-closed before touching disk.
     let shell = Doc { id: id.to_string(), data: Default::default() };
-    if !policy.allow(auth.as_ref(), collection, need, Some(&shell)) {
+    if !policy.allow(auth.as_ref(), pol, need, Some(&shell)) {
         let _ = tokio::fs::remove_file(&part.bytes_path_tmp).await;
         return Err(forbidden());
     }
@@ -407,9 +410,9 @@ async fn commit_file(
         .await
         .map_err(|e| err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()))?;
     realtime::emit(
-        stored_coll,
+        pol,
         Change {
-            collection: stored_coll.to_string(),
+            collection: pol.to_string(),
             id: doc_id.clone(),
             kind: ChangeKind::Change,
             old: None,
@@ -425,6 +428,7 @@ pub async fn upload(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     mut mp: Multipart,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
@@ -433,11 +437,19 @@ pub async fn upload(
     if !s.files.on() {
         return file_off();
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let target = match parse_target(&path) {
         Ok(t) => t,
         Err(r) => return r,
     };
     let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
     // Dir ensured per request (boot does it too; tests bypass boot).
@@ -479,10 +491,11 @@ pub async fn upload(
     let out = match target {
         FileTarget::Batch { collection } => {
             let stored_coll = stored(&collection);
-            let _ = hot.db.ensure_collection(&stored_coll).await;
+            let pol = dotted(&dbname, &collection);
+            let _ = dbh.ensure_collection(&stored_coll).await;
             let mut out = Vec::with_capacity(parts.len());
             for p in parts {
-                match commit_file(&s, &auth, &collection, &stored_coll, "", "file", p, None, &hot.policy, &hot.db).await {
+                match commit_file(&s, &auth, &stored_coll, "", "file", p, None, &hot.policy, &dbh, &pol).await {
                     Ok((id, meta)) => out.push(serde_json::json!({"id": id, "file": meta})),
                     Err(r) => return r,
                 }
@@ -498,10 +511,11 @@ pub async fn upload(
                 return err(StatusCode::BAD_REQUEST, "single-file route takes 1 `file` part (batch via collection route)");
             }
             let stored_coll = stored(&collection);
-            let _ = hot.db.ensure_collection(&stored_coll).await;
-            let existing = hot.db.get(&stored_coll, &id).await.ok().flatten();
+            let pol = dotted(&dbname, &collection);
+            let _ = dbh.ensure_collection(&stored_coll).await;
+            let existing = dbh.get(&stored_coll, &id).await.ok().flatten();
             let p = parts.into_iter().next().unwrap();
-            match commit_file(&s, &auth, &collection, &stored_coll, &id, &field, p, existing, &hot.policy, &hot.db).await {
+            match commit_file(&s, &auth, &stored_coll, &id, &field, p, existing, &hot.policy, &dbh, &pol).await {
                 // ponytail: manual map insert — json! takes literal keys,
                 // so a dynamic field name needs the real Map.
                 Ok((doc_id, meta)) => {
@@ -543,25 +557,34 @@ pub async fn download(
         Err(r) => return r,
     };
     let hot = s.hot().await;
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
     let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
     let stored_coll = stored(&collection);
-    let doc = hot.db.get(&stored_coll, &id).await.ok().flatten();
+    let doc = dbh.get(&stored_coll, &id).await.ok().flatten();
     // ponytail: shell check on missing docs, exactly like get_or_list —
     // public+absent is 404, deny is 403 either way. AuthZ first,
     // existence second, same as the document surface.
     let mut allowed = match &doc {
-        Some(d) => hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)),
+        Some(d) => hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(d)),
         None => {
             let shell = Doc { id: id.clone(), data: Default::default() };
-            hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(&shell))
+            hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&shell))
         }
     };
     // Signed-URL consume: anonymous iff MAC valid + fresh + feature on.
     if !allowed {
         if let (Some(exp), Some(sig)) = (q.get("exp"), q.get("sig")) {
             if let Ok(exp) = exp.parse::<u64>() {
-                allowed = verify_sig(&s.files.sign_secret, &collection, &id, &field, exp, sig);
+                allowed = verify_sig(&s.files.sign_secret, &dbname, &collection, &id, &field, exp, sig);
             }
         }
     }
@@ -578,8 +601,10 @@ pub async fn download(
             return err(StatusCode::BAD_REQUEST, "sign needs 1..=3600 seconds");
         }
         let exp = now_secs() + secs;
-        let sig = mint_sig(&s.files.sign_secret, &collection, &id, &field, exp);
-        let url = format!("/api/files/{}/{}{}?exp={exp}&sig={sig}", collection, id, field_suffix(&field));
+        let sig = mint_sig(&s.files.sign_secret, &dbname, &collection, &id, &field, exp);
+        // ponytail: db rides the query like everything else (uniform
+        // channel); the MAC binds it, so it cannot be swapped.
+        let url = format!("/api/files/{}/{}{}?db={dbname}&exp={exp}&sig={sig}", collection, id, field_suffix(&field));
         return Json(serde_json::json!({"url": url, "exp": exp})).into_response();
     }
     if !allowed {
@@ -728,6 +753,7 @@ pub async fn remove(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
@@ -735,6 +761,10 @@ pub async fn remove(
     if !s.files.on() {
         return file_off();
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let (collection, id, field) = match parse_target(&path) {
         Ok(FileTarget::Single { collection, id, field }) => (collection, id, field),
         Ok(FileTarget::Batch { .. }) => {
@@ -743,14 +773,19 @@ pub async fn remove(
         Err(r) => return r,
     };
     let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
     let stored_coll = stored(&collection);
-    let doc = hot.db.get(&stored_coll, &id).await.ok().flatten();
+    let doc = dbh.get(&stored_coll, &id).await.ok().flatten();
     // Same shell-on-missing discipline as download (see above).
     let allowed = match &doc {
-        Some(d) => hot.policy.allow(auth.as_ref(), &collection, Method::Delete, Some(d)),
+        Some(d) => hot.policy.allow(auth.as_ref(), &pol, Method::Delete, Some(d)),
         None => {
             let shell = Doc { id: id.clone(), data: Default::default() };
-            hot.policy.allow(auth.as_ref(), &collection, Method::Delete, Some(&shell))
+            hot.policy.allow(auth.as_ref(), &pol, Method::Delete, Some(&shell))
         }
     };
     if !allowed {
@@ -759,16 +794,16 @@ pub async fn remove(
     if doc.as_ref().is_none_or(|d| !d.data.contains_key(&field)) {
         return err(StatusCode::NOT_FOUND, "no such file");
     }
-    match remove_field(&hot.db, &stored_coll, &id, &field).await {
+    match remove_field(&dbh, &stored_coll, &id, &field).await {
         Ok(()) => {
             realtime::emit(
-                &stored_coll,
+                &pol,
                 Change {
-                    collection: stored_coll.clone(),
+                    collection: pol.clone(),
                     id: id.clone(),
                     kind: ChangeKind::Change,
                     old: None,
-                    new: hot.db.get(&stored_coll, &id).await.ok().flatten(),
+                    new: dbh.get(&stored_coll, &id).await.ok().flatten(),
                 },
             );
             Json(serde_json::json!({"ok": true})).into_response()
@@ -827,10 +862,21 @@ async fn sweep_once(s: &AppState, dir: &str) {
             }
         }
     }
-    // Referenced shas + stale pendings across every collection.
+    // Referenced shas + stale pendings across every collection of
+    // EVERY database (issue #13): bytes are content-addressed and
+    // shared, so the referenced set is the union over all DBs.
+    // ponytail: one shared scan body, not per-db copies — the only
+    // per-db inputs are the handle and where stale removals land.
     let mut referenced = std::collections::HashSet::new();
-    let mut stale: Vec<(String, String, String)> = Vec::new();
-    if let Ok(colls) = hot.db.list_collections().await {
+    let mut stale: Vec<(Arc<dyn Database>, String, String, String)> = Vec::new();
+    let mut names: Vec<String> = hot.dbs.keys().cloned().collect();
+    names.sort();
+    for dbname in &names {
+        let dbh = match hot.dbs.get(dbname) {
+            Some(h) => h.clone(),
+            None => continue,
+        };
+        if let Ok(colls) = dbh.list_collections().await {
         for c in colls {
             if c.split('/').next().is_some_and(|x| x.starts_with("__")) {
                 continue;
@@ -842,7 +888,7 @@ async fn sweep_once(s: &AppState, dir: &str) {
                     offset: Some(offset),
                     ..Default::default()
                 };
-                let docs = hot.db.list(&c, &opts).await.unwrap_or_default();
+                let docs = dbh.list(&c, &opts).await.unwrap_or_default();
                 if docs.is_empty() {
                     break;
                 }
@@ -853,7 +899,7 @@ async fn sweep_once(s: &AppState, dir: &str) {
                             && v.get("pendingSince").and_then(|x| x.as_u64()).is_some_and(|t| t < cutoff)
                             && v.get("sha256").and_then(|x| x.as_str()).is_some()
                         {
-                            stale.push((c.clone(), d.id.clone(), k.clone()));
+                            stale.push((dbh.clone(), c.clone(), d.id.clone(), k.clone()));
                         }
                         if let Some(sha) = as_file_meta(v) {
                             if v.get("state").and_then(|x| x.as_str()) == Some("ready") {
@@ -869,8 +915,9 @@ async fn sweep_once(s: &AppState, dir: &str) {
             }
         }
     }
-    for (c, id, field) in stale {
-        let _ = remove_field(&hot.db, &c, &id, &field).await;
+    }
+    for (dbh, c, id, field) in stale {
+        let _ = remove_field(&dbh, &c, &id, &field).await;
     }
     // Orphan bytes: walk shards, delete unreferenced (mtime-guarded).
     // ponytail: only exact 64-hex names under 2-hex shards are ever
@@ -924,12 +971,14 @@ mod tests {
     fn sig_roundtrip_and_expiry() {
         let secret = b"test-secret";
         let exp = now_secs() + 60;
-        let sig = mint_sig(secret, "avatars", "u1", "file", exp);
-        assert!(verify_sig(secret, "avatars", "u1", "file", exp, &sig));
-        assert!(!verify_sig(secret, "avatars", "u1", "file", exp, "00"));
-        assert!(!verify_sig(secret, "avatars", "u2", "file", exp, &sig));
-        assert!(!verify_sig(secret, "avatars", "u1", "file", now_secs() - 1, &mint_sig(secret, "avatars", "u1", "file", now_secs() - 1)));
-        assert!(!verify_sig(b"", "avatars", "u1", "file", exp, &sig));
+        let sig = mint_sig(secret, "default", "avatars", "u1", "file", exp);
+        assert!(verify_sig(secret, "default", "avatars", "u1", "file", exp, &sig));
+        assert!(!verify_sig(secret, "default", "avatars", "u1", "file", exp, "00"));
+        assert!(!verify_sig(secret, "default", "avatars", "u2", "file", exp, &sig));
+        // Cross-db replay fails (db inside the MAC).
+        assert!(!verify_sig(secret, "other", "avatars", "u1", "file", exp, &sig));
+        assert!(!verify_sig(secret, "default", "avatars", "u1", "file", now_secs() - 1, &mint_sig(secret, "default", "avatars", "u1", "file", now_secs() - 1)));
+        assert!(!verify_sig(b"", "default", "avatars", "u1", "file", exp, &sig));
     }
 
     #[test]

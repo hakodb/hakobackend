@@ -66,6 +66,9 @@ struct AppState {
     /// DB router: collection -> driver. Today 1 driver for all collections;
     /// this map is what enables per-collection overrides (`routes` in hakobackend.toml, phase 3).
     db: Arc<tokio::sync::RwLock<Arc<dyn Database>>>,
+    /// Named database handles (issue #13): `default` mirrors `db`.
+    /// Reload swaps the whole map; Hot snapshots it per SNAP_TTL.
+    dbs: Arc<tokio::sync::RwLock<Arc<std::collections::HashMap<String, Arc<dyn Database>>>>>,
     policy: Arc<PolicyHot>,
     /// Verifier chain (empty = dev mode without auth; resolve always None).
     auth: Arc<tokio::sync::RwLock<Arc<AuthChain>>>,
@@ -396,9 +399,50 @@ impl AppState {
 struct Hot {
     policy: Arc<PolicyFile>,
     db: Arc<dyn Database>,
+    /// Named databases (issue #13): `default` is `db` (same Arc);
+    /// extras from `[databases]`. Snapshot with the rest so reload
+    /// swaps the whole map atomically.
+    dbs: Arc<std::collections::HashMap<String, Arc<dyn Database>>>,
     auth: Arc<AuthChain>,
     service: Arc<ServiceAuth>,
     local: Option<Arc<LocalAuth>>,
+}
+
+impl Hot {
+    /// Handle lookup (issue #13): unknown = 404; non-default on a
+    /// single-db deployment = 400 (teaches single-namespace instead
+    /// of a confusing 404).
+    fn db_for(&self, db: &str) -> Result<Arc<dyn Database>, Response> {
+        if let Some(h) = self.dbs.get(db) {
+            return Ok(h.clone());
+        }
+        if self.dbs.len() <= 1 {
+            return Err(err(StatusCode::BAD_REQUEST, "single-database deployment (default only)"));
+        }
+        Err(err(StatusCode::NOT_FOUND, "unknown database"))
+    }
+}
+
+/// `?db=` resolution (issue #13): absent = default; illegal = 400.
+/// Uniform channel on every route, all verbs — bodies never carry db.
+fn resolve_db_name(q: &HashMap<String, String>) -> Result<String, Response> {
+    let db = q.get("db").map(|s| s.as_str()).unwrap_or("default");
+    if !hakobackend_core::valid_db_name(db) {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid db name"));
+    }
+    Ok(db.to_string())
+}
+
+/// Policy namespace: default stays bare (existing policy files keep
+/// working); named DBs dot-prefix. Dots are illegal in collection
+/// segments (charset gate), so no subcollection collision. Driver
+/// calls ALWAYS use the bare collection — dotted is policy-only.
+fn dotted(db: &str, collection: &str) -> String {
+    if db == "default" {
+        collection.to_string()
+    } else {
+        format!("{db}.{collection}")
+    }
 }
 
 /// Refresh cadence for the hot snapshot. Policy/file edits apply within
@@ -440,6 +484,7 @@ impl HotCache {
         let hot = Hot {
             policy: s.policy.get().await,
             db: s.db.read().await.clone(),
+            dbs: s.dbs.read().await.clone(),
             auth: s.auth.read().await.clone(),
             service: s.service.read().await.clone(),
             local: s.local.read().await.clone(),
@@ -603,6 +648,35 @@ async fn open_driver(
     Ok(db)
 }
 
+/// Open `default` (`data`) + every `[databases]` entry (issue #13)
+/// through the SAME driver. Each open spawns its own TTL sweeper
+/// (inside open_driver) — expiry stays per-database, never shared.
+async fn open_dbs(
+    driver: &str,
+    data: &str,
+    extra: &std::collections::HashMap<String, String>,
+    sync_serve: Option<String>,
+    sync_peer: Vec<String>,
+    ttl_sweep_secs: u64,
+) -> Result<std::collections::HashMap<String, Arc<dyn Database>>, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert(
+        "default".to_string(),
+        open_driver(driver, data, sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs).await?,
+    );
+    let mut names: Vec<&String> = extra.keys().collect();
+    names.sort();
+    for n in names {
+        m.insert(
+            n.clone(),
+            open_driver(driver, &extra[n], sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs)
+                .await
+                .map_err(|e| format!("database `{n}`: {e}"))?,
+        );
+    }
+    Ok(m)
+}
+
 /// Full HTTP surface: routes + every layer, exactly as served.
 /// Extracted from main() (pure code motion) so tests can oneshot the
 /// production stack byte-for-byte.
@@ -737,8 +811,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Fail closed before opening anything (useless/broken issuance shapes).
     validate_local_modes(&cfg).map_err(|e| format!("[ub] {e}"))?;
-    let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await.expect("open database");
-    println!("[ub] driver={} data={} config={}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source });
+    let dbs_map = open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await.expect("open database");
+    let db: Arc<dyn Database> = dbs_map["default"].clone();
+    println!("[ub] driver={} data={} config={} databases=[{}]", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source }, {
+        let mut n: Vec<&String> = dbs_map.keys().collect();
+        n.sort();
+        n.into_iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+    });
     // Flags are read here: `cli` moves into AppState below.
     let wstats_flag = cli.wstats;
     let benchmark_flag = cli.benchmark;
@@ -770,7 +849,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => eprintln!("[ub] WARN: {e}; using all"),
     }
     let (chain, local, github) = open_auth(cfg.auth.as_deref(), db.clone(), policy.identity_snapshot());
-    auto_provision(&db, &policy.get().await, &cfg.indexes).await;
+    auto_provision_all(&dbs_map, &policy.get().await, &cfg.indexes).await;
 
     let limits = Arc::new(LimitLayers {
         global: Arc::new(Limiter::new(Quota::per_minute(cfg.limit_global.0, cfg.limit_global.1))),
@@ -785,6 +864,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_handle: Arc<tokio::sync::RwLock<Arc<dyn Database>>> =
         Arc::new(tokio::sync::RwLock::new(db));
+    let dbs_handle: Arc<tokio::sync::RwLock<Arc<std::collections::HashMap<String, Arc<dyn Database>>>>> =
+        Arc::new(tokio::sync::RwLock::new(Arc::new(dbs_map)));
     let auth_handle = Arc::new(tokio::sync::RwLock::new(Arc::new(chain)));
     let local_handle: Arc<tokio::sync::RwLock<Option<Arc<LocalAuth>>>> =
         Arc::new(tokio::sync::RwLock::new(local));
@@ -796,12 +877,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hot_cache = Arc::new(HotCache::new(Hot {
         policy: policy.get().await,
         db: db_handle.read().await.clone(),
+        dbs: dbs_handle.read().await.clone(),
         auth: auth_handle.read().await.clone(),
         service: service_handle.read().await.clone(),
         local: local_handle.read().await.clone(),
     }));
     let state = AppState {
         db: db_handle.clone(),
+        dbs: dbs_handle.clone(),
         policy,
         auth: auth_handle,
         local: local_handle,        github: Arc::new(tokio::sync::RwLock::new(github)),
@@ -850,7 +933,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bare: Arc::new(std::sync::OnceLock::new()),
     };
     if cfg.coalesce_writes {
-        state.coalescer.spawn_flusher(state.db.clone());
+        state.coalescer.spawn_flusher(state.dbs.clone());
     }
     // Managed files (issue #11): dir must exist before serving; the
     // sweeper follows reloads via the hot snapshot (no respawn needed).
@@ -1122,8 +1205,8 @@ async fn limit_mw(
 /// Ready-to-use auto-create (legacy autoCreateTablesFromRules pattern,
 /// extended to indexes): collections from policy keys + `[[indexes]]` config.
 /// Per-item failure = WARN, not fatal (manual endpoints stay available).
-async fn auto_provision(db: &Arc<dyn Database>, policy: &Arc<PolicyFile>, indexes: &[config::IndexDecl]) {
-    for collection in policy.collections.keys() {
+async fn auto_provision(db: &Arc<dyn Database>, collections: &[String], indexes: &[config::IndexDecl]) {
+    for collection in collections {
         if let Err(e) = db.ensure_collection(collection).await {
             eprintln!("[ub] auto-create collection {collection} failed: {e}");
         }
@@ -1144,6 +1227,55 @@ async fn auto_provision(db: &Arc<dyn Database>, policy: &Arc<PolicyFile>, indexe
             Ok(info) => println!("[ub] index ready: {} → {}", decl.collection, info.name),
             Err(e) => eprintln!("[ub] index {} failed: {e}", decl.collection),
         }
+    }
+}
+
+/// Split policy keys + index decls across databases (issue #13):
+/// a `db.rest` first-dot prefix selects the db (dots are illegal in
+/// collection segments, so the split is safe); bare names land on
+/// default. Unknown-db prefixes WARN + skip (fail-closed: never
+/// provision into a typo).
+async fn auto_provision_all(
+    dbs: &std::collections::HashMap<String, Arc<dyn Database>>,
+    policy: &Arc<PolicyFile>,
+    indexes: &[config::IndexDecl],
+) {
+    let split = |name: &str| match name.split_once('.') {
+        Some((db, rest)) if dbs.contains_key(db) => (db.to_string(), rest.to_string()),
+        Some((db, _)) => {
+            eprintln!("[ub] WARN: unknown database `{db}` in `{name}` (skipped)");
+            (String::new(), String::new())
+        }
+        None => ("default".to_string(), name.to_string()),
+    };
+    let mut cols: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    for c in policy.collections.keys() {
+        let (db, rest) = split(c);
+        if db.is_empty() {
+            continue;
+        }
+        cols.entry(db).or_default().push(rest);
+    }
+    // ponytail: index decls filtered per db inline (dbs × decls, boot
+    // only) — no cloned vecs, no signature churn for one loop.
+    let mut names: Vec<&String> = dbs.keys().collect();
+    names.sort();
+    for db in names {
+        let handle = &dbs[db];
+        let mine: Vec<String> = cols.get(db).cloned().unwrap_or_default();
+        // Filter decls without cloning: temporary owned decls with the
+        // prefix stripped (IndexDecl is small; boot/reload only).
+        let mut scoped: Vec<config::IndexDecl> = Vec::new();
+        for d in indexes {
+            let (ddb, rest) = split(&d.collection);
+            if ddb.is_empty() || ddb != *db {
+                continue;
+            }
+            let mut one = d.clone();
+            one.collection = rest;
+            scoped.push(one);
+        }
+        auto_provision(handle, &mine, &scoped).await;
     }
 }
 
@@ -1806,13 +1938,14 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
             std::env::set_var("UB_PUBLIC_URL", p);
         }
     }
-    let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await {
-        Ok(db) => db,
+    let dbs_map = match open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await {
+        Ok(m) => m,
         Err(e) => {
             audit::reload(&admin, &ip, false, &e);
             return err(StatusCode::BAD_REQUEST, e);
         }
     };
+    let db: Arc<dyn Database> = dbs_map["default"].clone();
     let identity = s.hot().await.policy.identity.clone();
     bridge_local_env(&cfg);
     match audit::parse_level(&cfg.audit_level) {
@@ -1827,6 +1960,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
         }
     };
     *s.db.write().await = db;
+    *s.dbs.write().await = Arc::new(dbs_map);
     *s.auth.write().await = Arc::new(chain);
     *s.local.write().await = local;
     *s.github.write().await = github;
@@ -1837,15 +1971,27 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // expire it so the next request refetches. ≤1s staleness otherwise.
     s.hot_cache.invalidate().await;
     // Drain coalesced PATCHes into the fresh driver before serving it.
+    // Keys are dotted (db.collection) since writes; split on the first
+    // dot against the FRESH map (unknown prefix = default + full key,
+    // same rule as provisioning — a stale map cannot strand entries
+    // anywhere else).
     {
-        let dbh = s.hot().await.db.clone();
+        let hot = s.hot().await;
         s.coalescer
             .flush_all(|coll, id, body| {
-                let dbh = dbh.clone();
+                let hot = hot.clone();
                 async move {
-                    let out = dbh.set(&coll, &id, Doc { id: id.clone(), data: body }, true).await;
+                    let (dbname, stored) = match coll.split_once('.') {
+                        Some((d, rest)) if hot.dbs.contains_key(d) => (d.to_string(), rest.to_string()),
+                        _ => ("default".to_string(), coll.clone()),
+                    };
+                    let dbh = match hot.db_for(&dbname) {
+                        Ok(h) => h,
+                        Err(_) => return Err(format!("drain: unknown database for {coll}")),
+                    };
+                    let out = dbh.set(&stored, &id, Doc { id: id.clone(), data: body }, true).await;
                     // Bus parity with the live flusher (full doc, below).
-                    if let Ok(doc) = dbh.get(&coll, &id).await {
+                    if let Ok(doc) = dbh.get(&stored, &id).await {
                         if let Some(doc) = doc {
                             realtime::emit(
                                 &coll,
@@ -1884,7 +2030,10 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
         poll_secs: cfg.realtime_poll_secs,
         max_conn_docs: cfg.realtime_max_conn_docs as usize,
     };
-    auto_provision(&s.hot().await.db.clone(), &s.hot().await.policy, &cfg.indexes).await;
+    // ponytail: one snapshot fetch (each hot() clones Arcs; two
+    // fetches would just double that for zero freshness gain).
+    let hot = s.hot().await;
+    auto_provision_all(&hot.dbs, &hot.policy, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
     audit::reload(&admin, &ip, true, &msg);
@@ -1893,8 +2042,18 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
 
 async fn list_collections(
     State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    match s.hot().await.db.list_collections().await {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match dbh.list_collections().await {
         Ok(c) => Json(c).into_response(),
         Err(_) => err_internal(),
     }
@@ -1906,23 +2065,35 @@ async fn list_collections(
 async fn create_collection(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => return err(StatusCode::BAD_REQUEST, "body requires {name}"),
     };
     if denied_internal(&name).is_some() {
-        return err(StatusCode::FORBIDDEN, "internal collection");
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
     }
-    let policy = s.hot().await.policy;
-    if !policy.allow(auth.as_ref(), &name, Method::Create, None) {
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    // ponytail: dotted policy name, bare driver name — the firewall.
+    // `stored()` never sees the db; drivers stay single-namespace.
+    let pol = dotted(&dbname, &name);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Create, None) {
         return forbidden();
     }
-    match s.hot().await.db.ensure_collection(&stored(&name)).await {
+    match dbh.ensure_collection(&stored(&name)).await {
         Ok(()) => ok_true(),
                 Err(_) => err_internal(),
     }
@@ -2227,10 +2398,13 @@ async fn get_owned(
     collection: String,
     stored: String,
     id: String,
+    db: Arc<dyn Database>,
     samp: bool,
     mut ws_t: std::time::Instant,
 ) -> Response {
-    let db = s.hot().await.db.clone();
+    // `collection` arrives dotted (policy namespace); `stored` stays
+    // bare (driver namespace). `db` is the selected handle — never
+    // re-derived here (one snapshot per request, from the caller).
     // allow was already checked on the shell; re-check on the real doc is
     // free here (µs) and keeps one authorization rule for both paths.
     match db.get(&stored, &id).await {
@@ -2240,7 +2414,7 @@ async fn get_owned(
                 ws_t = std::time::Instant::now();
             }
             let overlaid = s.coalescer.overlay(
-                &stored,
+                &collection,
                 &id,
                 maybe_doc.as_ref().map(|d| d.data.clone()),
             );
@@ -2337,6 +2511,16 @@ async fn get_or_list(
     // One snapshot fetch serves policy + db (a single mutex for the
     // hottest endpoint; other handlers fetch per access, ~100 ns each).
     let hot = s.hot().await;
+    // Multidatabase (issue #13): one resolution up front; `pol` is the
+    // policy namespace (dotted), `stored` stays the driver namespace.
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     match parse_collection_path(&path) {
         PathKind::Document { collection, id } => {
             if let Some(r) = denied_internal(&collection) {
@@ -2346,6 +2530,10 @@ async fn get_or_list(
                 return r;
             }
             let stored = stored(&collection);
+            let pol = dotted(&dbname, &collection);
+            // Coalescer keys are driver-namespace + db (default bare):
+            // same stored+id in two DBs must not share entries.
+            let ckey = dotted(&dbname, &stored);
             if samp {
                 wstats::add(&wstats::G[0], ws_t.elapsed().as_nanos() as u64);
                 ws_t = std::time::Instant::now();
@@ -2354,7 +2542,7 @@ async fn get_or_list(
             // inspect the id (UidSelf); Fields passes on reads and the rest
             // ignore the resource — so no decode is needed to authorize.
             let shell = Doc { id: id.clone(), data: Default::default() };
-            if !hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(&shell)) {
+            if !hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&shell)) {
                 return forbidden();
             }
             if samp {
@@ -2363,7 +2551,7 @@ async fn get_or_list(
             }
             // ETag pre-check (version probe only, no fetch): equality means
             // unchanged, so polling clients get a 304 without any decode.
-            if let Ok(Some(v)) = hot.db.doc_version(&stored, &id).await {
+            if let Ok(Some(v)) = dbh.doc_version(&stored, &id).await {
                 if etag_match(&headers, v) {
                     return not_modified(v);
                 }
@@ -2372,20 +2560,21 @@ async fn get_or_list(
             // read-your-write holds inside the window. Pending docs take
             // the owned path (merge needs the real body); everything else
             // streams pre-serialized bytes with zero DOM.
-            if !s.coalescer.is_empty() && s.coalescer.has(&stored, &id) {
+            if !s.coalescer.is_empty() && s.coalescer.has(&ckey, &id) {
                 return get_owned(
                     s.clone(),
                     hot.policy.clone(),
                     auth,
-                    collection,
+                    pol,
                     stored,
                     id,
+                    dbh.clone(),
                     samp,
                     ws_t,
                 )
                 .await;
             }
-            match hot.db.get_json(&stored, &id).await {
+            match dbh.get_json(&stored, &id).await {
                 Ok(Some(raw)) => {
                     if samp {
                         wstats::add(&wstats::G[1], ws_t.elapsed().as_nanos() as u64);
@@ -2405,7 +2594,7 @@ async fn get_or_list(
                 }
                 // Driver can't pre-serialize (or doc missing): owned fallback.
                 _ => {
-                    get_owned(s.clone(), hot.policy.clone(), auth, collection, stored, id, samp, ws_t).await
+                    get_owned(s.clone(), hot.policy.clone(), auth, pol, stored, id, dbh.clone(), samp, ws_t).await
                 }
             }
         }
@@ -2417,6 +2606,7 @@ async fn get_or_list(
                 return r;
             }
             let stored = stored(&collection);
+            let pol = dotted(&dbname, &collection);
             match parse_options(&q) {
                 Err(msg) => err(StatusCode::BAD_REQUEST, msg),
                 Ok(opts) => {
@@ -2425,7 +2615,7 @@ async fn get_or_list(
                         ws_t = std::time::Instant::now();
                     }
                     let shape = wstats::classify(&opts) as usize;
-                    match hot.db.list(&stored, &opts).await {
+                    match dbh.list(&stored, &opts).await {
                     // Per-doc filter (replacement for the server.ts:233 loop): documents
                     // failing the rule are excluded from the response, with no extra N+1
                     // queries when drivers push rules into queries (phase 3).
@@ -2438,7 +2628,7 @@ async fn get_or_list(
                         }
                         let visible: Vec<_> = docs
                             .into_iter()
-                            .filter(|d| hot.policy.allow(auth.as_ref(), &collection, Method::Get, Some(d)))
+                            .filter(|d| hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(d)))
                             .collect();
                         if samp {
                             wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
@@ -2504,13 +2694,18 @@ fn parse_index_spec(body: &serde_json::Value) -> Result<hakobackend_core::IndexS
 async fn index_create(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let collection = match body.get("collection").and_then(|v| v.as_str()) {
         Some(c) if !c.is_empty() => c.to_string(),
         _ => return err(StatusCode::BAD_REQUEST, "collection required"),
     };
-    index_create_inner(s, auth, collection, body).await
+    index_create_inner(s, auth, collection, body, &dbname).await
 }
 
 /// Legacy shim: body {name, fields} (+optional kind/unique), response {success:true}.
@@ -2519,8 +2714,9 @@ async fn index_create_legacy(
     auth: Option<AuthContext>,
     collection: String,
     body: serde_json::Value,
+    dbname: &str,
 ) -> Response {
-    index_create_inner(s, auth, collection, body).await
+    index_create_inner(s, auth, collection, body, dbname).await
 }
 
 async fn index_create_inner(
@@ -2528,12 +2724,13 @@ async fn index_create_inner(
     auth: Option<AuthContext>,
     collection: String,
     body: serde_json::Value,
+    dbname: &str,
 ) -> Response {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
     if denied_internal(&collection).is_some() {
-        return err(StatusCode::FORBIDDEN, "internal collection");
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
     }
     if let Some(r) = valid_names(&collection, None) {
         return r;
@@ -2542,14 +2739,18 @@ async fn index_create_inner(
         Ok(spec) => spec,
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
-    let policy = s.hot().await.policy;
-    if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, None) {
         return forbidden();
     }
-    let db = s.hot().await.db.clone();
     let stored = stored(&collection);
-    let _ = db.ensure_collection(&stored).await;
-    match db.create_index(&stored, &spec).await {
+    let _ = dbh.ensure_collection(&stored).await;
+    match dbh.create_index(&stored, &spec).await {
         Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -2565,16 +2766,25 @@ async fn index_list(
         _ => return err(StatusCode::BAD_REQUEST, "query ?collection= required"),
     };
     if denied_internal(&collection).is_some() {
-        return err(StatusCode::FORBIDDEN, "internal collection");
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
     }
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.hot().await.policy;
-    if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
         return forbidden();
     }
-    match s.hot().await.db.list_indexes(&stored(&collection)).await {
+    match dbh.list_indexes(&stored(&collection)).await {
         Ok(indexes) => Json(indexes).into_response(),
                 Err(_) => err_internal(),
     }
@@ -2593,13 +2803,22 @@ async fn index_drop(
         _ => return err(StatusCode::BAD_REQUEST, "query ?collection= & ?name= required"),
     };
     if denied_internal(&collection).is_some() {
-        return err(StatusCode::FORBIDDEN, "internal collection");
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
     }
-    let policy = s.hot().await.policy;
-    if !policy.allow(auth.as_ref(), &collection, Method::Update, None) {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, None) {
         return forbidden();
     }
-    match s.hot().await.db.drop_index(&stored(&collection), &name).await {
+    match dbh.drop_index(&stored(&collection), &name).await {
         Ok(()) => ok_true(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -2609,16 +2828,21 @@ async fn create(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     // Legacy compat shim: POST /api/collections/<coll>/index {name, fields}
     // (legacy backend, server.ts:193). New shape: POST /api/indexes.
     // Collections actually named "index" are accessed via the new shape.
     if let Some(collection) = legacy_index_collection(&path) {
-        return index_create_legacy(s, auth, collection, body).await;
+        return index_create_legacy(s, auth, collection, body, &dbname).await;
     }
     match parse_collection_path(&path) {
         PathKind::Document { .. } => (
@@ -2633,36 +2857,41 @@ async fn create(
             if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
-            let policy = s.hot().await.policy;
+            let hot = s.hot().await;
+            let dbh = match hot.db_for(&dbname) {
+                Ok(h) => h,
+                Err(r) => return r,
+            };
+            let pol = dotted(&dbname, &collection);
             let incoming = incoming_doc("", body);
-            if !policy.allow(auth.as_ref(), &collection, Method::Create, Some(&incoming)) {
+            if !hot.policy.allow(auth.as_ref(), &pol, Method::Create, Some(&incoming)) {
                 return forbidden();
             }
-            let db = s.hot().await.db.clone();
             let stored = stored(&collection);
-            let _ = db.ensure_collection(&stored).await;
+            let _ = dbh.ensure_collection(&stored).await;
             // Atomics collapse (legacy parity) + createdAt/updatedAt stamping.
             let incoming = Doc {
                 id: incoming.id,
                 data: strip_write(
-                    &policy,
-                    &collection,
+                    &hot.policy,
+                    &pol,
                     Method::Create,
                     hakobackend_core::atomics::stamp_new(
                         hakobackend_core::atomics::resolve_for_create(incoming.data),
                     ),
                 ),
             };
-            if !policy.allow_fields(auth.as_ref(), &collection, Method::Create, &incoming.data) {
+            if !hot.policy.allow_fields(auth.as_ref(), &pol, Method::Create, &incoming.data) {
                 return forbidden();
             }
-            match db.insert(&stored, incoming).await {
+            match dbh.insert(&stored, incoming).await {
                 Ok(doc) => {
                     // Gateway bus (instant lane; poller reconciles foreign writes).
+                    // Dotted emit: realtime lanes partition by database.
                     realtime::emit(
-                        &stored,
+                        &pol,
                         Change {
-                            collection: stored.clone(),
+                            collection: pol.clone(),
                             id: doc.id.clone(),
                             kind: ChangeKind::Change,
                             old: None,
@@ -2681,27 +2910,37 @@ async fn put(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
-    write_doc(s, auth, path, body, false, skip_hint(&headers)).await
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    write_doc(s, auth, path, body, false, skip_hint(&headers), &dbname).await
 }
 
 async fn patch(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     // ponytail: merge=true uses the same path as PUT; no manual read-modify-write.
-    write_doc(s, auth, path, body, true, skip_hint(&headers)).await
+    write_doc(s, auth, path, body, true, skip_hint(&headers), &dbname).await
 }
 
 /// Per-request read-before-write skip hint (advisory perf only, never
@@ -2726,6 +2965,7 @@ async fn write_doc(
     body: serde_json::Value,
     merge: bool,
     skip_hint: bool,
+    dbname: &str,
 ) -> Response {
     let samp = WSAMP.try_get().unwrap_or(false);
     let mut ws_t = std::time::Instant::now();
@@ -2742,9 +2982,14 @@ async fn write_doc(
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.hot().await.policy;
-            let db = s.hot().await.db.clone();
+            let hot = s.hot().await;
+            let dbh = match hot.db_for(dbname) {
+                Ok(h) => h,
+                Err(r) => return r,
+            };
+            let pol = dotted(dbname, &collection);
             let stored = stored(&collection);
+            let ckey = dotted(dbname, &stored);
             // Policy-level read-before-write skip (PUT only): with no Owner
             // rule governing the write the old doc is pure overhead (~115us).
             // The per-request header hint joins the policy flag; both lose
@@ -2755,19 +3000,19 @@ async fn write_doc(
                 ws_t = std::time::Instant::now();
             }
             let skip_rbw = !merge
-                && !policy.needs_existing(&collection, Method::Update)
-                && (skip_hint || policy.skip_read_before_write(&collection, Method::Update));
+                && !hot.policy.needs_existing(&pol, Method::Update)
+                && (skip_hint || hot.policy.skip_read_before_write(&pol, Method::Update));
             let existing = if skip_rbw {
                 None
             } else {
-                db.get(&stored, &id).await.ok().flatten()
+                dbh.get(&stored, &id).await.ok().flatten()
             };
             if samp {
                 wstats::add(&wstats::W[1], ws_t.elapsed().as_nanos() as u64);
                 ws_t = std::time::Instant::now();
             }
             // Owner rule evaluated against the existing document (who owns this data?).
-            if !policy.allow(auth.as_ref(), &collection, Method::Update, existing.as_ref()) {
+            if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, existing.as_ref()) {
                 return forbidden();
             }
             if samp {
@@ -2784,19 +3029,19 @@ async fn write_doc(
             if merge && s.coalesce_on {
                 // No strip bypass: collections with claim strips skip the
                 // coalescer (its flusher stores without re-gating).
-                if policy.strip_fields(&collection, Method::Update).is_empty() {
+                if hot.policy.strip_fields(&pol, Method::Update).is_empty() {
                     if let Some(obj) = body.as_object() {
                         let map: HashMap<String, serde_json::Value> =
                             obj.clone().into_iter().collect();
                         if coalesce::Coalescer::eligible(&body)
-                            && s.coalescer.merge(&stored, &id, map)
+                            && s.coalescer.merge(&ckey, &id, map)
                         {
                             return ok_true();
                         }
                     }
                 }
             }
-            let _ = db.ensure_collection(&stored).await;
+            let _ = dbh.ensure_collection(&stored).await;
             let created_at = existing.as_ref().and_then(|d| d.data.get("createdAt").cloned());
             let is_new = existing.is_none();
             let body = incoming_doc(&id, body).data;
@@ -2815,9 +3060,9 @@ async fn write_doc(
                 hakobackend_core::atomics::stamp_update(data, created_at)
             };
             // Claim strips (anti-escalation without read-before-write).
-            let data = strip_write(&policy, &collection, Method::Update, data);
+            let data = strip_write(&hot.policy, &pol, Method::Update, data);
             // Field conditionals on the final data (incoming/merged — no read).
-            if !policy.allow_fields(auth.as_ref(), &collection, Method::Update, &data) {
+            if !hot.policy.allow_fields(auth.as_ref(), &pol, Method::Update, &data) {
                 return forbidden();
             }
             // Merge already applied above; store the final body as-is.
@@ -2825,7 +3070,7 @@ async fn write_doc(
                 wstats::add(&wstats::W[3], ws_t.elapsed().as_nanos() as u64);
                 ws_t = std::time::Instant::now();
             }
-            match db.set(&stored, &id, Doc { id: id.clone(), data }, false).await {
+            match dbh.set(&stored, &id, Doc { id: id.clone(), data }, false).await {
                 Ok(doc) => {
                     // Gateway bus: instant lane for subscribers (the shared
                     // poller stays as reconciler for foreign writes).
@@ -2835,9 +3080,9 @@ async fn write_doc(
                         ws_t = std::time::Instant::now();
                     }
                     realtime::emit(
-                        &stored,
+                        &pol,
                         Change {
-                            collection: stored.clone(),
+                            collection: pol.clone(),
                             id: id.clone(),
                             kind: ChangeKind::Change,
                             old: None,
@@ -2864,10 +3109,15 @@ async fn remove(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     match parse_collection_path(&path) {
         PathKind::Collection { .. } => (
             StatusCode::BAD_REQUEST,
@@ -2881,21 +3131,25 @@ async fn remove(
             if let Some(r) = valid_names(&collection, Some(&id)) {
                 return r;
             }
-            let policy = s.hot().await.policy;
-            let db = s.hot().await.db.clone();
+            let hot = s.hot().await;
+            let dbh = match hot.db_for(&dbname) {
+                Ok(h) => h,
+                Err(r) => return r,
+            };
+            let pol = dotted(&dbname, &collection);
             let stored = stored(&collection);
-            let existing = db.get(&stored, &id).await.ok().flatten();
-            if !policy.allow(auth.as_ref(), &collection, Method::Delete, existing.as_ref()) {
+            let existing = dbh.get(&stored, &id).await.ok().flatten();
+            if !hot.policy.allow(auth.as_ref(), &pol, Method::Delete, existing.as_ref()) {
                 return forbidden();
             }
-            let _ = db.ensure_collection(&stored).await;
-            match db.delete(&stored, &id).await {
+            let _ = dbh.ensure_collection(&stored).await;
+            match dbh.delete(&stored, &id).await {
                 Ok(_) => {
                     // Gateway bus (subscriber snapshot supplies the old doc).
                     realtime::emit(
-                        &stored,
+                        &pol,
                         Change {
-                            collection: stored.clone(),
+                            collection: pol.clone(),
                             id: id.clone(),
                             kind: ChangeKind::Remove,
                             old: None,
@@ -3007,6 +3261,7 @@ async fn run_ops(
     auth: Option<&AuthContext>,
     ops: Vec<BatchOpBody>,
     is_tx: bool,
+    dbname: &str,
 ) -> Result<Vec<OpOut>, (StatusCode, String, &'static str)> {
     use hakobackend_core::{TxOp, TxOpKind};
     // Phase 1: resolve + gate each op (reads tolerate missing tables).
@@ -3020,6 +3275,7 @@ async fn run_ops(
         existed: bool,
         existing: Option<Doc>,
         stored: String,
+        pol: String,
         method: Method,
     }
     let mut gated = Vec::with_capacity(ops.len());
@@ -3041,7 +3297,7 @@ async fn run_ops(
             .filter(|s| !s.is_empty())
             .ok_or((StatusCode::BAD_REQUEST, "op requires id".to_string(), "bad-request"))?;
         if denied_internal(&op.collection).is_some() {
-            return Err((StatusCode::FORBIDDEN, "internal collection".to_string(), "permission-denied"));
+            return Err((StatusCode::FORBIDDEN, "reserved __ prefix".to_string(), "permission-denied"));
         }
         if !hakobackend_core::valid_collection_path(&op.collection) {
             return Err((StatusCode::BAD_REQUEST, "invalid collection name".to_string(), "bad-request"));
@@ -3049,19 +3305,20 @@ async fn run_ops(
         if !hakobackend_core::valid_doc_id(&id) {
             return Err((StatusCode::BAD_REQUEST, "invalid document id".to_string(), "bad-request"));
         }
+        let pol = dotted(dbname, &op.collection);
         let stored = stored(&op.collection);
         let existing = db.get(&stored, &id).await.ok().flatten();
         let existed = existing.is_some();
         let method = op_method(&t, existed, is_tx);
-        if !policy.allow(auth, &op.collection, method, existing.as_ref()) {
+        if !policy.allow(auth, &pol, method, existing.as_ref()) {
             return Err((
                 StatusCode::FORBIDDEN,
-                format!("Permission denied: {method:?} on {}/{}", op.collection, id),
+                format!("Permission denied: {method:?} on {pol}/{id}"),
                 "permission-denied",
             ));
         }
         let _ = db.ensure_collection(&stored).await;
-        gated.push(Gated { body: op, id, existed, existing, stored, method });
+        gated.push(Gated { body: op, id, existed, existing, stored, pol, method });
     }
     // Phase 2: one atomic transaction.
     if !db.capabilities().supports_transactions {
@@ -3109,15 +3366,15 @@ async fn run_ops(
             let data = if t == "get" || t == "delete" {
                 data
             } else {
-                strip_write(&policy, &g.body.collection, g.method, data)
+                strip_write(&policy, &g.pol, g.method, data)
             };
             // Field conditionals on final data (no read); fail-closed 403.
             if t != "get" && t != "delete"
-                && !policy.allow_fields(auth, &g.body.collection, g.method, &data)
+                && !policy.allow_fields(auth, &g.pol, g.method, &data)
             {
                 return Err((
                     StatusCode::FORBIDDEN,
-                    format!("Permission denied: fields on {}/{}", g.body.collection, g.id),
+                    format!("Permission denied: fields on {}/{}", g.pol, g.id),
                     "permission-denied",
                 ));
             }
@@ -3155,9 +3412,9 @@ async fn run_ops(
             TxOpKind::Read => {}
             TxOpKind::Delete => {
                 realtime::emit(
-                    &g.stored,
+                    &g.pol,
                     Change {
-                        collection: g.stored.clone(),
+                        collection: g.pol.clone(),
                         id: g.id.clone(),
                         kind: ChangeKind::Remove,
                         old: None,
@@ -3167,9 +3424,9 @@ async fn run_ops(
             }
             TxOpKind::Put { .. } => {
                 realtime::emit(
-                    &g.stored,
+                    &g.pol,
                     Change {
-                        collection: g.stored.clone(),
+                        collection: g.pol.clone(),
                         id: g.id.clone(),
                         kind: ChangeKind::Change,
                         old: None,
@@ -3207,11 +3464,16 @@ async fn run_ops(
 async fn batch(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     // Legacy quirk preserved: batch failures are always 500, no code.
     let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
         Ok(v) => v,
@@ -3224,9 +3486,12 @@ async fn batch(
             format!("too many ops (max {max_ops})"),
         );
     }
-    let db = s.hot().await.db.clone();
-    let policy = s.hot().await.policy;
-    match run_ops(&db, &policy, auth.as_ref(), ops, false).await {
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match run_ops(&dbh, &hot.policy, auth.as_ref(), ops, false, &dbname).await {
         Ok(results) => render_results(results),
         Err((StatusCode::INTERNAL_SERVER_ERROR, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
         Err((_, msg, _)) => err(StatusCode::INTERNAL_SERVER_ERROR, msg),
@@ -3236,11 +3501,16 @@ async fn batch(
 async fn transaction(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     if let Some(r) = deny_if_read_only(&s) {
         return r;
     }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
     let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
         Ok(v) => v,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
@@ -3253,9 +3523,12 @@ async fn transaction(
             "bad-request",
         );
     }
-    let db = s.hot().await.db.clone();
-    let policy = s.hot().await.policy;
-    match run_ops(&db, &policy, auth.as_ref(), ops, true).await {
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match run_ops(&dbh, &hot.policy, auth.as_ref(), ops, true, &dbname).await {
         Ok(results) => render_results(results),
         Err((status, msg, code)) => err_code(status, msg, code),
     }
@@ -3281,9 +3554,16 @@ async fn collection_group(
     if let Some(r) = valid_names(&name, None) {
         return r;
     }
-    let policy = s.hot().await.policy;
-    let db = s.hot().await.db.clone();
-    let collections = match db.list_collections().await {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let collections = match dbh.list_collections().await {
         Ok(c) => c,
         Err(_) => return err_internal(),
     };
@@ -3293,10 +3573,10 @@ async fn collection_group(
         if !realtime::matches_group(&logical, &name) {
             continue;
         }
-        if !policy.allow(auth.as_ref(), &logical, Method::List, None) {
+        if !hot.policy.allow(auth.as_ref(), &dotted(&dbname, &logical), Method::List, None) {
             continue;
         }
-        let docs = match db.list(&stored, &opts).await {
+        let docs = match dbh.list(&stored, &opts).await {
             Ok(d) => d,
             Err(_) => continue,
         };
@@ -3306,7 +3586,8 @@ async fn collection_group(
                 .get("_collectionPath")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&logical);
-            if policy.allow(auth.as_ref(), doc_coll, Method::Get, Some(&doc)) {
+            // Same-db bare path (docs came from this handle) → dotted.
+            if hot.policy.allow(auth.as_ref(), &dotted(&dbname, doc_coll), Method::Get, Some(&doc)) {
                 out.push(doc);
             }
         }
@@ -3340,6 +3621,7 @@ async fn aggregate(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
     Json(body): Json<AggBody>,
 ) -> impl IntoResponse {
     let collection = path.trim_matches('/').to_string();
@@ -3347,16 +3629,24 @@ async fn aggregate(
         return err(StatusCode::BAD_REQUEST, "aggregate needs a collection path");
     }
     if denied_internal(&collection).is_some() {
-        return err(StatusCode::FORBIDDEN, "internal collection");
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
     }
     if let Some(r) = valid_names(&collection, None) {
         return r;
     }
-    let policy = s.hot().await.policy;
-    if !policy.allow(auth.as_ref(), &collection, Method::List, None) {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
         return forbidden();
     }
-    let db = s.hot().await.db.clone();
     let stored = stored(&collection);
     // Aggregates ignore paging (legacy passes options through to count/sum/avg).
     let mut opts = body.options.clone();
@@ -3370,7 +3660,7 @@ async fn aggregate(
             _ => format!("{t}_{}", agg.field.as_deref().unwrap_or("count")),
         });
         let value = match t.as_str() {
-            "count" => match db.count(&stored, &opts).await {
+            "count" => match dbh.count(&stored, &opts).await {
                 Ok(n) => serde_json::json!(n),
                 Err(e) => return err(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string()),
             },
@@ -3382,7 +3672,7 @@ async fn aggregate(
                 // Reduce guard: legacy drivers list into RAM — refuse past the cap.
                 // (Drivers with native aggregation never fetch; the guard is
                 // still correct — it bounds the legacy path only.)
-                match db.count(&stored, &opts).await {
+                match dbh.count(&stored, &opts).await {
                     Ok(n) if n > realtime::MAX_AGG_SCAN_DOCS => {
                         return err(
                             StatusCode::BAD_REQUEST,
@@ -3393,9 +3683,9 @@ async fn aggregate(
                     _ => {}
                 }
                 let r = if t == "sum" {
-                    db.sum(&stored, field, &opts).await
+                    dbh.sum(&stored, field, &opts).await
                 } else {
-                    db.avg(&stored, field, &opts).await
+                    dbh.avg(&stored, field, &opts).await
                 };
                 match r {
                     Ok(n) => serde_json::json!(n),
@@ -3932,6 +4222,28 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                         }
                         continue;
                     }
+                    // Multidatabase (issue #13): per-message `db` (absent =
+                    // default), validated like the URL channel.
+                    let dbname = match v
+                        .get("db")
+                        .and_then(|d| d.as_str())
+                        .map(|d| {
+                            if d.is_empty() || !hakobackend_core::valid_db_name(d) {
+                                Err(())
+                            } else {
+                                Ok(d.to_string())
+                            }
+                        })
+                        .unwrap_or_else(|| Ok("default".to_string()))
+                    {
+                        Ok(d) => d,
+                        Err(()) => {
+                            if !ws_send(&mut socket, ws_err(Some(&key), "invalid db name")).await {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
                     if subs.len() >= s.ws_max_subs && !subs.contains_key(&key) {
                         if !ws_send(&mut socket, ws_err(Some(&key), "subscription limit exceeded")).await {
                             break;
@@ -3945,6 +4257,7 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                             .map(|o| serde_json::from_value(o.clone()).unwrap_or_default())
                             .unwrap_or_default(),
                         group: v.get("group").and_then(|g| g.as_bool()).unwrap_or(false),
+                        db: dbname.clone(),
                     };
                     // Per-subscribe token (legacy authData pattern) overrides connection auth.
                     // Same DPoP rule as the `auth` message: no proof possible here.
@@ -3964,10 +4277,19 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                             }
                         }
                     }
-                    let db = s.hot().await.db.clone();
-                    let policy = s.hot().await.policy;
+                    let hot = s.hot().await;
+                    let dbh = match hot.db_for(&dbname) {
+                        Ok(h) => h,
+                        Err(_) => {
+                            if !ws_send(&mut socket, ws_err(Some(&key), "unknown database")).await {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let policy = hot.policy;
                     let caps = *s.rt_caps.read().unwrap();
-                    match realtime::subscribe(db, policy, sub_auth, spec, caps).await {
+                    match realtime::subscribe(dbh, policy, sub_auth, spec, caps).await {
                         Ok(sub) => {
                             // Per-connection snapshot budget (anti memory-bomb).
                             let total: usize =
@@ -4060,10 +4382,18 @@ async fn sse_handler(
         Err(msg) => return err(StatusCode::BAD_REQUEST, msg),
     };
     let group = matches!(q.get("group").map(|g| g.as_str()), Some("1") | Some("true"));
-    let db = s.hot().await.db.clone();
-    let policy = s.hot().await.policy;
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let policy = hot.policy;
     let caps = *s.rt_caps.read().unwrap();
-    let sub = match realtime::subscribe(db, policy, auth, realtime::SubSpec { collection, options, group }, caps).await {
+    let sub = match realtime::subscribe(dbh, policy, auth, realtime::SubSpec { collection, options, group, db: dbname }, caps).await {
         Ok(sub) => sub,
         Err(e) if matches!(e, hakobackend_core::AppError::PermissionDenied) => return forbidden(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -4663,6 +4993,102 @@ mod tests {
         assert_eq!(s, StatusCode::FORBIDDEN);
     }
 
+    /// Multidatabase end-to-end (issue #13): cluster-backed default +
+    /// app1. Isolation both directions, dotted policy, unknown → 404,
+    /// batch inside a db, bare default untouched.
+    #[tokio::test]
+    async fn multidb_end_to_end() {
+        use tower::ServiceExt;
+        let st = rbw_cluster_state(
+            "[defaults]\nread = \"public\"\nwrite = \"public\"\n[collections.\"app1.secret\"]\nread = \"deny\"\n",
+            "multidb",
+            &[("default", "db0"), ("app1", "db1")],
+        )
+        .await;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let app = build_router(st.clone(), vec![], false);
+        let doc = Some(serde_json::json!({"z": 1}));
+        // Same id, both databases, independent.
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m/a", doc.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m/a?db=app1", doc.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"z\":1"));
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a?db=app1", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"z\":1"));
+        // Isolation: app1-only doc invisible on default and vice versa.
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/only/b?db=app1", doc.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "GET", "/api/collections/only/b", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, b) = call(app.clone(), "GET", "/api/collections?db=app1", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let lists = String::from_utf8_lossy(&b);
+        assert!(lists.contains("\"only\"") && lists.contains("\"m\""), "got: {lists}");
+        // Dotted policy: app1.secret denied, bare secret (default) open.
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/secret/s?db=app1", doc.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "GET", "/api/collections/secret/s?db=app1", None).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/secret/s", doc.clone()).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "GET", "/api/collections/secret/s", None).await;
+        assert_eq!(s, StatusCode::OK);
+        // Unknown database: 404 (never a silent default).
+        let (s, _) = call(app.clone(), "GET", "/api/collections/m/a?db=nope", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        // Batch stays inside its db (structural, single ?db=).
+        let two = serde_json::json!({"operations": [
+            {"type": "set", "collection": "m", "id": "b1", "data": {"z": 2}},
+        ]});
+        let (s, _) = call(app.clone(), "POST", "/api/batch?db=app1", Some(two)).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "GET", "/api/collections/m/b1", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, _) = call(app.clone(), "GET", "/api/collections/m/b1?db=app1", None).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    /// Single-db deployments serve `default` only (issue #13): explicit
+    /// non-default is 400 (teaches the rule), absent is today's paths.
+    #[tokio::test]
+    async fn multidb_single_db_400() {
+        use tower::ServiceExt;
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "multidb400").await;
+        let app = build_router(st.clone(), vec![], false);
+        async fn get(app: Router, uri: &str) -> StatusCode {
+            let req = Request::builder().uri(uri).body(axum::body::Body::empty()).unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+        assert_eq!(get(app.clone(), "/api/collections?db=x").await, StatusCode::BAD_REQUEST);
+        assert_eq!(get(app.clone(), "/api/collections?db=default").await, StatusCode::OK);
+        assert_eq!(get(app.clone(), "/api/collections").await, StatusCode::OK);
+    }
+
     /// Minimal percent-decoder for the transform test (no new deps).
     fn percent_decode(s: &str) -> String {
         let mut out = Vec::with_capacity(s.len());
@@ -4888,6 +5314,7 @@ mod tests {
             vec![batch_op("update", "profiles", "local:u1",
                 serde_json::json!({"nick": "uno", "role": "admin"}))],
             false,
+            "default",
         )
         .await
         .unwrap();
@@ -4902,6 +5329,7 @@ mod tests {
             other().as_ref(),
             vec![batch_op("update", "profiles", "local:u1", serde_json::json!({"nick": "x"}))],
             false,
+            "default",
         )
         .await;
         assert!(denied.is_err());
@@ -4912,6 +5340,7 @@ mod tests {
             None,
             vec![batch_op("update", "profiles", "local:u1", serde_json::json!({"nick": "x"}))],
             false,
+            "default",
         )
         .await;
         assert!(denied.is_err());
@@ -4948,10 +5377,10 @@ mod tests {
         }, false).await.unwrap();
         // Staff without the role: denied.
         assert!(run_ops(&db, &policy, staff().as_ref(),
-            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false).await.is_err());
+            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false, "default").await.is_err());
         // Maintainer (array member): allowed.
         run_ops(&db, &policy, boss().as_ref(),
-            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false).await.unwrap();
+            vec![batch_op("delete", "posts", "p1", serde_json::json!({}))], false, "default").await.unwrap();
         assert!(db.get("posts", "p1").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4977,6 +5406,7 @@ mod tests {
                 batch_op("get", "w", "a", d(0)),
             ],
             false,
+            "default",
         )
         .await
         .unwrap();
@@ -4985,7 +5415,7 @@ mod tests {
         assert!(res.iter().all(|r| r.get("success") == Some(&serde_json::json!(true))));
         assert_eq!(res[0].get("id"), Some(&serde_json::json!("a")));
         // Unknown op types are rejected, never silently created.
-        let bad_type = run_ops(&db, &policy, None, vec![batch_op("bogus", "w", "z", d(0))], false).await;
+        let bad_type = run_ops(&db, &policy, None, vec![batch_op("bogus", "w", "z", d(0))], false, "default").await;
         assert!(bad_type.is_err());
 
         // must_exist failure aborts the whole batch (d is untouched).
@@ -4995,6 +5425,7 @@ mod tests {
             None,
             vec![batch_op("set", "w", "d", d(4)), batch_op("update", "w", "ghost", d(5))],
             false,
+            "default",
         )
         .await;
         assert!(bad.is_err());
@@ -5002,7 +5433,7 @@ mod tests {
 
         // Transaction shapes: get → doc, writes → {success}.
         let res = vals(
-            run_ops(&db, &policy, None, vec![batch_op("get", "w", "a", d(0))], true)
+            run_ops(&db, &policy, None, vec![batch_op("get", "w", "a", d(0))], true, "default")
                 .await
                 .unwrap(),
         );
@@ -5025,6 +5456,7 @@ mod tests {
                 }),
             )],
             false,
+            "default",
         )
         .await
         .unwrap();
@@ -5052,12 +5484,63 @@ mod tests {
         std::fs::write(&pol, policy_toml).unwrap();
         let raw: Arc<dyn Database> =
             Arc::new(SqliteDb::open(dir.join("t.db").to_string_lossy().as_ref()).await.unwrap());
-        let dbh = Arc::new(tokio::sync::RwLock::new(raw.clone()));
         let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
         let chain_root: Arc<AuthChain> =
             Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        // Single-db (default only); multidb coverage gets its own state below.
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        (st, raw)
+    }
+
+    /// Multidatabase state (issue #13): hakocluster-backed, one single-dir
+    /// cluster per database (N=1: no mesh needed, works everywhere).
+    /// `dbs` maps names (the first is `default`) to data dirs.
+    async fn rbw_cluster_state(
+        policy_toml: &str,
+        tag: &str,
+        dbs: &[(&str, &str)],
+    ) -> AppState {
+        use hakobackend_db_hakocluster::ClusterDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, policy_toml).unwrap();
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let mut map: HashMap<String, Arc<dyn Database>> = HashMap::new();
+        let mut raw = None;
+        for (name, sub) in dbs {
+            let d = dir.join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            let h: Arc<dyn Database> = Arc::new(
+                ClusterDb::open(d.to_string_lossy().as_ref()).map_err(|e| e.to_string()).unwrap(),
+            );
+            if name == &"default" {
+                raw = Some(h.clone());
+            }
+            map.insert(name.to_string(), h);
+        }
+        finish_state(raw.expect("need a default database"), map, policy_hot, chain_root, dir).await
+    }
+
+    /// Shared AppState construction for test states (single source for
+    /// the literal: new AppState fields land here once, not per helper).
+    async fn finish_state(
+        raw: Arc<dyn Database>,
+        dbs: HashMap<String, Arc<dyn Database>>,
+        policy_hot: Arc<PolicyHot>,
+        chain_root: Arc<AuthChain>,
+        dir: std::path::PathBuf,
+    ) -> AppState {
+        let dbh = Arc::new(tokio::sync::RwLock::new(raw.clone()));
+        let dbs_arc = Arc::new(dbs);
         let st = AppState {
             db: dbh.clone(),
+            dbs: Arc::new(tokio::sync::RwLock::new(dbs_arc.clone())),
             policy: policy_hot.clone(),
             auth: Arc::new(tokio::sync::RwLock::new(chain_root.clone())),
             local: Arc::new(tokio::sync::RwLock::new(None)),
@@ -5088,6 +5571,7 @@ mod tests {
             hot_cache: Arc::new(HotCache::new(Hot {
                 policy: policy_hot.get().await,
                 db: raw.clone(),
+                dbs: dbs_arc.clone(),
                 auth: chain_root.clone(),
                 service: ServiceAuth::build(&[], &[]),
                 local: None,
@@ -5124,7 +5608,7 @@ mod tests {
                 "test-secret".into(),
             )),
         };
-        (st, raw)
+        st
     }
 
     fn ok_put(r: Response) {
@@ -5211,26 +5695,26 @@ mod tests {
         // PUT-create with matching fields: allowed.
         ok_put(
             write_doc(st.clone(), staff(), "docs/d1".into(),
-                serde_json::json!({"unit": "ops", "score": 10}), false, false).await,
+                serde_json::json!({"unit": "ops", "score": 10}), false, false, "default").await,
         );
         // PUT-create with wrong unit: denied.
         let r = write_doc(st.clone(), staff(), "docs/d2".into(),
-            serde_json::json!({"unit": "hr", "score": 10}), false, false).await;
+            serde_json::json!({"unit": "hr", "score": 10}), false, false, "default").await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         assert!(db.get("docs", "d2").await.unwrap().is_none());
         // PATCH merged eval: patch only score, unit comes from the base.
         let r = write_doc(st.clone(), staff(), "docs/d1".into(),
-            serde_json::json!({"score": 99}), true, false).await;
+            serde_json::json!({"score": 99}), true, false, "default").await;
         assert_eq!(r.status(), StatusCode::OK);
         // PATCH breaking the range: denied, stored doc untouched.
         let r = write_doc(st.clone(), staff(), "docs/d1".into(),
-            serde_json::json!({"score": 101}), true, false).await;
+            serde_json::json!({"score": 101}), true, false, "default").await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         let d1 = db.get("docs", "d1").await.unwrap().unwrap();
         assert_eq!(d1.data.get("score").and_then(|v| v.as_i64()), Some(99));
         // Anonymous: auth.* unresolvable → denied.
         let r = write_doc(st.clone(), None, "docs/d3".into(),
-            serde_json::json!({"unit": "ops", "score": 1}), false, false).await;
+            serde_json::json!({"unit": "ops", "score": 1}), false, false, "default").await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
@@ -5278,10 +5762,11 @@ mod tests {
                 serde_json::json!({"v": 1, "createdAt": "orig"}),
                 false,
                 false,
+                "default",
             )
             .await,
         );
-        ok_put(write_doc(st, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false).await);
+        ok_put(write_doc(st, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false, "default").await);
         let d = db.get("w", "d1").await.unwrap().unwrap();
         assert_eq!(d.data.get("v"), Some(&serde_json::json!(2)));
         // Skip = stamp_new on overwrite: no old doc to preserve createdAt from.
@@ -5297,10 +5782,11 @@ mod tests {
                 serde_json::json!({"v": 1, "createdAt": "orig"}),
                 false,
                 false,
+                "default",
             )
             .await,
         );
-        ok_put(write_doc(st2, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false).await);
+        ok_put(write_doc(st2, None, "w/d1".into(), serde_json::json!({"v": 2}), false, false, "default").await);
         let d2 = db2.get("w", "d1").await.unwrap().unwrap();
         assert_eq!(d2.data.get("createdAt").and_then(|v| v.as_str()), Some("orig"));
 
@@ -5315,10 +5801,11 @@ mod tests {
                 serde_json::json!({"v": 1, "createdAt": "orig"}),
                 false,
                 true,
+                "default",
             )
             .await,
         );
-        ok_put(write_doc(st4, None, "w/d1".into(), serde_json::json!({"v": 2}), false, true).await);
+        ok_put(write_doc(st4, None, "w/d1".into(), serde_json::json!({"v": 2}), false, true, "default").await);
         let d4 = db4.get("w", "d1").await.unwrap().unwrap();
         assert_ne!(d4.data.get("createdAt").and_then(|v| v.as_str()), Some("orig"));
         // Header parsing itself: 1/true yes, everything else no.
@@ -5352,10 +5839,10 @@ mod tests {
             .await
             .unwrap();
         let stranger: Option<hakobackend_core::AuthContext> = None;
-        let r = write_doc(st3.clone(), stranger.clone(), "w/d9".into(), serde_json::json!({"v": 2}), false, false).await;
+        let r = write_doc(st3.clone(), stranger.clone(), "w/d9".into(), serde_json::json!({"v": 2}), false, false, "default").await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
         // Header hint under Owner: also ignored, still 403.
-        let r = write_doc(st3, stranger, "w/d9".into(), serde_json::json!({"v": 2}), false, true).await;
+        let r = write_doc(st3, stranger, "w/d9".into(), serde_json::json!({"v": 2}), false, true, "default").await;
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
 
@@ -5383,14 +5870,14 @@ mod tests {
         let policy = Arc::new(PolicyFile::open());
 
         // set+merge on a missing doc creates (Firestore parity).
-        run_ops(&db, &policy, None, vec![merge_op("set", "a", serde_json::json!({"x": 1}))], false)
+        run_ops(&db, &policy, None, vec![merge_op("set", "a", serde_json::json!({"x": 1}))], false, "default")
             .await
             .unwrap();
         let a = db.get("m", "a").await.unwrap().unwrap();
         assert_eq!(a.data.get("x"), Some(&serde_json::json!(1)));
 
         // set+merge on a present doc merges (old keys survive).
-        run_ops(&db, &policy, None, vec![merge_op("set", "a", serde_json::json!({"y": 2}))], false)
+        run_ops(&db, &policy, None, vec![merge_op("set", "a", serde_json::json!({"y": 2}))], false, "default")
             .await
             .unwrap();
         let a = db.get("m", "a").await.unwrap().unwrap();
@@ -5398,7 +5885,7 @@ mod tests {
         assert_eq!(a.data.get("y"), Some(&serde_json::json!(2)));
 
         // Plain set on a present doc replaces (old keys gone).
-        run_ops(&db, &policy, None, vec![batch_op("set", "m", "a", serde_json::json!({"z": 3}))], false)
+        run_ops(&db, &policy, None, vec![batch_op("set", "m", "a", serde_json::json!({"z": 3}))], false, "default")
             .await
             .unwrap();
         let a = db.get("m", "a").await.unwrap().unwrap();
@@ -5406,12 +5893,12 @@ mod tests {
         assert!(!a.data.contains_key("x"));
 
         // update on a missing doc aborts the whole batch.
-        let bad = run_ops(&db, &policy, None, vec![batch_op("update", "m", "ghost", serde_json::json!({"q": 1}))], false).await;
+        let bad = run_ops(&db, &policy, None, vec![batch_op("update", "m", "ghost", serde_json::json!({"q": 1}))], false, "default").await;
         assert!(bad.is_err());
         assert!(db.get("m", "ghost").await.unwrap().is_none());
 
         // add upserts: merge over present, create when missing.
-        run_ops(&db, &policy, None, vec![batch_op("add", "m", "a", serde_json::json!({"w": 9}))], false)
+        run_ops(&db, &policy, None, vec![batch_op("add", "m", "a", serde_json::json!({"w": 9}))], false, "default")
             .await
             .unwrap();
         let a = db.get("m", "a").await.unwrap().unwrap();
@@ -5419,7 +5906,7 @@ mod tests {
         assert_eq!(a.data.get("w"), Some(&serde_json::json!(9)));
 
         // Transaction unknown types map by existence (merge when present).
-        run_ops(&db, &policy, None, vec![batch_op("frobnicate", "m", "a", serde_json::json!({"u": 7}))], true)
+        run_ops(&db, &policy, None, vec![batch_op("frobnicate", "m", "a", serde_json::json!({"u": 7}))], true, "default")
             .await
             .unwrap();
         let a = db.get("m", "a").await.unwrap().unwrap();
