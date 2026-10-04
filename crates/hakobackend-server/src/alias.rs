@@ -354,8 +354,10 @@ impl AliasTable {
 
 /// Merge alias query (defaults) with the request query (wins).
 /// Both are raw `k=v&...` strings; request keys shadow alias keys
-/// (exact key match). Order: surviving alias pairs first, then the
-/// request pairs verbatim.
+/// (exact key match) — EXCEPT `db` (issue #13): namespace authority
+/// is alias-wins, so a request query can never escape an alias-pinned
+/// database. Order: surviving alias pairs first, then the request
+/// pairs verbatim.
 pub fn merge_query(alias_q: &str, req_q: Option<&str>) -> String {
     let req_q = req_q.unwrap_or("");
     if alias_q.is_empty() {
@@ -370,9 +372,23 @@ pub fn merge_query(alias_q: &str, req_q: Option<&str>) -> String {
         .collect();
     let mut parts: Vec<&str> = alias_q
         .split('&')
-        .filter(|p| !req_keys.contains(p.split('=').next().unwrap_or("")))
+        .filter(|p| {
+            let k = p.split('=').next().unwrap_or("");
+            // ponytail: one hardcoded exception, not a parameter — `db`
+            // is the only key with authority semantics; everything else
+            // keeps request-wins. A second such key would warrant a set.
+            k == "db" || !req_keys.contains(k)
+        })
         .collect();
-    parts.extend(req_q.split('&'));
+    // Alias-pinned db must be SINGULAR downstream (duplicate `db` keys
+    // parse last-wins, which would hand victory back to the request).
+    // Drop the request's db pair when the alias pins one.
+    let alias_pins_db = alias_q.split('&').any(|p| p.split('=').next().unwrap_or("") == "db");
+    parts.extend(
+        req_q
+            .split('&')
+            .filter(|p| !alias_pins_db || p.split('=').next().unwrap_or("") != "db"),
+    );
     parts.join("&")
 }
 
@@ -429,6 +445,18 @@ mod tests {
         assert_eq!(m, "a=1&b=9&c=3");
         assert_eq!(merge_query("", Some("x=1")), "x=1");
         assert_eq!(merge_query("a=1", None), "a=1");
+    }
+
+    /// `db` is alias-wins (issue #13): a request query can never escape
+    /// an alias-pinned database, and the merged query carries exactly
+    /// one db key (duplicates parse last-wins downstream).
+    #[test]
+    fn db_key_is_alias_wins_and_singular() {
+        // `x` follows the old rule (request wins); `db` stays pinned.
+        assert_eq!(merge_query("db=a&x=1", Some("x=2&db=b")), "db=a&x=2");
+        assert_eq!(merge_query("db=a", Some("db=b")), "db=a");
+        // No alias pin: request db passes through untouched.
+        assert_eq!(merge_query("x=1", Some("db=b")), "x=1&db=b");
     }
 
     #[test]

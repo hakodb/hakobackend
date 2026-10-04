@@ -6,6 +6,7 @@
 //! as deprecated aliases so old configs don't break.
 
 use clap::Parser;
+use std::collections::HashMap;
 
 pub const KNOWN_DRIVERS: &[&str] = &["hako", "hakocluster", "postgres", "sqlite", "mysql",
 "rethinkdb"];
@@ -206,6 +207,9 @@ pub struct UbConfig {
     pub file_mime_allow: Vec<String>,
     /// Signed-URL HMAC secret (empty = signed URLs off). Boot-time.
     pub file_sign_secret: String,
+    /// Multidatabase (issue #13): extra named databases (name -> `data`).
+    /// `data` is always `default`. Empty = single-db. Boot-time.
+    pub databases: HashMap<String, String>,
     /// Realtime guards for small boxes (defaults = today's constants):
     /// per-subscription snapshot doc cap, deliveries per sub per second
     /// (overflow resyncs, never queues), shared poller interval seconds,
@@ -404,6 +408,13 @@ struct FileConfig {
     /// so inline wins). Re-read by /api/admin/reload like the main file.
     alias_file: Option<String>,
     index_file: Option<String>,
+    /// Multidatabase (issue #13): extra named databases as
+    /// name -> driver `data` (`[databases] app2 = "other.db"`).
+    /// `data` stays the `default` database (absent = single-db,
+    /// today's behavior exactly). Embedded drivers (hako/sqlite)
+    /// refuse non-empty (single namespace only).
+    #[serde(default)]
+    databases: HashMap<String, String>,
     realtime_snapshot_docs: Option<u64>,
     realtime_events_per_sec: Option<u64>,
     realtime_poll_secs: Option<u64>,
@@ -675,6 +686,7 @@ pub fn resolve(args: &Args) -> UbConfig {
                 _ => file.file_sign_secret.unwrap_or_default(),
             }
         },
+        databases: file.databases,
         realtime_snapshot_docs: file.realtime_snapshot_docs.unwrap_or(5000),
         realtime_events_per_sec: file.realtime_events_per_sec.unwrap_or(200),
         realtime_poll_secs: file.realtime_poll_secs.unwrap_or(2),
@@ -784,6 +796,19 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     }
     if cfg.file_max_batch < 1 {
         return Err("file_max_batch must be >= 1".into());
+    }
+    // Multidatabase (issue #13): embedded drivers serve `default` only.
+    // Non-empty [databases] would pretend otherwise — refuse at boot.
+    if (cfg.driver == "hako" || cfg.driver == "sqlite") && !cfg.databases.is_empty() {
+        return Err("driver hako/sqlite is single-database (default only); remove [databases]".into());
+    }
+    for name in cfg.databases.keys() {
+        if !hakobackend_core::valid_db_name(name) {
+            return Err(format!("database name `{name}` illegal (charset/len, no __ prefix)"));
+        }
+    }
+    if cfg.databases.contains_key("default") {
+        return Err("[databases] must not name `default` (that is `data`)".into());
     }
     match tls_pair(cfg)? {
         Some((c, k)) => {
@@ -910,6 +935,11 @@ limit_auth_burst = 5
 # merged after inline (inline wins). Re-read by /api/admin/reload.
 # alias_file = "./aliases.toml"
 # index_file = "./indexes.toml"
+# Multidatabase (issue #13): extra named databases (name -> driver
+# `data`; `data` stays `default`). Absent = single-db. Embedded
+# drivers (hako/sqlite) refuse this section (default only).
+# [databases]
+# app2 = "./data/app2.ub"
 # Realtime guards for small boxes: per-subscription snapshot doc cap
 # (over-budget subscribes 400, never silent drops), deliveries per
 # sub per second (overflow resyncs, never queues), shared poller
@@ -1322,6 +1352,37 @@ mod tests {
         let _ = std::fs::remove_file(f);
         let _ = std::fs::remove_file(fa);
         let _ = std::fs::remove_file(fi);
+    }
+
+        #[test]
+    fn multidb_databases_validate() {
+        // Absent = single-db, no constraint.
+        assert!(validate(&resolve(&args())).is_ok());
+        // Embedded drivers refuse [databases] (default only).
+        let f = write_tmp("hakobackend_db_test.toml", "[databases]\napp1 = \"x.db\"\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert!(validate(&resolve(&a)).is_err());
+        let _ = std::fs::remove_file(f);
+        // Name gate + `default` reservation (any driver).
+        for bad in ["[databases]\n\"a/b\" = \"x\"\n", "[databases]\n__x = \"x\"\n", "[databases]\ndefault = \"x\"\n"] {
+            let f = write_tmp("hakobackend_db2_test.toml", bad);
+            let mut a = args();
+            a.config = Some(f.clone());
+            a.driver = Some("postgres".into());
+            assert!(validate(&resolve(&a)).is_err(), "accepted: {bad}");
+            let _ = std::fs::remove_file(f);
+        }
+        // Postgres + well-formed entries passes validation (live open
+        // is a different step, needs a server).
+        let f = write_tmp("hakobackend_db3_test.toml", "[databases]\napp1 = \"postgres://u@/a\"\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        a.driver = Some("postgres".into());
+        let cfg = resolve(&a);
+        assert!(validate(&cfg).is_ok());
+        assert_eq!(cfg.databases.get("app1").map(|s| s.as_str()), Some("postgres://u@/a"));
+        let _ = std::fs::remove_file(f);
     }
 
     #[test]
