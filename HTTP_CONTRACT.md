@@ -23,6 +23,7 @@ must produce exactly the same behavior.
 | `POST /api/transaction {operations[]}` | per-op (see §8) | one `run_transaction` (atomic) | 200 / 400 / mapped `{error, code}` |
 | `GET /api/collectionGroup/:name?options=` | List + per-doc Get | fan-out over matching collections | 200 / 400 |
 | `POST /api/aggregate/{collection} {options?, aggregations[]}` | List | gateway reduce (count/sum/avg) | 200 / 400 |
+| Any method `/api/alias/...` (see §14) | TARGET's slot | redispatch to target, same driver call | target's statuses / 404 (no match) |
 | Error | — | `AppError::status_code` (403/404/400/500) + `code()` | body `{error}` (`{error, code}` on writes) |
 
 ## 8. Batch + transaction (legacy server.ts:392-603 parity)
@@ -192,3 +193,24 @@ JSON API is the only interface; policy is managed via file +
   failures log + retry (10×), SIGKILL can lose one window.
   Full evaluation (exactness argument, measurements, limits):
   `COALESCING_NOTE.md`.
+
+## 14. Path aliases (`/api/alias/...`, issue #5)
+
+Owner-declared rewrites for regular endpoints (no scripts): an alias
+maps one client shape onto one target path + query, e.g.
+`/api/alias/students/:sid/:pin` → `/api/collections/students` with an
+`options={...}` envelope substituting `{sid}`/`{pin}`. Declared in
+`[[aliases]]` (config file, hot-reloaded like policy).
+
+- Match: exact segments + `:param` captures only (no regex). Query
+  templates substitute `{name}` captures; the request's own query MERGES
+  (request wins on collision). First declaration wins.
+- The rewritten request re-enters routing, so auth, policy, limits and
+  realtime see the TARGET exactly like a direct call (policy evaluates
+  the target — one rule surface). Bodies byte-identical to direct.
+- Load-time guards (fail-closed, refuse to boot): pattern must start
+  with `/api/alias/`; target must stay under `/api/` and must not chain
+  into `/api/alias/`; every `{name}` must resolve to a capture;
+  duplicates refused. Realtime lanes (`/ws`, `/api/stream/*`) cannot be
+  targets (long-lived subscriptions cannot survive a redispatch).
+- No match = empty 404 (same as an unknown route).
