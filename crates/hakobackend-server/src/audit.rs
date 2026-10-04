@@ -20,13 +20,46 @@
 //! passwords/tokens/hashes (login names are operationally necessary and
 //! already enumerable via register — see anti-enumeration note in login).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+/// Verbosity (config `audit_level`, issue #4): 0 = off (nothing),
+/// 1 = auth (auth.* only: login/register/logout/refresh/lockout),
+/// 2 = all (default = today: everything incl. reloads).
+static LEVEL: AtomicU8 = AtomicU8::new(2);
 
 /// Kill the stream (tests capture it via `capture()` instead).
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Parse a level name (config file). Unknown names Err (caller warns +
+/// falls back to all — never fail boot on a logging typo).
+pub fn parse_level(s: &str) -> Result<u8, String> {
+    match s {
+        "off" => Ok(0),
+        "auth" => Ok(1),
+        "all" => Ok(2),
+        other => Err(format!("audit_level `{other}` unknown (off|auth|all)")),
+    }
+}
+
+/// Apply a parsed level (boot + /api/admin/reload).
+pub fn set_level(level: u8) {
+    LEVEL.store(level, Ordering::Relaxed);
+}
+
+/// Pure verdict for tests: does `level` admit event `ev`?
+pub(crate) fn level_allows(level: u8, ev: &str) -> bool {
+    level >= class_of(ev)
+}
+
+fn class_of(ev: &str) -> u8 {
+    if ev.starts_with("auth.") {
+        1
+    } else {
+        2
+    }
 }
 
 /// RFC3339 UTC without extra deps (chrono would be a new dep for one line).
@@ -69,6 +102,9 @@ pub fn peer_ip(headers: &axum::http::HeaderMap, trust_proxy: bool, peer: Option<
 
 fn emit(ev: &str, fields: &[(&str, String)]) {
     if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    if !level_allows(LEVEL.load(Ordering::Relaxed), ev) {
         return;
     }
     let mut o = String::from("{\"ts\":\"");
@@ -139,8 +175,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ts_shape_and_peer_ip() {
-        let t = ts_now();
+    fn level_parse_and_filter() {
+        assert_eq!(parse_level("off"), Ok(0));
+        assert_eq!(parse_level("auth"), Ok(1));
+        assert_eq!(parse_level("all"), Ok(2));
+        assert!(parse_level("verbose").is_err());
+        // off admits nothing; auth admits auth.* only; all admits all.
+        for ev in ["auth.login.ok", "auth.register", "auth.lockout"] {
+            assert!(!level_allows(0, ev));
+            assert!(level_allows(1, ev));
+            assert!(level_allows(2, ev));
+        }
+        for ev in ["admin.reload", "policy.reload"] {
+            assert!(!level_allows(0, ev));
+            assert!(!level_allows(1, ev));
+            assert!(level_allows(2, ev));
+        }
+    }
+
+    #[test]
+    fn ts_shape_and_peer_ip() {        let t = ts_now();
         assert_eq!(t.len(), 20);
         assert!(t.ends_with('Z') && t.contains('T'));
         let h = axum::http::HeaderMap::new();

@@ -115,6 +115,14 @@ struct AppState {
     login_guard: Arc<loginguard::LoginGuard>,
     /// Self-service registration open (closed = admin-created users only).
     local_register: bool,
+    /// Maintenance mode: data-plane writes 503 (migrations/backups).
+    /// Reads, health and session flows stay up. Atomic: reload swaps it.
+    read_only: Arc<std::sync::atomic::AtomicBool>,
+    /// Batch/transaction op cap (larger payloads 400). Atomic: reload swaps it.
+    max_batch_ops: Arc<std::sync::atomic::AtomicU64>,
+    /// Realtime guards (snapshot/event/poll/conn caps). RwLock: reload
+    /// swaps it; already-running pollers keep their spawn-time interval.
+    rt_caps: Arc<std::sync::RwLock<realtime::RtCaps>>,
     /// Firebase-style issuance: also return tokens in the JSON body.
     local_token_response: bool,
     /// Set session cookies (false = pure-token mode, no Set-Cookie).
@@ -128,7 +136,8 @@ struct AppState {
     /// Router::layer wraps endpoints post-match, so a rewrite middleware
     /// can never affect routing; the alias *route* therefore rewrites the
     /// URI and re-enters here. Gates already ran on the outer pass (once);
-    /// handlers self-gate on the rewritten target. Set once in build_router.
+    /// handlers self-gate on the rewritten target. First install wins
+    /// (rebuilds produce the identical table).
     bare: Arc<std::sync::OnceLock<Router>>,
 }
 
@@ -529,6 +538,7 @@ async fn open_driver(
     path: &str,
     sync_serve: Option<String>,
     sync_peer: Vec<String>,
+    ttl_sweep_secs: u64,
 ) -> Result<Arc<dyn Database>, String> {
     use hakobackend_core::ttl::TtlDb;
     // Every driver is wrapped once: TTL expiry filters uniformly, and the
@@ -577,8 +587,15 @@ async fn open_driver(
         }
     };
     // One sweeper per open (reloads are rare; the old task idles on the
-    // swapped-out handle and exits with the process).
-    hakobackend_core::ttl::spawn_sweeper(db.clone(), std::time::Duration::from_secs(300), 100);
+    // swapped-out handle and exits with the process). 0 = off (docs
+    // without __ttl_at are immortal anyway).
+    if ttl_sweep_secs > 0 {
+        hakobackend_core::ttl::spawn_sweeper(
+            db.clone(),
+            std::time::Duration::from_secs(ttl_sweep_secs),
+            100,
+        );
+    }
     Ok(db)
 }
 
@@ -643,7 +660,8 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .merge(auth_routes_only)
         .merge(open.clone())
         .with_state(state.clone());
-    state.bare.set(bare).expect("bare router installs once");
+    // First install wins; rebuilds (tests) produce the identical table.
+    let _ = state.bare.set(bare);
     // ponytail: host gate wraps api + auth only (health/ready in `open`
     // stay ungated). host_mw is outermost (added last): off-domain
     // traffic dies before CORS/limit/auth do any work. Legit preflights
@@ -711,7 +729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Fail closed before opening anything (useless/broken issuance shapes).
     validate_local_modes(&cfg).map_err(|e| format!("[ub] {e}"))?;
-    let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await.expect("open database");
+    let db: Arc<dyn Database> = open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await.expect("open database");
     println!("[ub] driver={} data={} config={}", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source });
     // Flags are read here: `cli` moves into AppState below.
     let wstats_flag = cli.wstats;
@@ -737,6 +755,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = Arc::new(PolicyHot::new(cfg.rules.clone()));
     bridge_local_env(&cfg);
+    // Audit verbosity (unknown values warn + fall back to all — never
+    // fail boot on a logging typo).
+    match audit::parse_level(&cfg.audit_level) {
+        Ok(level) => audit::set_level(level),
+        Err(e) => eprintln!("[ub] WARN: {e}; using all"),
+    }
     let (chain, local, github) = open_auth(cfg.auth.as_deref(), db.clone(), policy.identity_snapshot());
     auto_provision(&db, &policy.get().await, &cfg.indexes).await;
 
@@ -795,6 +819,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cfg.login_lockout_secs,
         )),
         local_register: cfg.local_register,
+        read_only: Arc::new(std::sync::atomic::AtomicBool::new(cfg.read_only)),
+        max_batch_ops: Arc::new(std::sync::atomic::AtomicU64::new(cfg.max_batch_ops)),
+        rt_caps: Arc::new(std::sync::RwLock::new(realtime::RtCaps {
+            snapshot_docs: cfg.realtime_snapshot_docs as usize,
+            events_per_sec: cfg.realtime_events_per_sec,
+            poll_secs: cfg.realtime_poll_secs,
+            max_conn_docs: cfg.realtime_max_conn_docs as usize,
+        })),
         local_token_response: cfg.local_token_response,
         local_cookies: cfg.local_cookies,
         aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::new(
@@ -1497,7 +1529,7 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
             .headers()
             .get(header::HOST)
             .and_then(|v| v.to_str().ok());
-        if !csrf_origin_ok(host, origin_ok) {
+        if !csrf_origin_ok(host, origin_ok, &s.cors_allowed) {
             ctx = None;
         }
     }
@@ -1509,16 +1541,21 @@ async fn auth_mw(State(s): State<AppState>, mut req: Request, next: Next) -> Res
 }
 
 /// Pure CSRF verdict (field report: same host, split ports): same host
-/// passes with ports stripped on both sides (portal :443 -> API :3000); anything else fails; absent
+/// passes with ports stripped on both sides (portal :443 -> API :3000);
+/// an Origin exactly matching the CORS allowlist passes too (operator-
+/// trusted web origin, issue #4); anything else fails; absent
 /// Origin (curl/scripts) passes. Tested below; auth_mw only threads it.
-fn csrf_origin_ok(host: Option<&str>, origin: Option<&str>) -> bool {
+fn csrf_origin_ok(host: Option<&str>, origin: Option<&str>, trusted: &[String]) -> bool {
     let Some(o) = origin else { return true };
+    if trusted.iter().any(|t| t == o) {
+        return true;
+    }
     let o = o.trim_start_matches("https://").trim_start_matches("http://");
     let o_host = o.split('/').next().unwrap_or("");
     strip_port(o_host).eq_ignore_ascii_case(strip_port(host.unwrap_or("")))
 }
 
-/// Host without port for the Origin-vs-Host CSRF gate (DHP Temuan #4):
+/// Host without port for the Origin-vs-Host CSRF gate:
 /// "a.com:3000" -> "a.com", "[::1]:3000" -> "[::1]". Bare hosts/IPs and
 /// malformed multi-colon values pass through (fail-closed downstream:
 /// they won't match a legitimate peer either).
@@ -1596,6 +1633,27 @@ fn unauthorized() -> Response {
 /// Legacy wire shape: every failure is JSON `{error}` (writes add `code`).
 fn err(status: StatusCode, msg: impl ToString) -> Response {
     (status, Json(serde_json::json!({ "error": msg.to_string() }))).into_response()
+}
+
+/// Maintenance gate (config `read_only`, issue #4): data-plane writes
+/// 503 with Retry-After while migrations/backups run. Reads, health and
+/// session flows never check this. Handlers call it first and return the
+/// response when Some.
+fn deny_if_read_only(s: &AppState) -> Option<Response> {
+    if s.read_only.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut h = HeaderMap::new();
+        h.insert(header::RETRY_AFTER, "60".parse().unwrap());
+        Some(
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                h,
+                static_json(r#"{"error":"read-only mode: writes paused for maintenance"}"#),
+            )
+                .into_response(),
+        )
+    } else {
+        None
+    }
 }
 
 /// 500 without driver internals: DB errors carry table/DSN hints an
@@ -1723,7 +1781,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
             std::env::set_var("UB_PUBLIC_URL", p);
         }
     }
-    let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone()).await {
+    let db: Arc<dyn Database> = match open_driver(&cfg.driver, &cfg.data, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await {
         Ok(db) => db,
         Err(e) => {
             audit::reload(&admin, &ip, false, &e);
@@ -1732,6 +1790,10 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     };
     let identity = s.hot().await.policy.identity.clone();
     bridge_local_env(&cfg);
+    match audit::parse_level(&cfg.audit_level) {
+        Ok(level) => audit::set_level(level),
+        Err(e) => eprintln!("[ub] WARN: {e}; using all"),
+    }
     let (chain, local, github) = match open_auth_result(cfg.auth.as_deref(), db.clone(), identity) {
         Ok(v) => v,
         Err(e) => {
@@ -1785,6 +1847,18 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // Alias table swaps atomically (Arc): in-flight requests keep the old
     // table, new ones get the new — same discipline as the hot snapshot.
     *s.aliases.write().unwrap() = Arc::new(alias::AliasTable::new(cfg.aliases.clone()));
+    // Scalar ops knobs (issue #4) ride the same reload, no restart.
+    // (Sweep interval rides via open_driver above; already-running
+    // pollers keep their spawn-time interval until churn.)
+    s.read_only.store(cfg.read_only, std::sync::atomic::Ordering::Relaxed);
+    s.max_batch_ops
+        .store(cfg.max_batch_ops, std::sync::atomic::Ordering::Relaxed);
+    *s.rt_caps.write().unwrap() = realtime::RtCaps {
+        snapshot_docs: cfg.realtime_snapshot_docs as usize,
+        events_per_sec: cfg.realtime_events_per_sec,
+        poll_secs: cfg.realtime_poll_secs,
+        max_conn_docs: cfg.realtime_max_conn_docs as usize,
+    };
     auto_provision(&s.hot().await.db.clone(), &s.hot().await.policy, &cfg.indexes).await;
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
@@ -1809,6 +1883,9 @@ async fn create_collection(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     let name = match body.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => return err(StatusCode::BAD_REQUEST, "body requires {name}"),
@@ -2395,6 +2472,9 @@ async fn index_create_inner(
     collection: String,
     body: serde_json::Value,
 ) -> Response {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     if denied_internal(&collection).is_some() {
         return err(StatusCode::FORBIDDEN, "internal collection");
     }
@@ -2448,6 +2528,9 @@ async fn index_drop(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     let (collection, name) = match (q.get("collection"), q.get("name")) {
         (Some(c), Some(n)) if !c.is_empty() && !n.is_empty() => (c.clone(), n.clone()),
         _ => return err(StatusCode::BAD_REQUEST, "query ?collection= & ?name= required"),
@@ -2471,6 +2554,9 @@ async fn create(
     Path(path): Path<String>,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     // Legacy compat shim: POST /api/collections/<coll>/index {name, fields}
     // (legacy backend, server.ts:193). New shape: POST /api/indexes.
     // Collections actually named "index" are accessed via the new shape.
@@ -2541,6 +2627,9 @@ async fn put(
     headers: HeaderMap,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     write_doc(s, auth, path, body, false, skip_hint(&headers)).await
 }
 
@@ -2551,6 +2640,9 @@ async fn patch(
     headers: HeaderMap,
     TimedJson(body): TimedJson<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     // ponytail: merge=true uses the same path as PUT; no manual read-modify-write.
     write_doc(s, auth, path, body, true, skip_hint(&headers)).await
 }
@@ -2716,6 +2808,9 @@ async fn remove(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(path): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     match parse_collection_path(&path) {
         PathKind::Collection { .. } => (
             StatusCode::BAD_REQUEST,
@@ -2862,13 +2957,6 @@ async fn run_ops(
     // must never silently become a write, e.g. dodging an Update-deny via
     // the legacy create-fallback).
     const KNOWN: &[&str] = &["get", "set", "add", "update", "delete", "create"];
-    if ops.len() > realtime::MAX_BATCH_OPS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("too many ops (max {})", realtime::MAX_BATCH_OPS),
-            "bad-request",
-        ));
-    }
     struct Gated {
         body: BatchOpBody,
         id: String,
@@ -3064,11 +3152,21 @@ async fn batch(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     // Legacy quirk preserved: batch failures are always 500, no code.
     let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
         Ok(v) => v,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
+    let max_ops = s.max_batch_ops.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if ops.len() > max_ops {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("too many ops (max {max_ops})"),
+        );
+    }
     let db = s.hot().await.db.clone();
     let policy = s.hot().await.policy;
     match run_ops(&db, &policy, auth.as_ref(), ops, false).await {
@@ -3083,10 +3181,21 @@ async fn transaction(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
     let ops: Vec<BatchOpBody> = match serde_json::from_value(body.get("operations").cloned().unwrap_or_default()) {
         Ok(v) => v,
         Err(_) => return err(StatusCode::BAD_REQUEST, "body requires {operations[]}"),
     };
+    let max_ops = s.max_batch_ops.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if ops.len() > max_ops {
+        return err_code(
+            StatusCode::BAD_REQUEST,
+            format!("too many ops (max {max_ops})"),
+            "bad-request",
+        );
+    }
     let db = s.hot().await.db.clone();
     let policy = s.hot().await.policy;
     match run_ops(&db, &policy, auth.as_ref(), ops, true).await {
@@ -3800,12 +3909,13 @@ async fn ws_loop(s: AppState, mut socket: ws::WebSocket, mut auth: Option<AuthCo
                     }
                     let db = s.hot().await.db.clone();
                     let policy = s.hot().await.policy;
-                    match realtime::subscribe(db, policy, sub_auth, spec).await {
+                    let caps = *s.rt_caps.read().unwrap();
+                    match realtime::subscribe(db, policy, sub_auth, spec, caps).await {
                         Ok(sub) => {
                             // Per-connection snapshot budget (anti memory-bomb).
                             let total: usize =
                                 subs.values().map(|s| s.snapshot_docs).sum::<usize>() + sub.snapshot_docs;
-                            if total > realtime::MAX_CONN_SNAPSHOT_DOCS {
+                            if total > caps.max_conn_docs {
                                 drop(sub);
                                 if !ws_send(&mut socket, ws_err(Some(&key), "connection snapshot budget exceeded")).await {
                                     break;
@@ -3895,7 +4005,8 @@ async fn sse_handler(
     let group = matches!(q.get("group").map(|g| g.as_str()), Some("1") | Some("true"));
     let db = s.hot().await.db.clone();
     let policy = s.hot().await.policy;
-    let sub = match realtime::subscribe(db, policy, auth, realtime::SubSpec { collection, options, group }).await {
+    let caps = *s.rt_caps.read().unwrap();
+    let sub = match realtime::subscribe(db, policy, auth, realtime::SubSpec { collection, options, group }, caps).await {
         Ok(sub) => sub,
         Err(e) if matches!(e, hakobackend_core::AppError::PermissionDenied) => return forbidden(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -4149,39 +4260,80 @@ mod tests {
 
     #[test]
     fn csrf_strips_ports_both_sides() {
+        let none: &[String] = &[];
         // Cross-port same-host: app :443 -> API :3000. Origin as
         // browsers send it (default port omitted) vs Host with port.
         assert!(csrf_origin_ok(
             Some("api.example.com:3000"),
-            Some("https://api.example.com")
+            Some("https://api.example.com"),
+            none
         ));
         // Exact same + explicit port both sides.
         assert!(csrf_origin_ok(
             Some("api.example.com:3000"),
-            Some("https://api.example.com:3000")
+            Some("https://api.example.com:3000"),
+            none
         ));
         // True cross-site still fails (with and without ports).
         assert!(!csrf_origin_ok(
             Some("api.example.com:3000"),
-            Some("https://evil.example.com")
+            Some("https://evil.example.com"),
+            none
         ));
         assert!(!csrf_origin_ok(
             Some("api.example.com:3000"),
-            Some("https://evil.example.com:3000")
+            Some("https://evil.example.com:3000"),
+            none
         ));
         // Subdomain games fail.
         assert!(!csrf_origin_ok(
             Some("api.example.com:3000"),
-            Some("https://api.example.com.evil.com")
+            Some("https://api.example.com.evil.com"),
+            none
         ));
         // Absent Origin (curl/scripts) passes; absent Host fails closed
         // against any Origin.
-        assert!(csrf_origin_ok(Some("h:3000"), None));
-        assert!(!csrf_origin_ok(None, Some("https://h")));
+        assert!(csrf_origin_ok(Some("h:3000"), None, none));
+        assert!(!csrf_origin_ok(None, Some("https://h"), none));
         // Bracketed v6 with ports.
-        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]:3000")));
-        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]")));
-        assert!(!csrf_origin_ok(Some("[::1]:3000"), Some("http://[::2]:3000")));
+        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]:3000"), none));
+        assert!(csrf_origin_ok(Some("[::1]:3000"), Some("http://[::1]"), none));
+        assert!(!csrf_origin_ok(Some("[::1]:3000"), Some("http://[::2]:3000"), none));
+    }
+
+    #[test]
+    fn csrf_trusts_cors_allowlist() {
+        // Issue #4: an Origin exactly on the CORS allowlist passes even
+        // when the Host differs (operator-trusted web origin).
+        let allow = vec!["https://app.example.com".to_string()];
+        assert!(csrf_origin_ok(
+            Some("api.example.com:3000"),
+            Some("https://app.example.com"),
+            &allow
+        ));
+        // Exact match only: scheme, suffix and substring games fail.
+        assert!(!csrf_origin_ok(
+            Some("api.example.com:3000"),
+            Some("http://app.example.com"),
+            &allow
+        ));
+        assert!(!csrf_origin_ok(
+            Some("api.example.com:3000"),
+            Some("https://app.example.com.evil.com"),
+            &allow
+        ));
+        assert!(!csrf_origin_ok(
+            Some("api.example.com:3000"),
+            Some("https://evil.example.com"),
+            &allow
+        ));
+        // Empty allowlist = yesterday's behavior (host match only).
+        let none: &[String] = &[];
+        assert!(!csrf_origin_ok(
+            Some("api.example.com:3000"),
+            Some("https://app.example.com"),
+            none
+        ));
     }
 
     #[test]
@@ -4275,6 +4427,77 @@ mod tests {
         // Unmatched alias pattern: empty 404, like an unknown route.
         let (ns, _) = get(app, "/api/alias/students/only-one").await;
         assert_eq!(ns, StatusCode::NOT_FOUND);
+    }
+
+    /// Ops knobs end-to-end (issue #4): read_only 503s writes with
+    /// Retry-After while reads pass; max_batch_ops caps batch/transaction.
+    #[tokio::test]
+    async fn ops_knobs_end_to_end() {
+        use tower::ServiceExt;
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "ops_knobs").await;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let headers = res.headers().clone();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, headers, body)
+        }
+        let app = build_router(st.clone(), vec![], false);
+        // Seed with the gate open.
+        let (s, _, _) = call(app.clone(), "PUT", "/api/collections/m/a", Some(serde_json::json!({"z": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        // Maintenance on: writes 503 + Retry-After, reads pass.
+        st.read_only.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (s, h, _) = call(app.clone(), "PUT", "/api/collections/m/a", Some(serde_json::json!({"z": 2}))).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h.contains_key("retry-after"));
+        let (s, _, _) = call(app.clone(), "DELETE", "/api/collections/m/a", None).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, _, _) = call(
+            app.clone(),
+            "POST",
+            "/api/batch",
+            Some(serde_json::json!({"operations": []})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE);
+        let (s, body) = {
+            let (s, _, b) = call(app.clone(), "GET", "/api/collections/m/a", None).await;
+            (s, b)
+        };
+        assert_eq!(s, StatusCode::OK);
+        // The blocked overwrite never landed (still z:1, not z:2).
+        assert!(String::from_utf8_lossy(&body).contains("\"z\":1"));
+        // Gate off, cap tightened: oversized batch/tx refuse.
+        st.read_only.store(false, std::sync::atomic::Ordering::Relaxed);
+        st.max_batch_ops.store(1, std::sync::atomic::Ordering::Relaxed);
+        let two = serde_json::json!({"operations": [
+            {"type": "get", "collection": "m", "id": "a"},
+            {"type": "get", "collection": "m", "id": "a"},
+        ]});
+        let (s, _, b) = call(app.clone(), "POST", "/api/batch", Some(two.clone())).await;
+        // Legacy quirk preserved: batch failures are always 500, no code.
+        assert_eq!(s, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
+        let (s, _, b) = call(app.clone(), "POST", "/api/transaction", Some(two)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
     }
 
     /// Minimal percent-decoder for the transform test (no new deps).
@@ -4691,7 +4914,7 @@ mod tests {
                 trust_proxy: false, tls_cert: None, tls_key: None, validate: false,
                 print_default_config: false, coalesce_writes: false,
                 compress: false, body_limit_mb: None, cors_allowed_origins: vec![],
-                no_local_register: false,
+                no_local_register: false, read_only: false,
                 wstats: false, benchmark: false, sock: None, http2: false,
                 sync_serve: None, sync_peer: vec![], allowed_hosts: vec![],
             }),
@@ -4721,6 +4944,9 @@ mod tests {
             csrf_check: true,
             login_guard: Arc::new(loginguard::LoginGuard::new(0, 300)),
             local_register: true,
+            read_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            max_batch_ops: Arc::new(std::sync::atomic::AtomicU64::new(1000)),
+            rt_caps: Arc::new(std::sync::RwLock::new(realtime::RtCaps::default())),
             local_token_response: false,
             local_cookies: true,
             aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::default()))),

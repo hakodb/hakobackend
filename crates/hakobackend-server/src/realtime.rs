@@ -82,6 +82,7 @@ async fn bus_stream(collection: &str) -> tokio::sync::broadcast::Receiver<Change
 async fn shared_poll_stream(
     db: Arc<dyn Database>,
     collection: &str,
+    poll_secs: u64,
 ) -> tokio::sync::broadcast::Receiver<Vec<Doc>> {
     let key = format!("{:p}/{collection}", Arc::as_ptr(&db));
     {
@@ -98,7 +99,7 @@ async fn shared_poll_stream(
     let coll = collection.to_string();
     let keyc = key.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(POLL_INTERVAL);
+        let mut tick = tokio::time::interval(Duration::from_secs(poll_secs.max(1)));
         loop {
             tick.tick().await;
             if txc.receiver_count() == 0 {
@@ -121,8 +122,6 @@ async fn shared_poll_stream(
 
 /// Polling interval for drivers without watch (single-instance; Redis fan-out follows).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
-/// Subscription limit per WS connection (legacy backend parity).
-pub const MAX_SUBS_PER_SOCKET: usize = 100;
 /// Snapshot guard: a filtered universe bigger than this is rejected so one
 /// greedy subscription can't OOM the server (narrow with filters instead).
 pub const MAX_SNAPSHOT_DOCS: usize = 5000;
@@ -132,10 +131,35 @@ pub const MAX_EVENTS_PER_SEC: u64 = 200;
 /// Subscription budget per WS connection: 100 subs × 5000-doc snapshots
 /// would be ~500k docs on one socket without this.
 pub const MAX_CONN_SNAPSHOT_DOCS: usize = 20_000;
-/// Batch/transaction op cap (cloudserver parity: batch ≤ 1000).
-pub const MAX_BATCH_OPS: usize = 1000;
 /// Aggregate reduce guard: sum/avg list into RAM — refuse past this.
 pub const MAX_AGG_SCAN_DOCS: u64 = 50_000;
+
+/// Tunable realtime guards (config `realtime_*`, issue #4). Cloned per
+/// subscription from AppState (Copy-small); reload swaps the source, and
+/// already-running pollers keep their spawn-time interval until churn.
+/// `Default` = the legacy constants above (zero behavior change).
+#[derive(Debug, Clone, Copy)]
+pub struct RtCaps {
+    /// Per-subscription snapshot doc cap (over-budget subscribes 400).
+    pub snapshot_docs: usize,
+    /// Deliveries per sub per second (overflow resyncs, never queues).
+    pub events_per_sec: u64,
+    /// Shared poller interval seconds (drivers without watch).
+    pub poll_secs: u64,
+    /// Per-connection snapshot doc budget across all subs (handler-side).
+    pub max_conn_docs: usize,
+}
+
+impl Default for RtCaps {
+    fn default() -> Self {
+        Self {
+            snapshot_docs: MAX_SNAPSHOT_DOCS,
+            events_per_sec: MAX_EVENTS_PER_SEC,
+            poll_secs: POLL_INTERVAL.as_secs(),
+            max_conn_docs: MAX_CONN_SNAPSHOT_DOCS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubSpec {
@@ -205,11 +229,12 @@ fn snapshot_options(q: &QueryOptions) -> QueryOptions {
 struct RateGate {
     window: tokio::time::Instant,
     count: u64,
+    cap: u64,
 }
 
 impl RateGate {
-    fn new() -> Self {
-        Self { window: tokio::time::Instant::now(), count: 0 }
+    fn new(cap: u64) -> Self {
+        Self { window: tokio::time::Instant::now(), count: 0, cap }
     }
 
     fn observe(&mut self, n: u64) -> bool {
@@ -219,7 +244,7 @@ impl RateGate {
             self.count = 0;
         }
         self.count += n;
-        self.count > MAX_EVENTS_PER_SEC
+        self.count > self.cap
     }
 }
 
@@ -260,6 +285,7 @@ pub async fn subscribe(
     policy: Arc<PolicyFile>,
     auth: Option<AuthContext>,
     spec: SubSpec,
+    caps: RtCaps,
 ) -> Result<Subscription, AppError> {
     if !hakobackend_core::valid_collection_path(&spec.collection) {
         return Err(AppError::BadRequest("invalid collection name".into()));
@@ -293,7 +319,7 @@ pub async fn subscribe(
             snapshot.insert(format!("{coll}\0{}", doc.id), doc);
         }
     }
-    if snapshot.len() > MAX_SNAPSHOT_DOCS {
+    if snapshot.len() > caps.snapshot_docs {
         return Err(AppError::BadRequest(
             "collection too large for realtime: narrow with filters".into(),
         ));
@@ -309,7 +335,7 @@ pub async fn subscribe(
     // (never hang a subscribe on a dying source).
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(run_source(
-        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx, ready_tx,
+        db, policy, auth, spec.options, collections, logical_of, snapshot, watch, tx, ready_tx, caps,
     ));
     if tokio::time::timeout(std::time::Duration::from_secs(5), ready_rx)
         .await
@@ -332,6 +358,7 @@ async fn run_source(
     watch: bool,
     tx: tokio::sync::mpsc::UnboundedSender<OutEvent>,
     ready: tokio::sync::oneshot::Sender<()>,
+    caps: RtCaps,
 ) {
     // Policy sees logical names; storage/snapshot use stored names.
     let lf = &logical_of;
@@ -355,7 +382,7 @@ async fn run_source(
         // Bus receivers registered: subscribe() may return now.
         let _ = ready.send(());
         let snap_q = snapshot_options(&options);
-        let mut gate = RateGate::new();
+        let mut gate = RateGate::new(caps.events_per_sec);
         loop {
             match map.next().await {
                 // (collection, Ok(change)): normal path.
@@ -401,10 +428,10 @@ async fn run_source(
             BusLagged,
         }
         type Boxed = std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Lane> + Send>>;
-        let mut gate = RateGate::new();
+        let mut gate = RateGate::new(caps.events_per_sec);
         let mut map: StreamMap<String, Boxed> = StreamMap::new();
         for coll in &collections {
-            let ticks = BroadcastStream::new(shared_poll_stream(db.clone(), coll).await).map(|r| match r {
+            let ticks = BroadcastStream::new(shared_poll_stream(db.clone(), coll, caps.poll_secs).await).map(|r| match r {
                 Ok(docs) => Lane::Tick(docs),
                 Err(_) => Lane::TickLagged,
             });
@@ -434,7 +461,7 @@ async fn run_source(
                     // Flood: the next tick carries full state, so just reset
                     // the window — the diff below already self-heals.
                     if gate.observe(sent) {
-                        gate = RateGate::new();
+                        gate = RateGate::new(caps.events_per_sec);
                     }
                 }
                 // Lagged tick: skipped on purpose — the next tick carries
@@ -664,6 +691,7 @@ mod tests {
             policy,
             None,
             SubSpec { collection: "rt".into(), options: QueryOptions::default(), group: false },
+            RtCaps::default(),
         )
         .await
         .unwrap();
@@ -708,8 +736,8 @@ mod tests {
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
         let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
-        let mut s1 = subscribe(db.clone(), policy.clone(), None, spec.clone()).await.unwrap();
-        let mut s2 = subscribe(db.clone(), policy, None, spec).await.unwrap();
+        let mut s1 = subscribe(db.clone(), policy.clone(), None, spec.clone(), RtCaps::default()).await.unwrap();
+        let mut s2 = subscribe(db.clone(), policy, None, spec, RtCaps::default()).await.unwrap();
 
         db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false)
             .await
@@ -721,6 +749,34 @@ mod tests {
                 .unwrap();
             assert_eq!(ev.kind, ChangeKind::Add);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Snapshot cap is honored per caps (issue #4): a universe bigger
+    /// than the configured cap refuses instead of OOMing the server.
+    #[tokio::test]
+    async fn snapshot_cap_uses_caps() {
+        use hakobackend_db_sqlite::SqliteDb;
+        let dir = std::env::temp_dir().join(format!("hakobackend_cap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.db");
+        let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
+        let policy = Arc::new(PolicyFile::open());
+        let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
+        db.set("ev", "a", Doc { id: "a".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        db.set("ev", "b", Doc { id: "b".into(), data: Default::default() }, false)
+            .await
+            .unwrap();
+        // Default cap (5000) admits the 2-doc universe.
+        let _sub = subscribe(db.clone(), policy.clone(), None, spec.clone(), RtCaps::default())
+            .await
+            .unwrap();
+        // Tight cap refuses the same universe.
+        let tight = RtCaps { snapshot_docs: 1, ..RtCaps::default() };
+        assert!(subscribe(db, policy, None, spec, tight).await.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -751,7 +807,7 @@ mod tests {
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
         let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
-        let mut sub = subscribe(db, policy, None, spec).await.unwrap();
+        let mut sub = subscribe(db, policy, None, spec, RtCaps::default()).await.unwrap();
         emit(
             "ev",
             Change { collection: "ev".into(), id: "a".into(), kind: ChangeKind::Change, old: None, new: Some(doc("a", 1)) },
@@ -776,7 +832,7 @@ mod tests {
         let db: Arc<dyn Database> = Arc::new(SqliteDb::open(path.to_string_lossy().as_ref()).await.unwrap());
         let policy = Arc::new(PolicyFile::open());
         let spec = SubSpec { collection: "ev".into(), options: QueryOptions::default(), group: false };
-        let mut sub = subscribe(db.clone(), policy, None, spec).await.unwrap();
+        let mut sub = subscribe(db.clone(), policy, None, spec, RtCaps::default()).await.unwrap();
         // Commit through the driver AND emit (what write_doc does).
         db.set("ev", "a", Doc { id: "a".into(), data: [("age".to_string(), serde_json::json!(1))].into_iter().collect() }, false)
             .await

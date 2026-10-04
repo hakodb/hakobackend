@@ -106,6 +106,12 @@ pub struct Args {
     /// does the same without the flag.
     #[arg(long = "no-local-register", default_value_t = false)]
     pub no_local_register: bool,
+    /// Maintenance mode: refuse all data-plane writes (collections,
+    /// batch/transaction, indexes) with 503 so migrations and backups run
+    /// undisturbed. Reads, health and session flows stay up. File
+    /// `read_only = true` does the same without the flag.
+    #[arg(long, default_value_t = false)]
+    pub read_only: bool,
     /// Gzip responses above 1 KB (default OFF: realtime backend optimizes
     /// latency + CPU; bandwidth is the proxy's job when one fronts this).
     #[arg(long, default_value_t = false)]
@@ -177,6 +183,27 @@ pub struct UbConfig {
     pub local_argon2_p_cost: u32,
     pub login_max_attempts: u32,
     pub login_lockout_secs: u64,
+    /// Maintenance mode (default false; flag --read-only sets). Reads,
+    /// health and session flows stay up; data writes 503. Boot-time.
+    pub read_only: bool,
+    /// TTL sweeper interval seconds (default 300; 0 = off, immortal docs
+    /// stay without the periodic delete pass). Boot-time (spawner).
+    pub ttl_sweep_secs: u64,
+    /// Batch/transaction op cap (default 1000, cloudserver parity).
+    /// Larger payloads 400; align with body_limit_mb on big writes.
+    pub max_batch_ops: u64,
+    /// Realtime guards for small boxes (defaults = today's constants):
+    /// per-subscription snapshot doc cap, deliveries per sub per second
+    /// (overflow resyncs, never queues), shared poller interval seconds,
+    /// per-connection snapshot doc budget across all subs.
+    pub realtime_snapshot_docs: u64,
+    pub realtime_events_per_sec: u64,
+    pub realtime_poll_secs: u64,
+    pub realtime_max_conn_docs: u64,
+    /// Audit stream verbosity: off | auth | all (default all = today).
+    /// Unknown values warn + fall back to all (never fail boot on a
+    /// logging typo). File-only, boot-time.
+    pub audit_level: String,
     /// Firebase-style issuance (boot-time; see above).
     pub local_token_response: bool,
     pub local_cookies: bool,
@@ -344,6 +371,15 @@ struct FileConfig {
     local_argon2_p_cost: Option<u32>,
     login_max_attempts: Option<u32>,
     login_lockout_secs: Option<u64>,
+    #[serde(default)]
+    read_only: bool,
+    ttl_sweep_secs: Option<u64>,
+    max_batch_ops: Option<u64>,
+    realtime_snapshot_docs: Option<u64>,
+    realtime_events_per_sec: Option<u64>,
+    realtime_poll_secs: Option<u64>,
+    realtime_max_conn_docs: Option<u64>,
+    audit_level: Option<String>,
     /// Firebase-style issuance (all file-only, boot-time): return tokens
     /// in the JSON body alongside cookies (`local_token_response`, default
     /// false) and/or stop setting cookies entirely (`local_cookies`,
@@ -542,6 +578,14 @@ pub fn resolve(args: &Args) -> UbConfig {
         local_argon2_p_cost: file.local_argon2_p_cost.unwrap_or(1),
         login_max_attempts: file.login_max_attempts.unwrap_or(0),
         login_lockout_secs: file.login_lockout_secs.unwrap_or(300),
+        read_only: args.read_only || file.read_only,
+        ttl_sweep_secs: file.ttl_sweep_secs.unwrap_or(300),
+        max_batch_ops: file.max_batch_ops.unwrap_or(1000),
+        realtime_snapshot_docs: file.realtime_snapshot_docs.unwrap_or(5000),
+        realtime_events_per_sec: file.realtime_events_per_sec.unwrap_or(200),
+        realtime_poll_secs: file.realtime_poll_secs.unwrap_or(2),
+        realtime_max_conn_docs: file.realtime_max_conn_docs.unwrap_or(20_000),
+        audit_level: file.audit_level.unwrap_or_else(|| "all".into()),
         local_token_response: file.local_token_response.unwrap_or(false),
         local_cookies: file.local_cookies.unwrap_or(true),
         aliases: crate::alias::compile_all(
@@ -635,6 +679,15 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     for decl in &cfg.indexes {
         decl.validate()?;
     }
+    // Ops-knob floors (issue #4): a zero poll interval would panic the
+    // tokio ticker at runtime; a zero batch cap rejects every write.
+    // Refuse at boot with a clear message instead.
+    if cfg.realtime_poll_secs < 1 {
+        return Err("realtime_poll_secs must be >= 1".into());
+    }
+    if cfg.max_batch_ops < 1 {
+        return Err("max_batch_ops must be >= 1".into());
+    }
     match tls_pair(cfg)? {
         Some((c, k)) => {
             for (label, p) in [("tls_cert", &c), ("tls_key", &k)] {
@@ -711,8 +764,14 @@ limit_auth_burst = 5
 # ws_max_subs = 100
 # CSRF Origin-vs-Host gate for cookie-authed mutations (default on).
 # Same-host cross-port (portal :443 -> API :3000) passes: ports strip
-# from both sides before compare. Off only behind a sanitizing gateway.
+# from both sides before compare. An Origin exactly matching
+# cors_allowed_origins also passes (operator-trusted web origin).
+# Off only behind a sanitizing gateway.
 # csrf_origin_check = true
+
+# Maintenance mode: refuse data-plane writes with 503 (migrations,
+# backups). Reads, health and session flows stay up. Boot-time.
+# read_only = false  # or --read-only
 
 # Local-auth hardening (all file-only, boot-time; UB_LOCAL_* env wins
 # when set). Defaults = today's behavior.
@@ -731,6 +790,25 @@ limit_auth_burst = 5
 # locked; success clears. Complements the per-IP rate limiter.
 # login_max_attempts = 10
 # login_lockout_secs = 300
+
+# Operations follow-ups (issue #4; defaults = today's behavior).
+# TTL sweeper interval seconds (0 = off, docs without __ttl_at are
+# immortal anyway). Boot-time (spawner).
+# ttl_sweep_secs = 300
+# Batch/transaction op cap (larger payloads 400; align with
+# body_limit_mb on big writes).
+# max_batch_ops = 1000
+# Realtime guards for small boxes: per-subscription snapshot doc cap
+# (over-budget subscribes 400, never silent drops), deliveries per
+# sub per second (overflow resyncs, never queues), shared poller
+# interval seconds, per-connection snapshot budget across subs.
+# realtime_snapshot_docs = 5000
+# realtime_events_per_sec = 200
+# realtime_poll_secs = 2
+# realtime_max_conn_docs = 20000
+# Audit stream verbosity: off | auth | all (auth.* events only vs
+# everything; unknown values warn + fall back to all).
+# audit_level = "all"
 
 # Firebase-style local issuance (cross-origin without browser-cookie
 # surgery): login/refresh also return tokens in the JSON body
@@ -845,6 +923,7 @@ mod tests {
             print_default_config: false,
             coalesce_writes: false,
             no_local_register: false,
+            read_only: false,
             compress: false,
             wstats: false,
             benchmark: false,
@@ -1042,6 +1121,51 @@ mod tests {
     }
 
     #[test]
+    fn ops_followup_defaults_and_overrides() {
+        // Defaults = today's hardcoded behavior (issue #4).
+        let cfg = resolve(&args());
+        assert!(!cfg.read_only);
+        assert_eq!(cfg.ttl_sweep_secs, 300);
+        assert_eq!(cfg.max_batch_ops, 1000);
+        assert_eq!(
+            (
+                cfg.realtime_snapshot_docs,
+                cfg.realtime_events_per_sec,
+                cfg.realtime_poll_secs,
+                cfg.realtime_max_conn_docs
+            ),
+            (5000, 200, 2, 20_000)
+        );
+        assert_eq!(cfg.audit_level, "all");
+        // File overrides stick, including sweeper-off.
+        let f = write_tmp(
+            "hakobackend_ops_test.toml",
+            "read_only = true\nttl_sweep_secs = 0\nmax_batch_ops = 50\nrealtime_snapshot_docs = 100\nrealtime_events_per_sec = 10\nrealtime_poll_secs = 5\nrealtime_max_conn_docs = 1000\naudit_level = \"auth\"\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        assert!(cfg.read_only);
+        assert_eq!(cfg.ttl_sweep_secs, 0);
+        assert_eq!(cfg.max_batch_ops, 50);
+        assert_eq!(
+            (
+                cfg.realtime_snapshot_docs,
+                cfg.realtime_events_per_sec,
+                cfg.realtime_poll_secs,
+                cfg.realtime_max_conn_docs
+            ),
+            (100, 10, 5, 1000)
+        );
+        assert_eq!(cfg.audit_level, "auth");
+        // Flag flips read_only without the file.
+        let mut a2 = args();
+        a2.read_only = true;
+        assert!(resolve(&a2).read_only);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
     fn token_modes_validate_at_config() {
         // Defaults: cookies only (today's shape).
         let cfg = resolve(&args());
@@ -1078,6 +1202,22 @@ mod tests {
         a.config = Some(write_tmp("hakobackend_empty_test.toml", ""));
         let cfg = resolve(&a);
         assert!(validate(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_menolak_knob_nol() {
+        // Zero poll interval / batch cap can never serve: refuse at boot.
+        let f = write_tmp("hakobackend_nol_test.toml", "realtime_poll_secs = 0\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert!(validate(&resolve(&a)).is_err());
+        let f = write_tmp("hakobackend_nol_test.toml", "max_batch_ops = 0\n");
+        let mut a = args();
+        a.config = Some(f.clone());
+        assert!(validate(&resolve(&a)).is_err());
+        // Defaults validate clean.
+        assert!(validate(&resolve(&args())).is_ok());
+        let _ = std::fs::remove_file(f);
     }
 
     #[test]
