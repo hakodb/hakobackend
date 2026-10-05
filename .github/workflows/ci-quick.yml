@@ -1,0 +1,30 @@
+# Quick gate for branch protection (required check on main).
+#
+# Deliberately NOT the docker matrix (13 min) and NOT fmt (the tree is
+# not rustfmt-clean): answers one question fast — does the server
+# (plus its tests) still compile locked? Cache makes PR runs incremental.
+
+name: ci-quick
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: quick-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check server + tests (locked, no codegen)
+        run: cargo check --locked -p hakobackend-server --tests
