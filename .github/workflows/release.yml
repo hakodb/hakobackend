@@ -105,7 +105,10 @@ jobs:
           ./$BIN --help >/dev/null && echo "executes in-container"
       - name: package (linux tarball — deploy-release.sh contract)
         run: |
-          STAGE="hakobackend-${{ github.ref_name }}-linux-x86_64"
+          # ponytail: sanitize the ref (branch runs contain slashes;
+          # tags never do — identical output on tags either way).
+          TAG="${GITHUB_REF_NAME////-}"
+          STAGE="hakobackend-${TAG}-linux-x86_64"
           mkdir -p "$STAGE"
           cp target/x86_64-unknown-linux-musl/release/hakobackend-server "$STAGE/hakobackend"
           cp hakobackend.example.toml "$STAGE/" 2>/dev/null || true
