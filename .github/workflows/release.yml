@@ -81,7 +81,7 @@ jobs:
       image: alpine:3.21
     steps:
       - name: container toolchain (musl C/C++, static openssl/sqlite, perl/cmake for aws-lc-sys)
-        run: apk add --no-cache musl-dev gcc g++ perl cmake make pkgconfig git curl tar gzip ca-certificates openssl-dev openssl-libs-static sqlite-dev sqlite-static rustup bash file
+        run: apk add --no-cache musl-dev gcc g++ perl cmake make pkgconfig git curl tar gzip ca-certificates openssl-dev openssl-libs-static sqlite-dev sqlite-static protobuf rustup bash file
       - uses: actions/checkout@v4
       - name: rust toolchain + musl target
         # ponytail: rustup (not dtolnay) inside alpine — the action's
