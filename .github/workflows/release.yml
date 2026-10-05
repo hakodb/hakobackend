@@ -122,11 +122,3 @@ jobs:
           files: |
             hakobackend-*-linux-x86_64.tar.gz
           generate_release_notes: true
-
-      # TEMPORARY (prove-static): workflow artifact for manual download +
-      # EL7 execution proof. Removed before merge.
-      - name: test artifact (temporary)
-        uses: actions/upload-artifact@v4
-        with:
-          name: hakobackend-linux-test
-          path: hakobackend-*-linux-x86_64.tar.gz
