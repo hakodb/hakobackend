@@ -298,6 +298,19 @@ fn json_to_value(v: &serde_json::Value) -> hakodb::document::value::Value {    u
         serde_json::Value::String(s) => HV::String(s.clone()),
         serde_json::Value::Array(a) => HV::Array(a.iter().map(json_to_value).collect()),
         serde_json::Value::Object(m) => {
+            // Document references (issue #21 addendum 2): {"__ref__":"col/id"}
+            // becomes a typed Reference so filters/reads see it as one,
+            // exactly like the engine's Value::from_json. `__blob__` is
+            // deliberately NOT honored here: client-supplied blob offsets
+            // would point anywhere in the blob file (the engine only
+            // mints them server-side during extraction).
+            if let Some(path) = m.get("__ref__").and_then(|v| v.as_str()) {
+                if let Some((col, id)) = path.split_once('/') {
+                    if !col.is_empty() && !id.is_empty() {
+                        return HV::Reference { collection: col.to_string(), doc_id: id.to_string() };
+                    }
+                }
+            }
             let map = m
                 .into_iter()
                 .map(|(k, val)| (Arc::<str>::from(k.as_str()), json_to_value(&val)))
@@ -987,6 +1000,43 @@ fn spawn_bridge(db: Arc<hakodb::Hako>, collection: String, tx: tokio::sync::broa
 mod tests {
     use super::*;
 
+    /// Reference markers (issue #21 addendum 2): {"__ref__":"col/id"}
+    /// converts to a typed Reference (top-level and nested, write path
+    /// and filter values alike); malformed markers and __blob__ stay
+    /// plain maps (no client-minted blob offsets, ever).
+    #[test]
+    fn json_to_value_reference_markers() {
+        use hakodb::document::value::Value as HV;
+        assert!(matches!(
+            json_to_value(&serde_json::json!({"__ref__": "users/u1"})),
+            HV::Reference { collection, doc_id } if collection == "users" && doc_id == "u1"
+        ));
+        assert!(matches!(
+            json_to_value(&serde_json::json!({"owner": {"__ref__": "users/u1"}})),
+            HV::Map(_) // nested marker decodes (typedness asserted below end-to-end)
+        ));
+        match json_to_value(&serde_json::json!({"owner": {"__ref__": "users/u1"}})) {
+            HV::Map(m) => assert!(matches!(
+                &m[0].1,
+                HV::Reference { collection, doc_id } if collection == "users" && doc_id == "u1"
+            )),
+            _ => panic!("nested marker must stay a map holding a typed ref"),
+        }
+        // Malformed: no slash / empty side → plain map (never a broken ref).
+        assert!(matches!(
+            json_to_value(&serde_json::json!({"__ref__": "noslash"})),
+            HV::Map(_)
+        ));
+        assert!(matches!(
+            json_to_value(&serde_json::json!({"__ref__": "/u1"})),
+            HV::Map(_)
+        ));
+        // Blob markers stay maps (offsets are server-minted only).
+        assert!(matches!(
+            json_to_value(&serde_json::json!({"__blob__": {"len": 3, "offset": 8}})),
+            HV::Map(_)
+        ));
+    }
     /// Lazy teardown: dropping the last receiver reaps the bridge thread
     /// (within one idle tick) and prunes the entry, so a later subscribe
     /// respawns cleanly and still delivers.
