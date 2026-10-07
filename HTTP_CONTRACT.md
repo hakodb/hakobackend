@@ -327,3 +327,15 @@ authorize on the full doc, disclose the subset.
   function of versioned bytes). The coalescer overlay applies
   before projecting, so read-your-write holds inside the
   window.
+
+## 19. Document references (issue #21 addendum 2)
+
+A field holding `{"__ref__":"coll/id"}` is a typed Reference,
+not a map: the hako driver decodes the marker on write (top
+level and nested, filter values alike), reads surface the
+marker, and Eq filters match marker-against-marker. Following
+is client-side (GET the marker path, then GET the target;
+field-path GET returns the marker as-is). Malformed markers
+(no slash, empty side) stay plain maps. `__blob__` markers
+are never client-mintable over HTTP (offsets are
+server-minted during extraction); they pass through as maps.

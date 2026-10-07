@@ -5250,6 +5250,70 @@ mod tests {
         assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
     }
 
+    /// Document references over HTTP (issue #21 addendum 2): the
+    /// {"__ref__":"col/id"} marker survives the write path as a typed
+    /// Reference (roundtrip + Eq filter), reads surface the marker for
+    /// client-side follow (field-path GET included).
+    #[tokio::test]
+    async fn reference_marker_roundtrip_and_filter() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_ref_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, "[defaults]\nread = \"public\"\nwrite = \"public\"\n").unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.join("h.ub").to_string_lossy().as_ref()).unwrap());
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        let app = build_router(st.clone(), vec![], false);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/users/u1",
+            Some(serde_json::json!({"name": "Ann"}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/orders/o1",
+            Some(serde_json::json!({"owner": {"__ref__": "users/u1"}}))).await;
+        assert_eq!(s, StatusCode::OK);
+        // Marker roundtrips (typed server-side, marker on the wire).
+        let (s, b) = call(app.clone(), "GET", "/api/collections/orders/o1", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"__ref__\":\"users/u1\""));
+        // Field-path GET surfaces the marker for client-side follow.
+        let (s, b) = call(app.clone(), "GET", "/api/collections/orders/o1/owner", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"__ref__\":\"users/u1\""));
+        // Eq filter on the ref field matches (marker value, both sides).
+        let (s, b) = call(app.clone(), "GET",
+            &reencode_query("/api/collections/orders?options={\"filters\":[{\"field\":\"owner\",\"op\":\"==\",\"value\":{\"__ref__\":\"users/u1\"}}]}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"o1\""));
+    }
+
     /// Field-path GET + options.fields (issue #21 B): single and nested
     /// projection, missing-field legacy fallback, subcollection listing
     /// preserved, both-present field-wins, list stripping (incl. dotted).
