@@ -476,6 +476,25 @@ pub trait Database: Send + Sync {
     async fn run_transaction(&self, _ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
         Err(AppError::BadRequest("driver has no transaction support".into()))
     }
+    /// Move docs between collections, timestamp-preserving put at dst +
+    /// fresh tombstone at src; returns (moved, missing). Archive use only
+    /// makes sense on hako (lazy residency, sync-withhold gate); other
+    /// drivers reject clearly.
+    async fn relocate(&self, _src: &str, _dst: &str, _ids: &[String]) -> Result<(Vec<String>, Vec<String>), AppError> {
+        Err(AppError::BadRequest("driver has no relocate support".into()))
+    }
+    /// Explicit load of one (usually lazy archive) collection. Hako-only.
+    async fn load_collection(&self, _collection: &str) -> Result<(), AppError> {
+        Err(AppError::BadRequest("driver has no lazy-collection support".into()))
+    }
+    /// Explicit evict of one lazy collection. Hako-only.
+    async fn unload_collection(&self, _collection: &str) -> Result<(), AppError> {
+        Err(AppError::BadRequest("driver has no lazy-collection support".into()))
+    }
+    /// Archive-group collections present but not loaded. Hako-only.
+    async fn unloaded_collections(&self) -> Result<Vec<String>, AppError> {
+        Err(AppError::BadRequest("driver has no lazy-collection support".into()))
+    }
     /// Delete expired (`__ttl_at`) docs; returns (collections, deleted).
     /// Default lists + deletes through normal paths (works for bare
     /// drivers); TTL decorators override to reach past their own filter.
@@ -565,6 +584,18 @@ impl<D: Database + Send + Sync> Database for Arc<D> {
     }
     async fn run_transaction(&self, ops: Vec<TxOp>) -> Result<Vec<TxOut>, AppError> {
         self.as_ref().run_transaction(ops).await
+    }
+    async fn relocate(&self, src: &str, dst: &str, ids: &[String]) -> Result<(Vec<String>, Vec<String>), AppError> {
+        self.as_ref().relocate(src, dst, ids).await
+    }
+    async fn load_collection(&self, collection: &str) -> Result<(), AppError> {
+        self.as_ref().load_collection(collection).await
+    }
+    async fn unload_collection(&self, collection: &str) -> Result<(), AppError> {
+        self.as_ref().unload_collection(collection).await
+    }
+    async fn unloaded_collections(&self) -> Result<Vec<String>, AppError> {
+        self.as_ref().unloaded_collections().await
     }
     async fn sweep_expired(&self, per_collection_cap: usize) -> Result<(usize, usize), AppError> {
         self.as_ref().sweep_expired(per_collection_cap).await

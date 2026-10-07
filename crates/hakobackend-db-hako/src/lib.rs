@@ -270,8 +270,19 @@ impl HakoDb {
     }
 }
 
-fn json_to_value(v: &serde_json::Value) -> hakodb::document::value::Value {
-    use hakodb::document::value::Value as HV;
+/// Engine refusal markers (`relocate:` / `unload:` inside the Corrupt
+/// payload — Display prefixes `corrupt data: `) are operator input
+/// problems (400); anything else is a server fault (500).
+fn engine_err(e: hakodb::error::HakoError) -> AppError {
+    let m = e.to_string();
+    if m.contains("relocate:") || m.contains("unload:") {
+        AppError::BadRequest(m)
+    } else {
+        AppError::Internal(m)
+    }
+}
+
+fn json_to_value(v: &serde_json::Value) -> hakodb::document::value::Value {    use hakodb::document::value::Value as HV;
     match v {
         serde_json::Value::Null => HV::Null,
         serde_json::Value::Bool(b) => HV::Bool(*b),
@@ -533,6 +544,40 @@ impl Database for HakoDb {
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
         Ok(prev)
+    }
+
+    /// Engine refusal strings (`relocate: …`, `unload: …`) are operator
+    /// input problems (400); anything else is a server fault (500).
+    async fn relocate(&self, src: &str, dst: &str, ids: &[String]) -> Result<(Vec<String>, Vec<String>), AppError> {
+        let db = self.inner.clone();
+        let (s, d, i) = (src.to_string(), dst.to_string(), ids.to_vec());
+        tokio::task::spawn_blocking(move || {
+            db.relocate_docs(&s, &d, &i)
+                .map(|r| (r.moved, r.missing))
+                .map_err(engine_err)
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn load_collection(&self, collection: &str) -> Result<(), AppError> {
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        tokio::task::spawn_blocking(move || db.load_collection(&c).map_err(engine_err))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn unload_collection(&self, collection: &str) -> Result<(), AppError> {
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        tokio::task::spawn_blocking(move || db.unload_collection(&c).map_err(engine_err))
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn unloaded_collections(&self) -> Result<Vec<String>, AppError> {
+        Ok(self.inner.unloaded_lazy_collections())
     }
 
     async fn sum(&self, collection: &str, field: &str, q: &QueryOptions) -> Result<f64, AppError> {

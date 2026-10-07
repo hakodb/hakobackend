@@ -276,3 +276,28 @@ today's behavior exactly.
 - Unknown-db auto-create: SQL drivers (operator pre-creates or a
   follow-up CREATEDB convenience); cluster names must pre-exist
   (explicit registry, reload to add).
+
+## 17. Archive moves + lazy residency (issue #21 A)
+
+Hako-driver only; every other driver answers 400 (`driver has no …
+support`). `?db=` applies (dotted policy namespace, same as §16).
+
+- `POST /api/relocate {src, dst, ids[]}` → `{moved[], missing[]}`.
+  Timestamp-preserving put at dst first, fresh tombstone at src;
+  retry with the same ids is idempotent. Policy per id: src needs
+  Get+Delete, dst needs Create. Refusals are 400 (same-side,
+  engine excluded/local-only/lazy-unloaded sides, unload of
+  non-lazy, ids over the batch cap) or 403 (`__` prefix, policy
+  deny). Engine-excluded sides can never launder data onto the mesh
+  (see hakodb `relocate_refuses_excluded_sides`).
+- `POST /api/collections/load {collection}` → `{ok}`. Opens +
+  replays + backfills a (usually lazy archive) collection; no-op
+  when already loaded. Get gate.
+- `POST /api/collections/unload {collection}` → `{ok}`. Flushes
+  and evicts one lazy collection (refuses non-lazy with 400).
+  Get gate. Data stays on disk; next touch reloads.
+- `GET /api/collections/unloaded` → `[names]`. Archive-group
+  collections present but not loaded. Names only, ungated like
+  the collection list. Static paths win over
+  `/api/collections/{*path}`, so alias targets reach these
+  exactly like direct calls.

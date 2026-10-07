@@ -696,6 +696,13 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/indexes", post(index_create).get(index_list).delete(index_drop))
         .route("/api/batch", post(batch))
         .route("/api/transaction", post(transaction))
+        // Archive moves + lazy residency (issue #21): static paths win
+        // over /api/collections/{*path}, so alias targets reaching the
+        // bare table hit these exactly like direct calls.
+        .route("/api/relocate", post(relocate))
+        .route("/api/collections/load", post(collection_load))
+        .route("/api/collections/unload", post(collection_unload))
+        .route("/api/collections/unloaded", get(unloaded_list))
         // Managed files (issue #11): bytes on disk, metadata docs in the
         // addressed collection. In the bare table too, so /api/alias/*
         // targets reach them exactly like direct calls.
@@ -3534,6 +3541,184 @@ async fn transaction(
     }
 }
 
+/// Move docs between collections (archive/restore).
+/// POST /api/relocate {src, dst, ids[]} -> {moved[], missing[]}.
+/// Policy per id: src needs Get+Delete, dst needs Create (moved docs are
+/// new homes; overwrite is operator-explicit). The engine re-checks its
+/// own gate (sync-excluded/local-only/lazy-unloaded → 400, never 500).
+async fn relocate(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let src = match body.get("src").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return err(StatusCode::BAD_REQUEST, "body requires {src, dst, ids[]}"),
+    };
+    let dst = match body.get("dst").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return err(StatusCode::BAD_REQUEST, "body requires {src, dst, ids[]}"),
+    };
+    let ids: Vec<String> = body
+        .get("ids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|x| x.to_string())).collect())
+        .unwrap_or_default();
+    let max_ops = s.max_batch_ops.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    if ids.len() > max_ops {
+        return err(StatusCode::BAD_REQUEST, format!("too many ids (max {max_ops})"));
+    }
+    for col in [&src, &dst] {
+        if denied_internal(col).is_some() {
+            return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+        }
+        if valid_names(col, None).is_some() {
+            return err(StatusCode::BAD_REQUEST, "invalid collection name");
+        }
+    }
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let (stored_src, stored_dst) = (stored(&src), stored(&dst));
+    let (pol_src, pol_dst) = (dotted(&dbname, &src), dotted(&dbname, &dst));
+    for id in &ids {
+        if valid_names(&src, Some(id)).is_some() {
+            return err(StatusCode::BAD_REQUEST, "invalid doc id");
+        }
+        // ponytail: shell doc for the allow check (same as single-doc
+        // reads: slots only inspect the id, no decode needed).
+        let shell = Doc { id: id.clone(), data: Default::default() };
+        if !hot.policy.allow(auth.as_ref(), &pol_src, Method::Get, Some(&shell)) {
+            return forbidden();
+        }
+        if !hot.policy.allow(auth.as_ref(), &pol_src, Method::Delete, Some(&shell)) {
+            return forbidden();
+        }
+        if !hot.policy.allow(auth.as_ref(), &pol_dst, Method::Create, Some(&shell)) {
+            return forbidden();
+        }
+    }
+    match dbh.relocate(&stored_src, &stored_dst, &ids).await {
+        Ok((moved, missing)) => Json(serde_json::json!({ "moved": moved, "missing": missing })).into_response(),
+        Err(e) => driver_err(e),
+    }
+}
+
+/// Explicit load of one (usually lazy archive) collection.
+/// POST /api/collections/load {collection} -> {ok}. Get gate: residency
+/// management needs no more trust than reading the collection.
+async fn collection_load(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    residency_op(s, auth, q, body, false).await
+}
+
+/// Explicit evict of one lazy collection (refuses non-lazy).
+/// POST /api/collections/unload {collection} -> {ok}. Get gate.
+async fn collection_unload(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    residency_op(s, auth, q, body, true).await
+}
+
+async fn residency_op(
+    s: AppState,
+    auth: Option<AuthContext>,
+    q: HashMap<String, String>,
+    body: serde_json::Value,
+    unload: bool,
+) -> Response {
+    if unload {
+        if let Some(r) = deny_if_read_only(&s) {
+            return r;
+        }
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let name = match body.get("collection").and_then(|v| v.as_str()) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return err(StatusCode::BAD_REQUEST, "body requires {collection}"),
+    };
+    if denied_internal(&name).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if valid_names(&name, None).is_some() {
+        return err(StatusCode::BAD_REQUEST, "invalid collection name");
+    }
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let (stored_col, pol) = (stored(&name), dotted(&dbname, &name));
+    let shell = Doc { id: String::new(), data: Default::default() };
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&shell)) {
+        return forbidden();
+    }
+    let r = if unload {
+        dbh.unload_collection(&stored_col).await
+    } else {
+        dbh.load_collection(&stored_col).await
+    };
+    match r {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => driver_err(e),
+    }
+}
+
+/// Archive-group collections present but not loaded.
+/// GET /api/collections/unloaded -> [names]. No gate beyond routing
+/// (names only, same visibility as the collection list).
+async fn unloaded_list(
+    State(s): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match dbh.unloaded_collections().await {
+        Ok(c) => Json(c).into_response(),
+        Err(_) => err_internal(),
+    }
+}
+
+/// Driver errors to HTTP: refusal-style BadRequest stays 400 (never
+/// 500), permission stays 403, everything else is a server fault.
+fn driver_err(e: hakobackend_core::AppError) -> Response {
+    use hakobackend_core::AppError::*;
+    match e {
+        BadRequest(m) => err(StatusCode::BAD_REQUEST, m),
+        PermissionDenied => forbidden(),
+        NotFound => err(StatusCode::NOT_FOUND, "not found"),
+        AlreadyExists => err(StatusCode::BAD_REQUEST, "already exists"),
+        Internal(m) => err(StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
+}
+
 // --- Collection group (legacy server.ts:325-362 parity) ---
 //
 // `GET /api/collectionGroup/:name`: every collection whose name matches the
@@ -4885,6 +5070,89 @@ mod tests {
         let (s, _, b) = call(app.clone(), "POST", "/api/transaction", Some(two)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
+    }
+
+    /// Archive moves + lazy residency over HTTP (issue #21 A): relocate
+    /// roundtrip + refusals, load/unload/unloaded, and the non-hako
+    /// rejection. Hako-backed (sqlite rejects archive ops by design).
+    #[tokio::test]
+    async fn relocate_and_residency_end_to_end() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_reloc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, "[defaults]\nread = \"public\"\nwrite = \"public\"\n").unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.join("h.ub").to_string_lossy().as_ref()).unwrap());
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        let app = build_router(st.clone(), vec![], false);
+        // Seed, move, verify both sides.
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m/a", Some(serde_json::json!({"z": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = call(app.clone(), "POST", "/api/relocate",
+            Some(serde_json::json!({"src": "m", "dst": "m2", "ids": ["a", "ghost"]}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(v["moved"], serde_json::json!(["a"]));
+        assert_eq!(v["missing"], serde_json::json!(["ghost"]));
+        let (s, _) = call(app.clone(), "GET", "/api/collections/m/a", None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m2/a", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"z\":1"));
+        // Refusals: same-side 400, reserved prefix 403, oversize 400.
+        let (s, _) = call(app.clone(), "POST", "/api/relocate",
+            Some(serde_json::json!({"src": "m", "dst": "m", "ids": ["a"]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/relocate",
+            Some(serde_json::json!({"src": "__x", "dst": "m", "ids": ["a"]}))).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        // Residency: load ok, unload of non-lazy 400, unloaded list empty.
+        let (s, b) = call(app.clone(), "POST", "/api/collections/load",
+            Some(serde_json::json!({"collection": "m2"}))).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"ok\":true"));
+        let (s, _) = call(app.clone(), "POST", "/api/collections/unload",
+            Some(serde_json::json!({"collection": "m2"}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, b) = call(app.clone(), "GET", "/api/collections/unloaded", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&b).unwrap(), serde_json::json!([]));
+        // Non-hako driver rejects clearly (sqlite state).
+        let (st2, _raw2) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "reloc").await;
+        let app2 = build_router(st2.clone(), vec![], false);
+        let (s, b) = call(app2.clone(), "POST", "/api/relocate",
+            Some(serde_json::json!({"src": "m", "dst": "m2", "ids": ["a"]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&b).contains("no relocate support"));
     }
 
     /// Files end-to-end (issue #11): upload -> metadata -> bytes ->
