@@ -221,6 +221,18 @@ impl<D: Database + Send + Sync> Database for TtlDb<D> {
     async fn run_transaction(&self, ops: Vec<super::TxOp>) -> Result<Vec<super::TxOut>, AppError> {
         self.inner.run_transaction(ops).await
     }
+    async fn relocate(&self, src: &str, dst: &str, ids: &[String]) -> Result<(Vec<String>, Vec<String>), AppError> {
+        self.inner.relocate(src, dst, ids).await
+    }
+    async fn load_collection(&self, collection: &str) -> Result<(), AppError> {
+        self.inner.load_collection(collection).await
+    }
+    async fn unload_collection(&self, collection: &str) -> Result<(), AppError> {
+        self.inner.unload_collection(collection).await
+    }
+    async fn unloaded_collections(&self) -> Result<Vec<String>, AppError> {
+        self.inner.unloaded_collections().await
+    }
     async fn sweep_expired(&self, per_collection_cap: usize) -> Result<(usize, usize), AppError> {
         // Past our own filter: the inner list still sees the dead.
         self.inner.sweep_expired(per_collection_cap).await
