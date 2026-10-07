@@ -2506,6 +2506,151 @@ impl tower_http::compression::predicate::Predicate for NoBinary {
     }
 }
 
+/// Dotted descent into a doc data map: ["a","b"] on {a:{b:1}} → Some(1).
+/// Only maps are descended (arrays are values, never traversed); a
+/// missing key or a non-map mid-segment resolves to None. Shared by
+/// field-path GET and options.fields stripping.
+fn descend_json<'a>(
+    data: &'a std::collections::HashMap<String, serde_json::Value>,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut cur = data.get(path.first()?)?;
+    for seg in &path[1..] {
+        match cur {
+            serde_json::Value::Object(m) => cur = m.get(seg)?,
+            _ => return None,
+        }
+    }
+    Some(cur)
+}
+
+/// Keep only the listed fields, rebuilding dotted nesting (["a.b"] on
+/// {a:{b:1,c:2},z:3} → {a:{b:1}}). Empty list = full doc (backward
+/// compatible). Missing fields are omitted (engine `select`
+/// semantics); `id` lives on the envelope and is never stripped.
+fn project_fields(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+    fields: &[String],
+) -> std::collections::HashMap<String, serde_json::Value> {
+    if fields.is_empty() {
+        return data.clone();
+    }
+    let mut out: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    for f in fields {
+        let segs: Vec<String> = f.split('.').map(|x| x.to_string()).collect();
+        if segs.iter().any(|x| x.is_empty()) {
+            continue;
+        }
+        let Some(v) = descend_json(data, &segs) else { continue };
+        if segs.len() == 1 {
+            out.insert(segs[0].clone(), v.clone());
+            continue;
+        }
+        // ponytail: a colliding scalar is replaced by the object the
+        // deeper field needs (last field wins the shape).
+        let mut cur = out
+            .entry(segs[0].clone())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        for seg in &segs[1..segs.len() - 1] {
+            if !cur.is_object() {
+                *cur = serde_json::Value::Object(serde_json::Map::new());
+            }
+            cur = cur
+                .as_object_mut()
+                .expect("just ensured object")
+                .entry(seg.clone())
+                .or_insert(serde_json::Value::Object(serde_json::Map::new()));
+        }
+        if !cur.is_object() {
+            *cur = serde_json::Value::Object(serde_json::Map::new());
+        }
+        cur.as_object_mut()
+            .expect("just ensured object")
+            .insert(segs.last().expect("nonempty").clone(), v.clone());
+    }
+    out
+}
+
+/// Field-path GET (issue #21 B): paths try as doc + dotted field
+/// descent before legacy handling. Even doc-boundary depths,
+/// shallowest first (2, 4, … below `max_depth`): the first boundary
+/// whose doc exists AND whose field path resolves wins. Odd-segment
+/// callers pass `segs.len()` (pure projection attempt); even-segment
+/// callers pass `segs.len() - 1` and only on exact-doc miss (legacy
+/// doc GETs keep absolute priority). Anything unresolved returns None
+/// and the caller falls back to legacy behavior — subcollection paths
+/// keep working byte-for-byte, and the only behavior change is the
+/// rare both-present case (a present field beats a same-named
+/// subcollection list, documented).
+/// AuthZ mirrors single-doc reads on the winning doc: shell pre-check
+/// per boundary (fail closed), then full-doc Get + field-conds on the
+/// complete data (authorize on full context, disclose the subset).
+/// ETag rides the whole-doc version (projection is a pure function of
+/// versioned bytes); the coalescer overlay applies before projecting.
+async fn field_path_get(
+    s: &AppState,
+    hot: &Hot,
+    dbh: std::sync::Arc<dyn hakobackend_core::Database>,
+    auth: Option<AuthContext>,
+    dbname: &str,
+    raw_path: &str,
+    headers: &HeaderMap,
+    max_depth: usize,
+) -> Option<Response> {
+    let clean = raw_path.trim_matches('/');
+    let segs: Vec<&str> = clean.split('/').filter(|x| !x.is_empty()).collect();
+    if segs.len() < 3 {
+        return None;
+    }
+    let mut depth = 2usize;
+    while depth < max_depth {
+        let (collpath, id, fields) = (
+            segs[..depth - 1].join("/"),
+            segs[depth - 1].to_string(),
+            segs[depth..].iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        );
+        let pol = dotted(dbname, &collpath);
+        let shell = Doc { id: id.clone(), data: Default::default() };
+        if !hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&shell)) {
+            return Some(forbidden());
+        }
+        let stored_coll = stored(&collpath);
+        let fetched = dbh.get(&stored_coll, &id).await.ok()?;
+        if let Some(mut doc) = fetched {
+            // Whole-doc gates on the complete data (same as the list
+            // per-doc filter), then disclose the projected subset.
+            if !hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&doc)) {
+                return Some(forbidden());
+            }
+            if !hot.policy.allow_fields(auth.as_ref(), &pol, Method::Get, &doc.data) {
+                return Some(forbidden());
+            }
+            // Coalescer overlay (same keying as the Document branch).
+            let ckey = dotted(dbname, &stored_coll);
+            if !s.coalescer.is_empty() && s.coalescer.has(&ckey, &id) {
+                if let Some(data) = s.coalescer.overlay(&ckey, &id, Some(doc.data.clone())) {
+                    doc.data = data;
+                }
+            }
+            if let Some(v) = descend_json(&doc.data, &fields) {
+                // ETag on the whole-doc version (see fn docs).
+                if let Ok(Some(ver)) = dbh.doc_version(&stored_coll, &id).await {
+                    if etag_match(headers, ver) {
+                        return Some(not_modified(ver));
+                    }
+                }
+                return Some(Json(v.clone()).into_response());
+            }
+            // Field missing here: keep probing deeper doc-boundaries
+            // (a subcollection doc further down may resolve); only when
+            // no boundary resolves does the caller fall back to the
+            // legacy collection list.
+        }
+        depth += 2;
+    }
+    None
+}
+
 async fn get_or_list(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -2551,6 +2696,20 @@ async fn get_or_list(
             let shell = Doc { id: id.clone(), data: Default::default() };
             if !hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(&shell)) {
                 return forbidden();
+            }
+            // Field-path fallback (issue #21 B): on 4+-segment paths whose
+            // exact doc is missing, retry as doc + dotted field descent
+            // (nested projection under subcollection docs). Legacy doc
+            // GETs keep absolute priority — this only runs on miss.
+            {
+                let segs_now: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+                if segs_now.len() >= 4 && segs_now.len() % 2 == 0
+                    && dbh.get(&stored, &id).await.ok().flatten().is_none()
+                {
+                    if let Some(r) = field_path_get(&s, &hot, dbh.clone(), auth.clone(), &dbname, &path, &headers, segs_now.len() - 1).await {
+                        return r;
+                    }
+                }
             }
             if samp {
                 wstats::add(&wstats::G[3], ws_t.elapsed().as_nanos() as u64);
@@ -2612,6 +2771,15 @@ async fn get_or_list(
             if let Some(r) = valid_names(&collection, None) {
                 return r;
             }
+            // Field-path GET (issue #21 B): odd-segment paths (3+) first
+            // try as doc + dotted field descent, shallowest even
+            // doc-boundary first. A resolving field wins; anything else
+            // falls through to the legacy collection list below, so
+            // subcollection listings keep working byte-for-byte.
+            let segs_now: Vec<&str> = path.trim_matches('/').split('/').filter(|x| !x.is_empty()).collect();
+            if let Some(r) = field_path_get(&s, &hot, dbh.clone(), auth.clone(), &dbname, &path, &headers, segs_now.len()).await {
+                return r;
+            }
             let stored = stored(&collection);
             let pol = dotted(&dbname, &collection);
             match parse_options(&q) {
@@ -2629,13 +2797,23 @@ async fn get_or_list(
                     // Policy sees logical names: one file serves all tenants.
                     Ok(docs) => {
                         if samp {
-                            wstats::add(&wstats::L[1], ws_t.elapsed().as_nanos() as u64);
-                            wstats::add(&wstats::S[shape].eng, ws_t.elapsed().as_nanos() as u64);
+                            wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
+                            wstats::add(&wstats::S[shape].filter, ws_t.elapsed().as_nanos() as u64);
                             ws_t = std::time::Instant::now();
                         }
+                        // ponytail: authorize on full docs first (field-conds
+                        // see complete context), then disclose the projected
+                        // subset. Server-side for all drivers alike; engine
+                        // pushdown stays a follow-up (policy-aware planning).
                         let visible: Vec<_> = docs
                             .into_iter()
                             .filter(|d| hot.policy.allow(auth.as_ref(), &pol, Method::Get, Some(d)))
+                            .map(|mut d| {
+                                if !opts.fields.is_empty() {
+                                    d.data = project_fields(&d.data, &opts.fields);
+                                }
+                                d
+                            })
                             .collect();
                         if samp {
                             wstats::add(&wstats::L[2], ws_t.elapsed().as_nanos() as u64);
@@ -5070,6 +5248,84 @@ mod tests {
         let (s, _, b) = call(app.clone(), "POST", "/api/transaction", Some(two)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(String::from_utf8_lossy(&b).contains("too many ops (max 1)"));
+    }
+
+    /// Field-path GET + options.fields (issue #21 B): single and nested
+    /// projection, missing-field legacy fallback, subcollection listing
+    /// preserved, both-present field-wins, list stripping (incl. dotted).
+    #[tokio::test]
+    async fn projection_paths_and_options_fields() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "proj").await;
+        let app = build_router(st.clone(), vec![], false);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m/a",
+            Some(serde_json::json!({"z": 1, "n": {"x": 5, "y": 6}, "drop": true}))).await;
+        assert_eq!(s, StatusCode::OK);
+        // Single + nested field projection (raw JSON values).
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a/z", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&b), "1");
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a/n/x", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&b), "5");
+        // Missing field, no subcollection: legacy empty list.
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a/nope", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&b), "[]");
+        // Subcollection listing preserved (doc has no such field).
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m/a/sub/d1",
+            Some(serde_json::json!({"k": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m/a/sub", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"d1\""));
+        // Both present: present field wins over the subcollection list.
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m2/b",
+            Some(serde_json::json!({"sub": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/m2/b/sub/d1",
+            Some(serde_json::json!({"k": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = call(app.clone(), "GET", "/api/collections/m2/b/sub", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(String::from_utf8_lossy(&b), "1");
+        // options.fields strips lists (top-level + dotted); [] = full.
+        let (s, b) = call(app.clone(), "GET", &reencode_query("/api/collections/m?options={\"fields\":[\"z\"]}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let text = String::from_utf8_lossy(&b).to_string();
+        assert!(text.contains("\"z\":1"));
+        assert!(!text.contains("\"drop\""));
+        assert!(!text.contains("\"n\":"));
+        let (s, b) = call(app.clone(), "GET", &reencode_query("/api/collections/m?options={\"fields\":[\"n.x\"]}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        let text = String::from_utf8_lossy(&b).to_string();
+        assert!(text.contains("\"x\":5"));
+        assert!(!text.contains("\"y\":6"));
+        let (s, b) = call(app.clone(), "GET", &reencode_query("/api/collections/m?options={\"fields\":[]}"), None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"drop\":true"));
     }
 
     /// Archive moves + lazy residency over HTTP (issue #21 A): relocate
