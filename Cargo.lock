@@ -1443,7 +1443,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1480,9 +1480,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "341eecc06b51b6336cf81f2a70fc22572c0c31694d4ce5eaa7e58d891daf65a8"
+checksum = "b53f69e66f505f95caf2acd7bb16f81ba056d27c72520d32e72bc79c18f5f7a3"
 dependencies = [
  "hakodb",
  "serde_json",
@@ -1491,9 +1491,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac55d33a720196fc80ec8000e08ea4d69b75b7d71dba24db4eb224cb25567944"
+checksum = "9292e0a73a545fa62dba9f2c1744b0dd73625806995aa6c3015ea87105d1d4dd"
 dependencies = [
  "bincode",
  "cbindgen",
