@@ -3880,7 +3880,7 @@ async fn unloaded_list(
     };
     match dbh.unloaded_collections().await {
         Ok(c) => Json(c).into_response(),
-        Err(_) => err_internal(),
+        Err(e) => driver_err(e),
     }
 }
 
@@ -5473,6 +5473,10 @@ mod tests {
             Some(serde_json::json!({"src": "m", "dst": "m2", "ids": ["a"]}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
         assert!(String::from_utf8_lossy(&b).contains("no relocate support"));
+        // Non-hako residency probes reject clearly too (400, never 500).
+        let (s, b) = call(app2.clone(), "GET", "/api/collections/unloaded", None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&b).contains("no lazy-collection support"));
     }
 
     /// Files end-to-end (issue #11): upload -> metadata -> bytes ->
