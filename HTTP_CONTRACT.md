@@ -301,3 +301,29 @@ support`). `?db=` applies (dotted policy namespace, same as §16).
   the collection list. Static paths win over
   `/api/collections/{*path}`, so alias targets reach these
   exactly like direct calls.
+
+## 18. Projection (issue #21 B)
+
+Field reads without fetching whole docs. Two shapes, one rule:
+authorize on the full doc, disclose the subset.
+
+- Field-path GET: `.../coll/id/field` (and deeper
+  `.../f1/f2/...` dotted descent, arrays are values, never
+  traversed) returns the raw JSON value. Odd-segment paths (3+)
+  try doc + descent first, shallowest even doc-boundary first; a
+  resolving field wins. Even-segment paths keep exact-doc
+  priority and retry as field descent only on miss (nested
+  projection under subcollection docs). Anything unresolved
+  falls back to legacy behavior (collection list or 404) — so
+  the only behavior change is the rare both-present case, where
+  a present field beats a same-named subcollection list.
+- List projection: `?options={"fields":["a","b.c"]}` strips
+  each row after policy filtering (top-level retain, dotted
+  paths rebuild their nesting, missing fields omitted,
+  `[]` = full doc, `id` envelope always present). Server-side
+  on all drivers alike; engine `select` pushdown stays a
+  follow-up (it would change what policy field-conds see).
+- ETag rides the whole-doc version (projection is a pure
+  function of versioned bytes). The coalescer overlay applies
+  before projecting, so read-your-write holds inside the
+  window.
