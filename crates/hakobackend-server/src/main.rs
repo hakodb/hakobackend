@@ -124,6 +124,9 @@ struct AppState {
     read_only: Arc<std::sync::atomic::AtomicBool>,
     /// Batch/transaction op cap (larger payloads 400). Atomic: reload swaps it.
     max_batch_ops: Arc<std::sync::atomic::AtomicU64>,
+    /// Readiness verdict cache (see ready()): LB probes poll constantly
+    /// and the check walks storage; 1s TTL bounds failover delay.
+    ready_cache: Arc<std::sync::Mutex<Option<(std::time::Instant, bool)>>>,
     /// Managed-file config (issue #11). Arc: heap data, not per-connection
     /// copies. Boot-time like body_limit (reload ignores it).
     files: Arc<files::FileConf>,
@@ -799,8 +802,28 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
     .with_state(state)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Worker count: HAKO_WORKERS wins, otherwise the tokio default
+    // (logical CPUs — unchanged behavior). Deliberately no physical-core
+    // detection: the measured optimum is box- and workload-specific
+    // (external audit on 4C/8T: 6 beats both 4 and 8), so this only
+    // exposes the knob and logs the effective choice at boot.
+    let workers = std::env::var("HAKO_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0);
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(n) = workers {
+        eprintln!("[ub] tokio workers: {n} (HAKO_WORKERS)");
+        builder.worker_threads(n);
+    }
+    builder
+        .enable_all()
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Args::parse();
     if cli.print_default_config {
         println!("{DEFAULT_CONFIG_TEMPLATE}");
@@ -919,6 +942,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         local_register: cfg.local_register,
         read_only: Arc::new(std::sync::atomic::AtomicBool::new(cfg.read_only)),
         max_batch_ops: Arc::new(std::sync::atomic::AtomicU64::new(cfg.max_batch_ops)),
+        ready_cache: Arc::new(std::sync::Mutex::new(None)),
         files: Arc::new(files::FileConf::from_cfg(
             cfg.file_dir.clone(),
             cfg.file_max_mb,
@@ -1918,9 +1942,33 @@ async fn health() -> impl IntoResponse {
 /// CORS allowlist. health stays header-clean (hottest path, non-browser
 /// probes only).
 async fn ready(State(s): State<AppState>) -> impl IntoResponse {
-    let body = match s.hot().await.db.list_collections().await {
-        Ok(_) => Json(serde_json::json!({ "ready": true })).into_response(),
-        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    // ponytail: readiness probes poll constantly (every LB/K8s second)
+    // and the check walks storage — an external audit measured 514% CPU
+    // at 142k rps on readdir-per-probe. Cache the verdict 1s: failover
+    // delay impact is bounded by the TTL, probes stay truthful within it.
+    const READY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    let hit: Option<bool> = s
+        .ready_cache
+        .lock()
+        .ok()
+        .and_then(|g| match g.as_ref() {
+            Some((t, ok)) if t.elapsed() < READY_CACHE_TTL => Some(*ok),
+            _ => None,
+        });
+    let ok = match hit {
+        Some(ok) => ok,
+        None => {
+            let ok = s.hot().await.db.list_collections().await.is_ok();
+            if let Ok(mut g) = s.ready_cache.lock() {
+                *g = Some((std::time::Instant::now(), ok));
+            }
+            ok
+        }
+    };
+    let body = if ok {
+        Json(serde_json::json!({ "ready": true })).into_response()
+    } else {
+        err(StatusCode::SERVICE_UNAVAILABLE, "not ready")
     };
     (
         [(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")],
@@ -5314,6 +5362,42 @@ mod tests {
         assert!(String::from_utf8_lossy(&b).contains("\"o1\""));
     }
 
+    /// Readiness cache (external audit): LB-speed probes must not walk
+    /// storage per request; verdict cached 1s, still truthful within it.
+    #[tokio::test]
+    async fn ready_cache_serves_and_caches() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+        ) -> (StatusCode, Vec<u8>) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "ready").await;
+        let app = build_router(st.clone(), vec![], false);
+        assert!(st.ready_cache.lock().unwrap().is_none());
+        let (s, b) = call(app.clone(), "GET", "/api/ready").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"ready\":true"));
+        assert!(st.ready_cache.lock().unwrap().is_some());
+        // Second probe inside the TTL: same verdict, no storage walk.
+        let (s, b) = call(app.clone(), "GET", "/api/ready").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(String::from_utf8_lossy(&b).contains("\"ready\":true"));
+    }
+
     /// Field-path GET + options.fields (issue #21 B): single and nested
     /// projection, missing-field legacy fallback, subcollection listing
     /// preserved, both-present field-wins, list stripping (incl. dotted).
@@ -6185,6 +6269,7 @@ mod tests {
             local_register: true,
             read_only: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             max_batch_ops: Arc::new(std::sync::atomic::AtomicU64::new(1000)),
+            ready_cache: Arc::new(std::sync::Mutex::new(None)),
             rt_caps: Arc::new(std::sync::RwLock::new(realtime::RtCaps::default())),
             local_token_response: false,
             local_cookies: true,
