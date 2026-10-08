@@ -67,6 +67,12 @@ So: packet → worker task → (blocking pool for hako ops) → inline emit
 - HakoDB engine benches (`benches/write_path.rs`, criterion,
   per-durability, small/blob docs) measure the ENGINE, not the gateway;
   gateway adds ~400µs fixed cost per request on top.
+- Bench numbers assume limiters off (`--limit-global 0` bypass by
+  design) and public policy: the 600/min/IP default is protection,
+  not capacity — any load test through it measures the limiter.
+- Tokio workers: `#[tokio::main]` default (logical CPUs) is kept;
+  `HAKO_WORKERS` overrides (an external 4C/8T audit measured 6 beating
+  both 4 and 8 — optimum is box-specific, so set explicitly).
 
 ## 6. Levers, measured (not theorized)
 
