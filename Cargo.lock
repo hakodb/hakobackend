@@ -939,7 +939,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1408,7 +1408,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -1445,9 +1445,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b53f69e66f505f95caf2acd7bb16f81ba056d27c72520d32e72bc79c18f5f7a3"
+checksum = "e1c457cb695578b3425f0febafd0cf145f9520418c3662d296a7c161e56038de"
 dependencies = [
  "hakodb",
  "serde_json",
@@ -1456,9 +1456,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.12.0"
+version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9292e0a73a545fa62dba9f2c1744b0dd73625806995aa6c3015ea87105d1d4dd"
+checksum = "49eec16087b987761777723d400bf8b72fa09698ac07801fa84ae9c1fc4493a9"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -2558,7 +2558,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2870,7 +2870,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3482,10 +3482,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
