@@ -80,6 +80,11 @@ Endpoints (same as the legacy backend):
 - `GET /api/files/{coll}/{id}[/{field}]` — bytes (ETag, single-range 206);
   `?sign=<secs>` mints a signed URL, `?exp=&sig=` consumes it
 - `DELETE /api/files/{coll}/{id}[/{field}]` — metadata (bytes via sweeper)
+- Archive: `POST /api/relocate {src, dst, ids[]}` (moved/missing report;
+  refuses excluded sides); `POST /api/collections/{col}/load|unload`;
+  `GET /api/collections/unloaded` (lazy collections out of the index)
+- Field-path read: `GET /api/collections/{*path}` with dotted segments
+  resolves into the doc; `?options={"fields":[...]}` projects the output
 - TLS: `--tls-cert/--tls-key` (HSTS automatic); DPoP scheme follows
 
 ## Build notes
