@@ -519,6 +519,7 @@ impl Database for TestDb {
             supports_unique: false,
             supports_named_index: false,
             supports_native_aggregation: false,
+            supports_vector: false,
         }
     }
     async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
@@ -767,7 +768,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Database for FakeDb {
         fn capabilities(&self) -> Capabilities {
-            Capabilities { driver: "fake", supports_watch: false, supports_transactions: false, supports_composite: false, supports_fts: false, supports_drop_index: false, supports_unique: false, supports_named_index: false, supports_native_aggregation: false }
+            Capabilities { driver: "fake", supports_watch: false, supports_transactions: false, supports_composite: false, supports_fts: false, supports_drop_index: false, supports_unique: false, supports_named_index: false, supports_native_aggregation: false, supports_vector: false }
         }
         async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
             Ok(())

@@ -15,6 +15,10 @@ pub struct HakoDb {
     /// Unique-enforced fields per collection (from `create_index(unique)`).
     /// std mutex: read inside spawn_blocking threads where await is illegal.
     unique: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    /// Vector-indexed (field, dim) per collection (from `create_vector_index`
+    /// + engine defs at open). Write path encodes matching float arrays to
+    /// Binary; the len==dim rule keeps Binary round-trips (dim*4 u8s) out.
+    vector_fields: std::sync::Mutex<std::collections::HashMap<String, Vec<(String, u32)>>>,
     /// Socket_sync peering (hako driver only): held so serve/dial tasks
     /// outlive enablement. None = yesterday's standalone default.
     #[cfg(unix)]
@@ -57,11 +61,30 @@ impl HakoDb {
             inner: db,
             channels: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             unique: std::sync::Mutex::new(std::collections::HashMap::new()),
+            vector_fields: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(unix)]
             sync: std::sync::Mutex::new(None),
         };
         this.load_unique_registry();
+        this.load_vector_registry();
         this
+    }
+
+    /// Vector defs survive restarts (engine snapshot) but the in-RAM map
+    /// doesn't — rebuild it at open so writes keep encoding correctly.
+    fn load_vector_registry(&self) {
+        let list = self.inner.list_indexes(None);
+        let mut map = self.vector_fields.lock().unwrap();
+        for (coll, defs) in &list.vector {
+            map.insert(
+                coll.clone(),
+                defs.iter().map(|d| (d.field.clone(), d.dim)).collect(),
+            );
+        }
+    }
+
+    fn vector_fields(&self, collection: &str) -> Vec<(String, u32)> {
+        self.vector_fields.lock().unwrap().get(collection).cloned().unwrap_or_default()
     }
 
     /// Flush all shards to disk (WAL + segments). Sync engine call —
@@ -230,9 +253,29 @@ impl HakoDb {
     }
 
     fn to_hako(doc: &Doc) -> hakodb::document::hako_doc::HakoDoc {
+        Self::to_hako_vector(doc, &[])
+    }
+
+    /// Doc to engine doc, encoding float arrays on vector-indexed fields
+    /// as Binary LE-f32 (the only shape the vector hook indexes).
+    /// Only arrays of exactly the def dim convert — Binary round-trips
+    /// (dim*4 u8s) and mistyped data stay untouched and simply don't index.
+    fn to_hako_vector(doc: &Doc, vector_fields: &[(String, u32)]) -> hakodb::document::hako_doc::HakoDoc {
         let mut hako = hakodb::document::hako_doc::HakoDoc::default();
         for (k, v) in &doc.data {
             hako.insert(k, json_to_value(v));
+        }
+        for (field, dim) in vector_fields {
+            let convert = match doc.data.get(field) {
+                Some(serde_json::Value::Array(items)) if items.len() as u32 == *dim => items
+                    .iter()
+                    .map(|n| n.as_f64().map(|f| f as f32))
+                    .collect::<Option<Vec<_>>>(),
+                _ => None,
+            };
+            if let Some(vec) = convert {
+                hako.insert(field, hakodb::document::value::Value::Binary(hakodb::index::vector::encode_f32s(&vec)));
+            }
         }
         hako
     }
@@ -366,6 +409,7 @@ impl Database for HakoDb {
             supports_named_index: false,
             // Native count/sum/avg (index/sweep, no doc fetch).
             supports_native_aggregation: true,
+            supports_vector: true,
         }
     }
 
@@ -523,7 +567,8 @@ impl Database for HakoDb {
         };
         let merged = Doc { id: id.to_string(), data };
         let db = self.inner.clone();
-        let hako = Self::to_hako(&merged);
+        let vector_fields = self.vector_fields(collection);
+        let hako = Self::to_hako_vector(&merged, &vector_fields);
         let (c, i) = (collection.to_string(), id.to_string());
         tokio::task::spawn_blocking(move || {
             db.put(&c, &i, &hako)
@@ -761,7 +806,91 @@ impl Database for HakoDb {
                         kind: hakobackend_core::IndexKind::FullText,
                     })
                 }
+                hakobackend_core::IndexKind::Vector => {
+                    Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()))
+                }
             }
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn create_vector_index(&self, collection: &str, spec: &hakobackend_core::VectorIndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
+        // Engine range first (400, not 500): dim is operator input.
+        if spec.dim == 0 || spec.dim > 4096 {
+            return Err(AppError::BadRequest(format!("vector dim {} out of range 1..=4096", spec.dim)));
+        }
+        if spec.field.is_empty() {
+            return Err(AppError::BadRequest("vector index needs a field".into()));
+        }
+        let metric = match spec.metric {
+            hakobackend_core::VectorMetric::Cosine => hakodb::index::vector::Metric::Cosine,
+            hakobackend_core::VectorMetric::L2 => hakodb::index::vector::Metric::L2,
+        };
+        let db = self.inner.clone();
+        let (c, f) = (collection.to_string(), spec.field.clone());
+        let (dim, m) = (spec.dim, metric);
+        tokio::task::spawn_blocking(move || {
+            db.create_vector_index(&c, &f, dim, m).map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        // Writes must encode this field from here on (in-RAM map; engine
+        // defs are the source of truth at open via load_vector_registry).
+        // Entry merge, not overwrite: one collection holds many vector fields.
+        {
+            let mut map = self.vector_fields.lock().unwrap();
+            let entry = map.entry(collection.to_string()).or_default();
+            entry.retain(|(f, _)| f != &spec.field);
+            entry.push((spec.field.clone(), spec.dim));
+        }
+        Ok(hakobackend_core::IndexInfo {
+            name: format!("vector({})", spec.field),
+            fields: vec![spec.field.clone()],
+            unique: false,
+            kind: hakobackend_core::IndexKind::Vector,
+        })
+    }
+
+    async fn vector_search(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        _metric: hakobackend_core::VectorMetric,
+    ) -> Result<Vec<hakobackend_core::ScoredDoc>, AppError> {
+        // Native: the index's own metric scores (authoritative); the
+        // caller's metric is a hint for the gateway path only.
+        let db = self.inner.clone();
+        let (c, f) = (collection.to_string(), field.to_string());
+        let q = query.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let metric = db.vector_metric(&c, &f).unwrap_or(hakodb::index::vector::Metric::Cosine);
+            let rows = db.find_near(&c, &f, &q, k).map_err(|e| {
+                let m = e.to_string();
+                if m.contains("dim mismatch") {
+                    AppError::BadRequest(m)
+                } else {
+                    AppError::Internal(m)
+                }
+            })?;
+            Ok::<_, AppError>(rows
+                .into_iter()
+                .map(|(id, doc)| {
+                    let score = match doc.get(&f) {
+                        Some(hakodb::document::value::Value::Binary(b)) => {
+                            hakodb::index::vector::decode_f32s(b)
+                                .ok()
+                                .filter(|v| v.len() == q.len())
+                                .map(|v| hakodb::index::vector::distance(metric, &q, &v))
+                                .unwrap_or(f64::INFINITY)
+                        }
+                        _ => f64::INFINITY,
+                    };
+                    hakobackend_core::ScoredDoc { id: id.clone(), score, doc: Self::to_doc(id, doc) }
+                })
+                .collect())
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -806,6 +935,16 @@ impl Database for HakoDb {
                     kind: hakobackend_core::IndexKind::Composite,
                 });
             }
+            for defs in list.vector.values() {
+                for d in defs {
+                    out.push(hakobackend_core::IndexInfo {
+                        name: format!("vector({})", d.field),
+                        fields: vec![d.field.clone()],
+                        unique: false,
+                        kind: hakobackend_core::IndexKind::Vector,
+                    });
+                }
+            }
             Ok::<_, AppError>(out)
         })
         .await
@@ -820,6 +959,7 @@ impl Database for HakoDb {
         use hakobackend_core::{TxOpKind, TxOut};
         let db = self.inner.clone();
         let uniq_map = self.unique.lock().unwrap().clone();
+        let vector_map = self.vector_fields.lock().unwrap().clone();
         tokio::task::spawn_blocking(move || {
             let mut tx = db.begin_serializable_transaction();
             let mut out = Vec::with_capacity(ops.len());
@@ -913,7 +1053,8 @@ impl Database for HakoDb {
                         };
                         data.extend(body);
                         let doc = Doc { id: op.id.clone(), data };
-                        tx.put(&op.collection, &op.id, Self::to_hako(&doc));
+                        let vf: &[(String, u32)] = vector_map.get(&op.collection).map(|v| v.as_slice()).unwrap_or(&[]);
+                        tx.put(&op.collection, &op.id, Self::to_hako_vector(&doc, vf));
                         staged.insert(key, Some(doc.clone()));
                         claim(&mut tx, &db, &mut staged, &op.collection, &op.id, &old, &Some(doc.clone()))?;
                         out.push(TxOut { existed, doc: Some(doc) });
@@ -1110,6 +1251,54 @@ mod tests {
         assert_eq!(db.sum("t", "n", &qc).await.unwrap(), 60.0);
         assert_eq!(db.avg("t", "n", &qc).await.unwrap(), 20.0);
         assert_eq!(db.count("t", &qc).await.unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Vector native path: JSON float arrays written via set() encode to
+    /// Binary for indexed fields (write conversion), create + search go
+    /// native, scores are exact, and dim mismatch is a loud BadRequest.
+    /// A second vector field on the same collection coexists (entry merge).
+    #[tokio::test]
+    async fn native_vector_search() {
+        use hakobackend_core::{VectorIndexSpec, VectorMetric};
+        let dir = std::env::temp_dir().join(format!("hakobackend_vec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        let doc = |id: &str, v: serde_json::Value| hakobackend_core::Doc {
+            id: id.into(),
+            data: [("emb".to_string(), v)].into_iter().collect(),
+        };
+        // Writes BEFORE the index exists land as plain arrays; the index
+        // backfill picks up Binary-encoded docs, earlier array docs stay
+        // unindexed (documented: create the index before writing, or
+        // rewrite). Write after creating so conversion applies.
+        db.create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine })
+            .await
+            .unwrap();
+        db.set("pts", "a", doc("a", serde_json::json!([1.0, 0.0])), false).await.unwrap();
+        db.set("pts", "b", doc("b", serde_json::json!([0.0, 1.0])), false).await.unwrap();
+        db.set("pts", "c", doc("c", serde_json::json!([1.0, 1.0])), false).await.unwrap();
+        db.set("pts", "junk", doc("junk", serde_json::json!("nope")), false).await.unwrap();
+        // Settle background indexing (same rule as engine tests: Near
+        // fail-closes before indexes_ready).
+        let inner = db.inner.clone();
+        tokio::task::spawn_blocking(move || inner.await_quiescent(std::time::Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let hits = db.vector_search("pts", "emb", &[1.0, 0.5], 2, VectorMetric::Cosine).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "c");
+        assert_eq!(hits[1].id, "a");
+        assert!((hits[0].score - 0.0513167).abs() < 1e-4, "{}", hits[0].score);
+        // Dim mismatch is a loud 400, not silent truncation.
+        let bad = db.vector_search("pts", "emb", &[1.0, 0.5, 0.0], 2, VectorMetric::Cosine).await;
+        assert!(matches!(bad, Err(hakobackend_core::AppError::BadRequest(_))));
+        // Second vector field coexists; listing shows both as kind vector.
+        db.create_vector_index("pts", &VectorIndexSpec { field: "emb2".into(), dim: 2, metric: VectorMetric::L2 })
+            .await
+            .unwrap();
+        let listed = db.list_indexes("pts").await.unwrap();
+        assert_eq!(listed.iter().filter(|i| i.kind == hakobackend_core::IndexKind::Vector).count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -270,6 +270,9 @@ fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
         IndexKind::Simple => format!("idx_{}_{}", table, spec.fields.join("_")),
         IndexKind::Composite => format!("idx_{}_{}", table, spec.fields.join("_")),
         IndexKind::FullText => format!("fts_{}_{}", table, spec.fields.join("_")),
+        // Unreachable via the validated path (validate_spec rejects Vector
+        // before DDL); total for the compiler.
+        IndexKind::Vector => format!("vec_{}_{}", table, spec.fields.join("_")),
     });
     let clean: String = base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     clean.chars().take(60).collect()
@@ -422,6 +425,7 @@ impl Database for PgDb {
             supports_unique: true,
             supports_named_index: true,
             supports_native_aggregation: false,
+            supports_vector: false,
         }
     }
 
@@ -654,6 +658,9 @@ impl Database for PgDb {
                     f = f.replace('\'', "''")
                 )
             }
+            IndexKind::Vector => {
+                return Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()));
+            }
         };
         sqlx::query(&ddl).execute(&self.pool).await.map_err(|e| {
             if is_conflict(&e) {
@@ -667,6 +674,7 @@ impl Database for PgDb {
             IndexKind::Simple => "simple",
             IndexKind::Composite => "composite",
             IndexKind::FullText => "fts",
+            IndexKind::Vector => "vector",
         };
         sqlx::query("INSERT INTO \"__ub_indexes\" (collection, name, fields, \"unique\", kind, ddl) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (collection, name) DO UPDATE SET fields = EXCLUDED.fields, \"unique\" = EXCLUDED.\"unique\", kind = EXCLUDED.kind, ddl = EXCLUDED.ddl")
             .bind(collection)

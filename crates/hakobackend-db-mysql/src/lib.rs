@@ -342,6 +342,9 @@ fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
         IndexKind::Simple => format!("idx_{}_{}", table, spec.fields.join("_")),
         IndexKind::Composite => format!("idx_{}_{}", table, spec.fields.join("_")),
         IndexKind::FullText => format!("ft_{}_{}", table, spec.fields.join("_")),
+        // Unreachable via the validated path (validate_spec rejects Vector
+        // before DDL); total for the compiler.
+        IndexKind::Vector => format!("vec_{}_{}", table, spec.fields.join("_")),
     });
     base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect::<String>()
 }
@@ -493,6 +496,7 @@ impl Database for MysqlDb {
             supports_unique: true,
             supports_named_index: true,
             supports_native_aggregation: false,
+            supports_vector: false,
         }
     }
 
@@ -732,9 +736,12 @@ impl Database for MysqlDb {
                 .await
                 .map_err(|_| AppError::Internal("db error (generated columns need MySQL 5.7+/MariaDB 10.2+)".into()))?;
                 sqlx::query(&format!("CREATE FULLTEXT INDEX {name} ON {table} ({col})", name = qi(&physical), table = qi(&table), col = qi(&col)))
-                    .execute(&self.pool)
-                    .await
-                    .map_err(|_| AppError::Internal("db error".into()))?;
+                .execute(&self.pool)
+                .await
+                .map_err(|_| AppError::Internal("db error".into()))?;
+            }
+            IndexKind::Vector => {
+                return Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()));
             }
         }
         let fields_json = serde_json::Value::Array(spec.fields.iter().map(|f| serde_json::Value::String(f.clone())).collect())
@@ -743,6 +750,7 @@ impl Database for MysqlDb {
             IndexKind::Simple => "simple",
             IndexKind::Composite => "composite",
             IndexKind::FullText => "fts",
+            IndexKind::Vector => "vector",
         };
         sqlx::query("INSERT INTO `__ub_indexes` (collection, name, fields, `unique`, kind, ddl) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE fields = VALUES(fields), `unique` = VALUES(`unique`), kind = VALUES(kind), ddl = VALUES(ddl)")
             .bind(collection)

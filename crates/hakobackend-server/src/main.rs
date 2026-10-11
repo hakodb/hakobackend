@@ -712,6 +712,11 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/files/{*path}", post(files::upload).get(files::download).delete(files::remove))
         .route("/api/collectionGroup/{name}", get(collection_group))
         .route("/api/aggregate/{*path}", post(aggregate))
+        // Vector KNN (issue: uniform contract, native-or-exact serving).
+        // Static paths (like relocate/load/unload) so alias targets reach
+        // them exactly like direct calls.
+        .route("/api/vector-index", post(vector_index_create))
+        .route("/api/vector-search/{*path}", post(vector_search))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler));
@@ -4109,6 +4114,160 @@ async fn aggregate(
     }
     Json(serde_json::Value::Object(result)).into_response()
 }
+
+// --- Vector KNN: uniform contract, native-or-exact serving ---
+//
+// Over HTTP a vector field is a JSON array of numbers, period. The hako
+// driver encodes matching float arrays to Binary LE-f32 at write time
+// (the only shape its vector hook indexes); other drivers store the
+// array as-is and serve the gateway exact scan over it. Scores are
+// exact metric distances in both paths (lower is nearer).
+
+#[derive(Debug, serde::Deserialize)]
+struct VectorIndexBody {
+    collection: String,
+    field: String,
+    dim: u32,
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+fn parse_vector_metric(raw: Option<&str>) -> Result<hakobackend_core::VectorMetric, Response> {
+    use hakobackend_core::VectorMetric;
+    match raw.unwrap_or("cosine") {
+        "cosine" => Ok(VectorMetric::Cosine),
+        "l2" => Ok(VectorMetric::L2),
+        other => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("unknown vector metric '{other}' (cosine|l2)"),
+        )),
+    }
+}
+
+async fn vector_index_create(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<VectorIndexBody>,
+) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
+    let collection = body.collection.trim().to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "collection required");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if body.field.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "field required");
+    }
+    if body.dim == 0 || body.dim > 4096 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("vector dim {} out of range 1..=4096", body.dim),
+        );
+    }
+    let metric = match parse_vector_metric(body.metric.as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    let _ = dbh.ensure_collection(&stored).await;
+    let spec = hakobackend_core::VectorIndexSpec { field: body.field, dim: body.dim, metric };
+    match dbh.create_vector_index(&stored, &spec).await {
+        Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct VectorSearchBody {
+    field: String,
+    query: Vec<f64>,
+    #[serde(default)]
+    k: Option<usize>,
+    #[serde(default)]
+    metric: Option<String>,
+}
+
+async fn vector_search(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<VectorSearchBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "vector-search needs a collection path");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if body.field.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "field required");
+    }
+    if body.query.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "query needs >= 1 float");
+    }
+    if body.query.iter().any(|f| !f.is_finite()) {
+        return err(StatusCode::BAD_REQUEST, "query must be finite floats");
+    }
+    let k = body.k.unwrap_or(10);
+    if k == 0 || k > hakobackend_core::MAX_VECTOR_K {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("k out of range 1..={}", hakobackend_core::MAX_VECTOR_K),
+        );
+    }
+    let metric = match parse_vector_metric(body.metric.as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    // The scan cap lives in the driver's default method (count-guard);
+    // native drivers override vector_search and never list, so no
+    // handler-side guard is needed here.
+    let query: Vec<f32> = body.query.iter().map(|f| *f as f32).collect();
+    match dbh.vector_search(&stored, &body.field, &query, k, metric).await {
+        Ok(hits) => Json(serde_json::json!(hits)).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
 // --- Local auth (BFF): two HttpOnly cookies, browser never holds tokens ---
 
 fn session_cookies(
@@ -5360,6 +5519,148 @@ mod tests {
             &reencode_query("/api/collections/orders?options={\"filters\":[{\"field\":\"owner\",\"op\":\"==\",\"value\":{\"__ref__\":\"users/u1\"}}]}"), None).await;
         assert_eq!(s, StatusCode::OK);
         assert!(String::from_utf8_lossy(&b).contains("\"o1\""));
+    }
+
+    /// Vector HTTP loop, native (hako): PUT float arrays → create index →
+    /// KNN search ordered with exact scores; dim mismatch + bad dim +
+    /// unknown metric are loud 400s. Polls to settle background indexing
+    /// (same rule as engine tests: Near fail-closes before ready).
+    #[tokio::test]
+    async fn vector_http_native() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_vec_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, "[defaults]\nread = \"public\"\nwrite = \"public\"\n").unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.join("h.ub").to_string_lossy().as_ref()).unwrap());
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        let app = build_router(st.clone(), vec![], false);
+        // Index BEFORE writing: pre-index docs land as plain arrays and
+        // stay unindexed (only Binary encodes index; create-first is the
+        // documented order).
+        let (s, b) = call(app.clone(), "POST", "/api/vector-index",
+            Some(serde_json::json!({"collection": "pts", "field": "emb", "dim": 2}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(String::from_utf8_lossy(&b).contains("vector(emb)"));
+        for (id, emb) in [("a", "[1.0,0.0]"), ("b", "[0.0,1.0]"), ("c", "[1.0,1.0]")] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/pts/{id}"),
+                Some(serde_json::json!({"emb": serde_json::from_str::<serde_json::Value>(emb).unwrap()}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let search = || call(app.clone(), "POST", "/api/vector-search/pts",
+            Some(serde_json::json!({"field": "emb", "query": [1.0, 0.5], "k": 2})));
+        // Settle polling: 2 req/s stays far under the test limiter
+        // (600/min); 429s are tolerated, anything else fails fast.
+        let mut hits = serde_json::Value::Null;
+        for _ in 0..90 {
+            let (s, b) = search().await;
+            if s == StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            hits = serde_json::from_slice(&b).unwrap();
+            if hits.as_array().is_some_and(|a| a.len() == 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let arr = hits.as_array().expect("2 hits after settle");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "c");
+        assert_eq!(arr[1]["id"], "a");
+        assert!((arr[0]["score"].as_f64().unwrap() - 0.0513167).abs() < 1e-4);
+        // Loud 400s: dim mismatch, bad dim, unknown metric, k=0.
+        let (s, _) = call(app.clone(), "POST", "/api/vector-search/pts",
+            Some(serde_json::json!({"field": "emb", "query": [1.0, 0.5, 0.0]}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/vector-index",
+            Some(serde_json::json!({"collection": "pts", "field": "emb", "dim": 0}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/vector-search/pts",
+            Some(serde_json::json!({"field": "emb", "query": [1.0], "metric": "dot"}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/vector-search/pts",
+            Some(serde_json::json!({"field": "emb", "query": [1.0, 0.5], "k": 0}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    /// Vector HTTP loop, gateway fallback (sqlite has no native vector):
+    /// search works with no index at all (exact scan), create rejects
+    /// clearly naming the hako driver.
+    #[tokio::test]
+    async fn vector_http_gateway_fallback() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "vecfb").await;
+        let app = build_router(st.clone(), vec![], false);
+        for (id, emb) in [("a", "[1.0,0.0]"), ("b", "[0.0,1.0]"), ("c", "[1.0,1.0]")] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/pts/{id}"),
+                Some(serde_json::json!({"emb": serde_json::from_str::<serde_json::Value>(emb).unwrap()}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let (s, b) = call(app.clone(), "POST", "/api/vector-search/pts",
+            Some(serde_json::json!({"field": "emb", "query": [1.0, 0.5], "k": 2}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let hits: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let arr = hits.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "c");
+        assert_eq!(arr[1]["id"], "a");
+        let (s, b) = call(app.clone(), "POST", "/api/vector-index",
+            Some(serde_json::json!({"collection": "pts", "field": "emb", "dim": 2}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        assert!(String::from_utf8_lossy(&b).contains("no vector-index support"));
     }
 
     /// Readiness cache (external audit): LB-speed probes must not walk
