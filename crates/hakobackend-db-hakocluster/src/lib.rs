@@ -18,6 +18,7 @@
 
 use hakobackend_core::{
     AppError, Capabilities, Change, Doc, IndexInfo, IndexSpec, QueryOptions, TxOp, TxOut,
+    VectorIndexSpec, VectorMetric, ScoredDoc,
 };
 
 pub struct ClusterDb {
@@ -188,6 +189,34 @@ impl hakobackend_core::Database for ClusterDb {
 
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError> {
         self.writer().list_indexes(collection).await
+    }
+
+    async fn create_vector_index(
+        &self,
+        collection: &str,
+        spec: &VectorIndexSpec,
+    ) -> Result<IndexInfo, AppError> {
+        // Same DDL fan-out rule as create_index (definitions never replicate).
+        let mut out = None;
+        for m in &self.members {
+            let info = m.create_vector_index(collection, spec).await?;
+            if out.is_none() {
+                out = Some(info);
+            }
+        }
+        out.ok_or_else(|| AppError::Internal("no cluster members".into()))
+    }
+
+    async fn vector_search(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        metric: VectorMetric,
+    ) -> Result<Vec<ScoredDoc>, AppError> {
+        // Reads go to the writer (native when the writer is HakoDb).
+        self.writer().vector_search(collection, field, query, k, metric).await
     }
 
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError> {

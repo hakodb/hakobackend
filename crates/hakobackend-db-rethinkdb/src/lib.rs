@@ -398,6 +398,7 @@ impl Database for RethinkDb {
             supports_unique: false,
             supports_named_index: true,
             supports_native_aggregation: false,
+            supports_vector: false,
         }
     }
 

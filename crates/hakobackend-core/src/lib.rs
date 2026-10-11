@@ -466,6 +466,52 @@ pub trait Database: Send + Sync {
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError>;
     /// Create an index (simple/composite/FTS). Unsupported capability → reject clearly.
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError>;
+    /// Create a vector (KNN) index. Default: reject clearly (drivers
+    /// advertising `supports_vector` override with a native index).
+    async fn create_vector_index(&self, collection: &str, spec: &VectorIndexSpec) -> Result<IndexInfo, AppError> {
+        let _ = (collection, spec);
+        Err(AppError::BadRequest(format!("driver {} has no vector-index support", self.capabilities().driver)))
+    }
+    /// KNN search, nearest-first. Default: gateway exact scan (uniform
+    /// across drivers — same rule as the sum/avg list-and-reduce
+    /// defaults); native drivers override (hako: index/ANN, no doc
+    /// fetch). Count-guarded like the aggregate reduce path; per-doc dim
+    /// mismatch skips the doc (fail-closed per doc, never per query).
+    /// `metric` steers the fallback; native drivers score with their
+    /// index's own metric (authoritative) and take it as a hint only.
+    async fn vector_search(
+        &self,
+        collection: &str,
+        field: &str,
+        query: &[f32],
+        k: usize,
+        metric: VectorMetric,
+    ) -> Result<Vec<ScoredDoc>, AppError> {
+        let n = self.count(collection, &QueryOptions::default()).await?;
+        if n > MAX_VECTOR_SCAN_DOCS {
+            return Err(AppError::BadRequest(format!(
+                "collection too large for exact scan on this driver ({n} docs, cap {MAX_VECTOR_SCAN_DOCS}): use the hako driver for indexed search"
+            )));
+        }
+        let mut scored: Vec<(f64, Doc)> = self
+            .list(collection, &QueryOptions::default())
+            .await?
+            .into_iter()
+            .filter_map(|d| {
+                let v = d.data.get(field).and_then(json_float_array)?;
+                if v.len() != query.len() {
+                    return None;
+                }
+                Some((vector_distance(metric, query, &v), d))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        Ok(scored
+            .into_iter()
+            .map(|(score, doc)| ScoredDoc { id: doc.id.clone(), score, doc })
+            .collect())
+    }
     async fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>, AppError>;
     /// Drop an index by name. Drivers without a drop API → reject clearly.
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError>;
@@ -653,6 +699,10 @@ pub struct Capabilities {
     /// Native count/sum/avg pushdown (when true, TtlDb may compute
     /// total−expired natively instead of listing; when false it lists).
     pub supports_native_aggregation: bool,
+    /// Native vector index + KNN (when true the driver serves
+    /// `vector_search` from an index; when false the trait-default exact
+    /// scan serves it, capped by MAX_VECTOR_SCAN_DOCS).
+    pub supports_vector: bool,
 }
 
 // --- Index: simple/composite/FTS management contract (HTTP_CONTRACT.md §index) ---
@@ -664,6 +714,10 @@ pub enum IndexKind {
     Composite,
     #[serde(rename = "fts")]
     FullText,
+    /// Vector (KNN) index. Only creatable via the vector endpoint
+    /// (`POST /api/vector-index`); the generic index endpoint rejects it
+    /// clearly (validate_spec) so the dim/metric contract can't be skipped.
+    Vector,
 }
 
 fn simple_kind() -> IndexKind {
@@ -688,6 +742,84 @@ pub struct IndexInfo {
     pub fields: Vec<String>,
     pub unique: bool,
     pub kind: IndexKind,
+}
+
+// --- Vector (KNN): uniform contract, native-or-exact serving ---
+
+/// Exact-scan cap for the gateway fallback (same scale as the aggregate
+/// reduce guard). Native drivers never list, so the cap only bounds the
+/// legacy path — like MAX_AGG_SCAN_DOCS bounds the legacy reduce.
+pub const MAX_VECTOR_SCAN_DOCS: u64 = 50_000;
+
+/// Max KNN neighbors per request (bounds the rescore/sort work; RAG
+/// needs tens, not millions).
+pub const MAX_VECTOR_K: usize = 1000;
+
+/// Distance metric for vector indexes (mirrors the engine's
+/// `Metric::from_u32`: 0 = cosine, 1 = l2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VectorMetric {
+    Cosine,
+    L2,
+}
+
+/// Vector index definition for `create_vector_index`. Dim is validated
+/// against the engine range (1..=4096) before reaching any driver.
+#[derive(Debug, Clone)]
+pub struct VectorIndexSpec {
+    pub field: String,
+    pub dim: u32,
+    pub metric: VectorMetric,
+}
+
+/// One KNN hit: doc id, exact metric distance (lower is nearer), and
+/// the doc itself (id-first shape, like every other row).
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoredDoc {
+    pub id: String,
+    pub score: f64,
+    pub doc: Doc,
+}
+
+/// Exact metric distance: cosine in [0, 2], L2 squared (sqrt-free —
+/// ordering-identical to L2, same convention as the engine rescore).
+/// Length mismatch (caller bug — drivers check dims first) scores INFINITY.
+pub fn vector_distance(metric: VectorMetric, a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() {
+        return f64::INFINITY;
+    }
+    match metric {
+        VectorMetric::Cosine => {
+            let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..a.len() {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na == 0.0 || nb == 0.0 {
+                return 1.0;
+            }
+            1.0 - dot / (na.sqrt() * nb.sqrt())
+        }
+        VectorMetric::L2 => {
+            a.iter().zip(b.iter()).map(|(x, y)| ((x - y) as f64).powi(2)).sum()
+        }
+    }
+}
+
+/// JSON number array (ints or floats) to f32 vector. Anything else
+/// (missing, strings, nested, non-numbers) is None — the doc simply
+/// doesn't participate in KNN (fail-closed per doc, never per query).
+pub fn json_float_array(v: &serde_json::Value) -> Option<Vec<f32>> {
+    match v {
+        serde_json::Value::Array(items) if !items.is_empty() => items
+            .iter()
+            .map(|n| n.as_f64().map(|f| f as f32))
+            .collect::<Option<Vec<_>>>(),
+        _ => None,
+    }
 }
 
 // --- Policy trait: replacing userrules.ts ---
@@ -1254,6 +1386,9 @@ pub mod conformance {
     /// Standard spec validation against capabilities. Used by all drivers so
     /// rejections are identical (no silent-ignore).
     pub fn validate_spec(caps: Capabilities, spec: &IndexSpec) -> Result<(), AppError> {
+        if spec.kind == IndexKind::Vector {
+            return Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()));
+        }
         if spec.fields.is_empty() {
             return Err(AppError::BadRequest("index needs >= 1 field".into()));
         }
@@ -1279,6 +1414,7 @@ pub mod conformance {
             IndexKind::Simple => base,
             IndexKind::Composite => format!("composite({base})"),
             IndexKind::FullText => format!("fts({base})"),
+            IndexKind::Vector => format!("vector({base})"),
         }
     }
 
@@ -1398,6 +1534,7 @@ pub mod conformance {
                 supports_unique: true,
                 supports_named_index: true,
                 supports_native_aggregation: false,
+                supports_vector: false,
             }
         }
         async fn ensure_collection(&self, _path: &str) -> Result<(), AppError> {
@@ -1520,6 +1657,44 @@ pub mod conformance {
     async fn conformance_memdb() {
         run_conformance_suite(&MemDb::new()).await;
         run_index_suite(&MemDb::new()).await;
+    }
+
+    /// Gateway exact fallback (default `vector_search`): nearest-first
+    /// with exact scores; mistyped + dim-mismatched docs are skipped
+    /// per-doc, never failing the query. `create_vector_index` rejects
+    /// clearly on drivers without native support (MemDb included).
+    #[tokio::test]
+    async fn vector_fallback_exact() {
+        let db = MemDb::new();
+        let put = |id: &str, emb: serde_json::Value| {
+            let mut d = mk(serde_json::json!({ "emb": emb }));
+            d.id = id.into();
+            d
+        };
+        db.set("pts", "a", put("a", serde_json::json!([1.0, 0.0])), false).await.unwrap();
+        db.set("pts", "b", put("b", serde_json::json!([0.0, 1.0])), false).await.unwrap();
+        db.set("pts", "c", put("c", serde_json::json!([1.0, 1.0])), false).await.unwrap();
+        db.set("pts", "junk", put("junk", serde_json::json!("nope")), false).await.unwrap();
+        db.set("pts", "wide", put("wide", serde_json::json!([1.0, 0.0, 0.0])), false).await.unwrap();
+        let hits = db
+            .vector_search("pts", "emb", &[1.0, 0.5], 2, VectorMetric::Cosine)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "c");
+        assert_eq!(hits[1].id, "a");
+        assert!((hits[0].score - 0.0513167).abs() < 1e-4, "{}", hits[0].score);
+        assert!((hits[1].score - 0.1055728).abs() < 1e-4, "{}", hits[1].score);
+        // L2-squared: a and c tie at 0.25 (tie order unspecified), b at 1.25.
+        let l2 = db.vector_search("pts", "emb", &[1.0, 0.5], 4, VectorMetric::L2).await.unwrap();
+        assert_eq!(l2.len(), 3);
+        assert!((l2[0].score - 0.25).abs() < 1e-9, "{}", l2[0].score);
+        assert!((l2[1].score - 0.25).abs() < 1e-9, "{}", l2[1].score);
+        assert_eq!(l2[2].id, "b");
+        assert!(db
+            .create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine })
+            .await
+            .is_err());
     }
 
     #[cfg(test)]

@@ -295,6 +295,7 @@ mod tests {
                 supports_unique: false,
                 supports_named_index: false,
                 supports_native_aggregation: false,
+                supports_vector: false,
             }
         }
         async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
@@ -389,6 +390,7 @@ mod tests {
                     supports_unique: false,
                     supports_named_index: false,
                     supports_native_aggregation: false,
+                    supports_vector: false,
                 }
             }
             async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
