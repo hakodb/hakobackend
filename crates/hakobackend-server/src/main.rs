@@ -1362,11 +1362,23 @@ fn open_auth_result(
         AuthSpec::Named(n) => n,
         AuthSpec::File(_) => &custom.as_ref().unwrap().providers,
     };
-    let local = names
-        .iter()
-        .any(|n| n == hakobackend_auth_local::NAME)
+    let has_local_issuer = names.iter().any(|n| n == hakobackend_auth_local::NAME);
+    // Issue #44: snapshot the warning input before `identity` moves below.
+    let attrs_without_issuer: Vec<String> = if has_local_issuer { vec![] } else { identity.attrs.clone() };
+    let local = has_local_issuer
         .then(|| LocalAuth::build(db.clone(), identity))
         .transpose()?;
+    // Issue #44 (cont.): user-doc attrs are minted only by the local
+    // issuer (attrs_of at login/refresh). External/verifier-only providers
+    // never mint them, so claim:/fields: rules on attrs silently deny
+    // there. Loud at boot AND reload (this fn serves both) instead of silent.
+    if !attrs_without_issuer.is_empty() {
+        eprintln!(
+            "[ub] WARNING: [identity].attrs is set ({attrs_without_issuer:?}) but the auth chain has no local issuer — \
+             external providers never mint user-doc attrs, so claim:/fields: rules on them will \
+             silently deny. Mint roles as JWT custom claims instead, or add the local provider."
+        );
+    }
     if let (Some(d), Some(l)) = (custom.as_ref().and_then(|c| c.dpop.as_deref()), &local) {
         // custom.toml `dpop` wins over env; typo = error (fail-closed).
         l.set_dpop_mode(hakobackend_auth_local::DpopMode::parse(d)?);
@@ -2102,6 +2114,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
 
 async fn list_collections(
     State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let dbname = match resolve_db_name(&q) {
@@ -2114,7 +2127,20 @@ async fn list_collections(
         Err(r) => return r,
     };
     match dbh.list_collections().await {
-        Ok(c) => Json(c).into_response(),
+        // Enumeration guard (issue #47): names reveal product surface, so
+        // the listing shows only collections whose List rule passes for
+        // this caller (evaluated without a target doc — UidSelf-scoped
+        // collections stay hidden here and remain directly addressable).
+        // Fully-public deployments see the same list as before.
+        Ok(all) => {
+            let visible: Vec<String> = all
+                .into_iter()
+                .filter(|name| {
+                    hot.policy.allow(auth.as_ref(), &dotted(&dbname, name), Method::List, None)
+                })
+                .collect();
+            Json(visible).into_response()
+        }
         Err(_) => err_internal(),
     }
 }
@@ -6064,6 +6090,52 @@ mod tests {
         assert_eq!(get(app.clone(), "/api/collections?db=x").await, StatusCode::BAD_REQUEST);
         assert_eq!(get(app.clone(), "/api/collections?db=default").await, StatusCode::OK);
         assert_eq!(get(app.clone(), "/api/collections").await, StatusCode::OK);
+    }
+
+    /// Listing enumerates only List-visible collections (issue #47):
+    /// internal names never leak through enumeration to callers who
+    /// couldn't open them directly.
+    #[tokio::test]
+    async fn collection_listing_filters_by_list() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let (st, _raw) = rbw_state(
+            "[defaults]\nread = \"deny\"\nwrite = \"public\"\n[collections.posts]\nread = \"public\"\n",
+            "listfilter",
+        )
+        .await;
+        let app = build_router(st.clone(), vec![], false);
+        let doc = serde_json::json!({"v": 1});
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/posts/a", Some(doc.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/priv/b", Some(doc.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, b) = call(app.clone(), "GET", "/api/collections", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let names = String::from_utf8_lossy(&b);
+        assert!(names.contains("\"posts\""), "got: {names}");
+        assert!(!names.contains("\"priv\""), "got: {names}");
     }
 
     /// Minimal percent-decoder for the transform test (no new deps).

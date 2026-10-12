@@ -5,6 +5,10 @@
 
 # Your identity: which user collection holds login docs, and which of
 # their fields ride token claims for `claim:` / `fields:` rules.
+# NOTE (issue #44): attrs minting is local-issuer-only. External providers
+# (firebase/github/oidc) never mint user-doc attrs — claim rules on them
+# silently deny (boot warns). Those deployments mint roles as JWT custom
+# claims instead.
 [identity]
 users_collection = "users"
 attrs = ["role", "department"]

@@ -342,16 +342,45 @@ impl PolicyFile {
         toml::from_str(raw).map_err(|e| e.to_string())
     }
 
-    /// Collection resolution: exact (`posts/abc/revisions`) → root
-    /// (`posts`) → `[defaults]`. Deliberately NO last-segment fallback: a
-    /// permissive generic rule (e.g. open `revisions`) must never silently
-    /// cover every hierarchy (S3 audit). Name the full path or the root.
+    /// Collection resolution: exact (`posts/abc/revisions`) → wildcard
+    /// (`posts/*/revisions`, `*` = exactly one `/`-separated segment, same
+    /// segment count) → root (`posts`) → `[defaults]`. Deliberately NO
+    /// last-segment fallback: a permissive generic rule (e.g. open
+    /// `revisions`) must never silently cover every hierarchy (S3 audit).
+    /// Name the full path or the root.
+    ///
+    /// Wildcard precedence is deterministic: fewest `*` wins; ties break
+    /// toward the lexicographically smallest pattern (documented so
+    /// overlapping patterns resolve predictably — prefer non-overlapping
+    /// rules). Dots ride inside segments literally, so dotted db namespaces
+    /// (`akademik.posts/*/revisions`) compose without dot parsing.
     fn find(&self, collection: &str) -> Option<&CollectionPolicy> {
         if let Some(p) = self.collections.get(collection) {
             return Some(p);
         }
+        let segments: Vec<&str> = collection.split('/').collect();
+        let mut best: Option<(usize, &str, &CollectionPolicy)> = None;
+        for (pattern, policy) in &self.collections {
+            if !pattern.contains('*') {
+                continue;
+            }
+            let parts: Vec<&str> = pattern.split('/').collect();
+            if parts.len() != segments.len() {
+                continue;
+            }
+            let wilds = parts.iter().filter(|p| **p == "*").count();
+            if !parts.iter().zip(segments.iter()).all(|(pat, seg)| *pat == "*" || pat == seg) {
+                continue;
+            }
+            let candidate = (wilds, pattern.as_str(), policy);
+            if best.is_none_or(|b| (candidate.0, candidate.1) < (b.0, b.1)) {
+                best = Some(candidate);
+            }
+        }
+        if let Some((_, _, policy)) = best {
+            return Some(policy);
+        }
         if collection.contains('/') {
-            let segments: Vec<&str> = collection.split('/').collect();
             if let Some(root) = segments.first() {
                 if let Some(p) = self.collections.get(*root) {
                     return Some(p);
@@ -558,6 +587,48 @@ mod tests {
         );
         // typo -> Deny
         assert!(!p.allow(Some(&auth("u1")), "posts", Method::Update, None));
+    }
+
+    #[test]
+    fn wildcard_segments_resolve() {
+        let p = policy(
+            r#"
+            [defaults]
+            read = "deny"
+            [collections.posts]
+            read = "public"
+            [collections."posts/*/revisions"]
+            read = "deny"
+            update = "deny"
+            "#,
+        );
+        // Exact > wildcard > root > defaults.
+        assert!(p.allow(None, "posts", Method::List, None));
+        assert!(!p.allow(None, "posts/a/revisions", Method::List, None));
+        assert!(!p.allow(None, "posts/a/revisions", Method::Update, None));
+        // Wildcard needs the same segment count (no prefix matching).
+        assert!(p.allow(None, "posts/a/revisions/deep", Method::List, None));
+        // No last-segment fallback: a bare `revisions` rule never covers.
+        let q = policy(
+            r#"
+            [defaults]
+            read = "deny"
+            [collections.revisions]
+            read = "public"
+            "#,
+        );
+        assert!(!q.allow(None, "posts/a/revisions", Method::List, None));
+        // Dotted db namespaces compose (dots ride inside segments).
+        let r = policy(
+            r#"
+            [defaults]
+            read = "deny"
+            [collections."akademik.posts/*/revisions"]
+            read = "public"
+            "#,
+        );
+        assert!(r.allow(None, "akademik.posts/m1/revisions", Method::List, None));
+        assert!(!r.allow(None, "akademik.posts/m1/other", Method::List, None));
     }
 
     fn map(pairs: &[(&str, serde_json::Value)]) -> HashMap<String, serde_json::Value> {

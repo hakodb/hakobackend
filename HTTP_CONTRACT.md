@@ -8,12 +8,30 @@ must produce exactly the same behavior.
 `/api/collections/{*path}` — even segment count = document, odd = collection
 (`hakobackend_core::parse_collection_path`, parity-tested against the legacy `getPathInfo`).
 
+### Subcollection convention (issue #45)
+
+Slash paths are literal collections: `posts/p1/revisions` is stored as-is
+(identity `stored()`), distinct from any flat `posts_revisions`. Legacy data
+migrated 1:1 under flat names is invisible to slash-path clients and vice
+versa — normalize at migration time, not at serve time (no silent aliasing;
+no strict-mode rejection either, which would break migrated datasets that
+mix both shapes during transition).
+
+Reads on odd-segment paths try doc + dotted field descent before the
+subcollection list (§18): a present same-named field beats the subcollection.
+Never store a field and a subcollection under the same name.
+
+Policy resolves exact → `*` wildcard → root first segment → `[defaults]`;
+`posts/p1/revisions` is governed by `posts` rules unless a fuller pattern
+exists. Multidb: the dotted `db.` prefix rides inside the first segment
+literally (`akademik.posts/*/revisions` is a valid pattern).
+
 ## 2. Endpoint → policy → driver table
 
 | HTTP | Policy slot | Trait call | Status |
 |---|---|---|---|
 | `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
-| `GET /api/collections` | — (ungated) | `list_collections` | 200 |
+| `GET /api/collections` | List (per-collection filter, issue #47) | `list_collections` | 200 |
 | `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |

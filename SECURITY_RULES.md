@@ -61,6 +61,13 @@ conditionals evaluate on in-hand data (token claims + incoming/merged doc)
 no read either (id-match); only true change-detection would, and strip
 replaces it. `wstats allow` row must stay ~1µs class.
 
+Claim source caveat (issue #44): `[identity].attrs` are minted into token
+claims **only by the local issuer** (at login/refresh). External /
+verifier-only providers (firebase, github, oidc) never mint user-doc attrs —
+`claim:` / `fields:` rules on them silently deny there (boot logs a loud
+warning when attrs are set without the local provider). External-provider
+deployments must mint roles as JWT custom claims instead.
+
 ## 5. Document conventions (working defaults, all replaceable)
 
 - Per-user data separation is the deployer's data modeling (separate
