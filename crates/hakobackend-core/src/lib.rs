@@ -466,6 +466,27 @@ pub trait Database: Send + Sync {
     async fn subscribe(&self, collection: &str) -> Result<tokio::sync::broadcast::Receiver<Change>, AppError>;
     /// Create an index (simple/composite/FTS). Unsupported capability → reject clearly.
     async fn create_index(&self, collection: &str, spec: &IndexSpec) -> Result<IndexInfo, AppError>;
+    /// Track a collection as a traversal target. Default: reject clearly
+    /// (only the hako driver serves graph walks natively).
+    async fn create_traverse_index(&self, collection: &str) -> Result<IndexInfo, AppError> {
+        let _ = collection;
+        Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
+    }
+    /// Graph BFS from one anchor. Default: reject clearly (unlike vector
+    /// there is no bounded gateway fallback — reverse hops without an
+    /// index are full scans per level).
+    async fn traverse_search(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        direction: TraverseDirection,
+        edge: Option<&str>,
+        max_depth: usize,
+        k: usize,
+    ) -> Result<Vec<PathHit>, AppError> {
+        let _ = (collection, doc_id, direction, edge, max_depth, k);
+        Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
+    }
     /// Create a vector (KNN) index. Default: reject clearly (drivers
     /// advertising `supports_vector` override with a native index).
     async fn create_vector_index(&self, collection: &str, spec: &VectorIndexSpec) -> Result<IndexInfo, AppError> {
@@ -718,6 +739,9 @@ pub enum IndexKind {
     /// (`POST /api/vector-index`); the generic index endpoint rejects it
     /// clearly (validate_spec) so the dim/metric contract can't be skipped.
     Vector,
+    /// Graph-traversal target tracking. Only creatable via the traverse
+    /// endpoint (`POST /api/traverse-index`); same rejection rule.
+    Traverse,
 }
 
 fn simple_kind() -> IndexKind {
@@ -755,6 +779,13 @@ pub const MAX_VECTOR_SCAN_DOCS: u64 = 50_000;
 /// needs tens, not millions).
 pub const MAX_VECTOR_K: usize = 1000;
 
+/// Max BFS hits per traverse request (bounds walk + verify work).
+pub const MAX_TRAVERSE_K: usize = 1000;
+
+/// Max BFS depth per traverse request (engine hard-caps at 32; the
+/// gateway clamps earlier for shared servers).
+pub const MAX_TRAVERSE_DEPTH: usize = 32;
+
 /// Distance metric for vector indexes (mirrors the engine's
 /// `Metric::from_u32`: 0 = cosine, 1 = l2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,6 +810,26 @@ pub struct VectorIndexSpec {
 pub struct ScoredDoc {
     pub id: String,
     pub score: f64,
+    pub doc: Doc,
+}
+
+// --- Graph traversal (uniform contract, native-only serving) ---
+
+/// BFS direction (mirrors the engine TraverseDir).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TraverseDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+/// One BFS hit: collection + id (paths cross collections), depth, doc.
+#[derive(Debug, Clone, Serialize)]
+pub struct PathHit {
+    pub collection: String,
+    pub id: String,
+    pub depth: u64,
     pub doc: Doc,
 }
 
@@ -1389,6 +1440,9 @@ pub mod conformance {
         if spec.kind == IndexKind::Vector {
             return Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()));
         }
+        if spec.kind == IndexKind::Traverse {
+            return Err(AppError::BadRequest("traverse tracking needs no field: use POST /api/traverse-index".into()));
+        }
         if spec.fields.is_empty() {
             return Err(AppError::BadRequest("index needs >= 1 field".into()));
         }
@@ -1415,6 +1469,7 @@ pub mod conformance {
             IndexKind::Composite => format!("composite({base})"),
             IndexKind::FullText => format!("fts({base})"),
             IndexKind::Vector => format!("vector({base})"),
+            IndexKind::Traverse => format!("traverse({base})"),
         }
     }
 

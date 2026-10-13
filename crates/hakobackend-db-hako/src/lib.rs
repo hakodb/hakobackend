@@ -809,7 +809,76 @@ impl Database for HakoDb {
                 hakobackend_core::IndexKind::Vector => {
                     Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()))
                 }
+                hakobackend_core::IndexKind::Traverse => {
+                    Err(AppError::BadRequest("traverse tracking needs no field: use POST /api/traverse-index".into()))
+                }
             }
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn create_traverse_index(&self, collection: &str) -> Result<hakobackend_core::IndexInfo, AppError> {
+        if collection.is_empty() {
+            return Err(AppError::BadRequest("traverse index needs a collection".into()));
+        }
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.create_traverse_index(&c).map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        Ok(hakobackend_core::IndexInfo {
+            name: format!("traverse({collection})"),
+            fields: vec![],
+            unique: false,
+            kind: hakobackend_core::IndexKind::Traverse,
+        })
+    }
+
+    async fn traverse_search(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        direction: hakobackend_core::TraverseDirection,
+        edge: Option<&str>,
+        max_depth: usize,
+        k: usize,
+    ) -> Result<Vec<hakobackend_core::PathHit>, AppError> {
+        let dir = match direction {
+            hakobackend_core::TraverseDirection::Outgoing => hakodb::index::traverse::TraverseDir::Outgoing,
+            hakobackend_core::TraverseDirection::Incoming => hakodb::index::traverse::TraverseDir::Incoming,
+            hakobackend_core::TraverseDirection::Both => hakodb::index::traverse::TraverseDir::Both,
+        };
+        let spec = hakodb::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: edge.map(str::to_string),
+            max_depth,
+            limit: k,
+        };
+        let db = self.inner.clone();
+        let (c, i) = (collection.to_string(), doc_id.to_string());
+        tokio::task::spawn_blocking(move || {
+            let rows = db.find_paths(&c, &i, &spec).map_err(|e| {
+                let m = e.to_string();
+                // Operator-input problems (untracked incoming, bad
+                // depth/limit) are 400; anything else is a server fault.
+                if m.contains("traverse") || m.contains("create_traverse_index") {
+                    AppError::BadRequest(m)
+                } else {
+                    AppError::Internal(m)
+                }
+            })?;
+            Ok::<_, AppError>(rows
+                .into_iter()
+                .map(|h| hakobackend_core::PathHit {
+                    collection: h.collection.clone(),
+                    id: h.id.clone(),
+                    depth: h.depth as u64,
+                    doc: Self::to_doc(h.id, h.doc),
+                })
+                .collect())
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -944,6 +1013,14 @@ impl Database for HakoDb {
                         kind: hakobackend_core::IndexKind::Vector,
                     });
                 }
+            }
+            for col in list.traverse {
+                out.push(hakobackend_core::IndexInfo {
+                    name: format!("traverse({col})"),
+                    fields: vec![],
+                    unique: false,
+                    kind: hakobackend_core::IndexKind::Traverse,
+                });
             }
             Ok::<_, AppError>(out)
         })
@@ -1299,6 +1376,54 @@ mod tests {
             .unwrap();
         let listed = db.list_indexes("pts").await.unwrap();
         assert_eq!(listed.iter().filter(|i| i.kind == hakobackend_core::IndexKind::Vector).count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Vector-native path: JSON float arrays written via set() encode to
+    /// Binary for indexed fields (write conversion), create + search go
+    /// native, untracked incoming is a loud BadRequest, listing shows
+    /// kind Traverse.
+    #[tokio::test]
+    async fn native_traverse_search() {
+        use hakobackend_core::TraverseDirection;
+        let dir = std::env::temp_dir().join(format!("hakobackend_trav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        db.create_traverse_index("g").await.unwrap();
+        let lnk = |t: &str| serde_json::json!({"link": {"__ref__": t}});
+        let put = |id: &str, v: serde_json::Value| hakobackend_core::Doc {
+            id: id.into(),
+            data: [("link".to_string(), v["link"].clone())].into_iter().collect(),
+        };
+        db.set("g", "a", put("a", lnk("g/b")), false).await.unwrap();
+        db.set("g", "b", put("b", lnk("g/c")), false).await.unwrap();
+        let blank = hakobackend_core::Doc {
+            id: "c".into(),
+            data: [("v".to_string(), serde_json::json!(1))].into_iter().collect(),
+        };
+        db.set("g", "c", blank, false).await.unwrap();
+        let inner = db.inner.clone();
+        tokio::task::spawn_blocking(move || inner.await_quiescent(std::time::Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let hits = db
+            .traverse_search("g", "a", TraverseDirection::Outgoing, None, 10, 100)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "b");
+        assert_eq!(hits[0].depth, 1);
+        assert_eq!(hits[1].id, "c");
+        assert_eq!(hits[1].depth, 2);
+        assert_eq!(hits[1].collection, "g");
+        // Untracked incoming is a loud 400.
+        let bad = db.traverse_search("u", "x", TraverseDirection::Incoming, None, 5, 10).await;
+        assert!(matches!(bad, Err(hakobackend_core::AppError::BadRequest(_))));
+        let listed = db.list_indexes("g").await.unwrap();
+        assert_eq!(
+            listed.iter().filter(|i| i.kind == hakobackend_core::IndexKind::Traverse).count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

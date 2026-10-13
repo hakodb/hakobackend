@@ -273,6 +273,8 @@ fn safe_index_name(table: &str, spec: &IndexSpec) -> String {
         // Unreachable via the validated path (validate_spec rejects Vector
         // before DDL); total for the compiler.
         IndexKind::Vector => format!("vec_{}_{}", table, spec.fields.join("_")),
+        // Same unreachable rule as Vector (validate_spec rejects first).
+        IndexKind::Traverse => format!("trav_{}_{}", table, spec.fields.join("_")),
     });
     let clean: String = base.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     clean.chars().take(60).collect()
@@ -661,6 +663,9 @@ impl Database for PgDb {
             IndexKind::Vector => {
                 return Err(AppError::BadRequest("vector indexes need dim+metric: use POST /api/vector-index".into()));
             }
+            IndexKind::Traverse => {
+                return Err(AppError::BadRequest("traverse tracking needs no field: use POST /api/traverse-index".into()));
+            }
         };
         sqlx::query(&ddl).execute(&self.pool).await.map_err(|e| {
             if is_conflict(&e) {
@@ -675,6 +680,7 @@ impl Database for PgDb {
             IndexKind::Composite => "composite",
             IndexKind::FullText => "fts",
             IndexKind::Vector => "vector",
+            IndexKind::Traverse => "traverse",
         };
         sqlx::query("INSERT INTO \"__ub_indexes\" (collection, name, fields, \"unique\", kind, ddl) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (collection, name) DO UPDATE SET fields = EXCLUDED.fields, \"unique\" = EXCLUDED.\"unique\", kind = EXCLUDED.kind, ddl = EXCLUDED.ddl")
             .bind(collection)

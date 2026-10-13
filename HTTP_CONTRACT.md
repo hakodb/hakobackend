@@ -67,10 +67,13 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
 | `POST /api/collections/<coll>/index {name, fields}` (legacy) | Update | `create_index` | 200 `{success: true}` |
 | `POST /api/vector-index {collection, field, dim, metric?}` | Update | `create_vector_index` | 200 `{success, index}` / 400 |
 | `POST /api/vector-search/{collection} {field, query[], k?, metric?}` | List | `vector_search` | 200 `[{id, score, doc}]` / 400 |
+| `POST /api/traverse-index {collection}` | Update | `create_traverse_index` | 200 `{success, index}` / 400 |
+| `POST /api/traverse-search/{collection} {start_id, direction?, edge?, max_depth?, k?}` | List | `traverse_search` | 200 `[{collection, id, depth, doc}]` / 400 |
 
 - `kind`: `simple` (default, exactly 1 field), `composite` (>1 field, requires
   `supports_composite`), `fts` (1 field, requires `supports_fts`), `vector`
-  (rejected at the generic endpoint — needs dim+metric via `/api/vector-index`).
+  (rejected at the generic endpoint — needs dim+metric via `/api/vector-index`),
+  `traverse` (rejected at the generic endpoint — needs no field, via `/api/traverse-index`).
 - Vector contract: over HTTP a vector field is a JSON array of numbers.
   `metric`: `cosine` (default) | `l2`. `dim` 1..=4096, `k` 1..=1000 (default 10).
   Scores are exact metric distances (lower is nearer) on every driver.
@@ -81,6 +84,13 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
   Pre-index docs land as plain arrays and stay unindexed (only Binary
   LE-f32 encodes index); post-index writes encode automatically. A second
   vector field on the same collection coexists.
+- Graph contract: refs are native (`{"__ref__": "col/id"}` revives on
+  write — no encoding step). `direction`: `outgoing` (default) |
+  `incoming` | `both`; `edge`: single field or omitted (any ref field);
+  `max_depth` 1..=32 (default 10); `k` 1..=1000 (default 100). Hits ride
+  BFS order with per-hop `depth`. Serving: hako only (backlink index);
+  other drivers reject create + search clearly (400, never silent —
+  reverse hops without an index are unbounded scans).
 
 - `kind`: `simple` (default, exactly 1 field), `composite` (>1 field, requires
   `supports_composite`), `fts` (1 field, requires `supports_fts`).

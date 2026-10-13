@@ -717,6 +717,9 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         // them exactly like direct calls.
         .route("/api/vector-index", post(vector_index_create))
         .route("/api/vector-search/{*path}", post(vector_search))
+        // Graph BFS (issue #53): same static-path rule as vector.
+        .route("/api/traverse-index", post(traverse_index_create))
+        .route("/api/traverse-search/{*path}", post(traverse_search))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler));
@@ -4294,6 +4297,141 @@ async fn vector_search(
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
+
+// --- Graph traversal: uniform contract, native-only serving ---
+//
+// Only the hako driver serves walks (backlink index); other drivers
+// reject clearly at the trait default (no bounded gateway fallback
+// exists — reverse hops without an index are full scans per level).
+
+#[derive(Debug, serde::Deserialize)]
+struct TraverseIndexBody {
+    collection: String,
+}
+
+fn parse_traverse_direction(raw: Option<&str>) -> Result<hakobackend_core::TraverseDirection, Response> {
+    use hakobackend_core::TraverseDirection;
+    match raw.unwrap_or("outgoing") {
+        "outgoing" => Ok(TraverseDirection::Outgoing),
+        "incoming" => Ok(TraverseDirection::Incoming),
+        "both" => Ok(TraverseDirection::Both),
+        other => Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("unknown traverse direction '{other}' (outgoing|incoming|both)"),
+        )),
+    }
+}
+
+async fn traverse_index_create(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<TraverseIndexBody>,
+) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
+    let collection = body.collection.trim().to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "collection required");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    let _ = dbh.ensure_collection(&stored).await;
+    match dbh.create_traverse_index(&stored).await {
+        Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct TraverseSearchBody {
+    start_id: String,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    edge: Option<String>,
+    #[serde(default)]
+    max_depth: Option<usize>,
+    #[serde(default)]
+    k: Option<usize>,
+}
+
+async fn traverse_search(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<TraverseSearchBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "traverse-search needs a collection path");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if body.start_id.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "start_id required");
+    }
+    let direction = match parse_traverse_direction(body.direction.as_deref()) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let max_depth = body.max_depth.unwrap_or(10);
+    if max_depth == 0 || max_depth > hakobackend_core::MAX_TRAVERSE_DEPTH {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("max_depth out of range 1..={}", hakobackend_core::MAX_TRAVERSE_DEPTH),
+        );
+    }
+    let k = body.k.unwrap_or(100);
+    if k == 0 || k > hakobackend_core::MAX_TRAVERSE_K {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("k out of range 1..={}", hakobackend_core::MAX_TRAVERSE_K),
+        );
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    match dbh.traverse_search(&stored, &body.start_id, direction, body.edge.as_deref(), max_depth, k).await {
+        Ok(hits) => Json(serde_json::json!(hits)).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
 // --- Local auth (BFF): two HttpOnly cookies, browser never holds tokens ---
 
 fn session_cookies(
@@ -5687,6 +5825,135 @@ mod tests {
             Some(serde_json::json!({"collection": "pts", "field": "emb", "dim": 2}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
         assert!(String::from_utf8_lossy(&b).contains("no vector-index support"));
+    }
+
+    /// Graph HTTP loop, native (hako): track -> PUT refs -> BFS walk with
+    /// depths; loud 400s for bad direction/depth/k. Settle polling mirrors
+    /// the vector loop (2 req/s, 429-tolerant).
+    #[tokio::test]
+    async fn traverse_http_native() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_trav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, "[defaults]\nread = \"public\"\nwrite = \"public\"\n").unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.join("h.ub").to_string_lossy().as_ref()).unwrap());
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        let app = build_router(st.clone(), vec![], false);
+        let (s, b) = call(app.clone(), "POST", "/api/traverse-index",
+            Some(serde_json::json!({"collection": "g"}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        assert!(String::from_utf8_lossy(&b).contains("traverse(g)"));
+        for (id, tgt) in [("a", "g/b"), ("b", "g/c")] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/g/{id}"),
+                Some(serde_json::json!({"link": {"__ref__": tgt}}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/g/c",
+            Some(serde_json::json!({"v": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        let search = || call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": "a", "direction": "outgoing", "max_depth": 10, "k": 100})));
+        let mut hits = serde_json::Value::Null;
+        for _ in 0..90 {
+            let (s, b) = search().await;
+            if s == StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            hits = serde_json::from_slice(&b).unwrap();
+            if hits.as_array().is_some_and(|a| a.len() == 2) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let arr = hits.as_array().expect("2 hits after settle");
+        assert_eq!(arr[0]["id"], "b");
+        assert_eq!(arr[0]["depth"], 1);
+        assert_eq!(arr[1]["id"], "c");
+        assert_eq!(arr[1]["depth"], 2);
+        // Loud 400s: bad direction, depth 0, k 0, missing start_id.
+        let (s, _) = call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": "a", "direction": "sideways"}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": "a", "max_depth": 0}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": "a", "k": 0}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let (s, _) = call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": ""}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    /// Graph on a non-hako driver: create + search both reject clearly
+    /// (no bounded gateway fallback exists for reverse hops).
+    #[tokio::test]
+    async fn traverse_http_unsupported_driver() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let (st, _raw) = rbw_state("[defaults]\nread = \"public\"\nwrite = \"public\"\n", "travunsup").await;
+        let app = build_router(st.clone(), vec![], false);
+        let (s, b) = call(app.clone(), "POST", "/api/traverse-index",
+            Some(serde_json::json!({"collection": "g"}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        assert!(String::from_utf8_lossy(&b).contains("no graph support"));
+        let (s, b) = call(app.clone(), "POST", "/api/traverse-search/g",
+            Some(serde_json::json!({"start_id": "a"}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&b));
+        assert!(String::from_utf8_lossy(&b).contains("no graph support"));
     }
 
     /// Readiness cache (external audit): LB-speed probes must not walk

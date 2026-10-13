@@ -938,7 +938,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1407,7 +1407,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1444,9 +1444,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.3.7"
+version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a6f337c37f478fa6794fc1b58d136ecf3bf7e09b72f8791a2f5dc83594480e9"
+checksum = "bfb660711554ddf214b8cbac79f3f18062b31e8f14ba54ff5c9b27fc5be3ef74"
 dependencies = [
  "cbindgen",
  "hakodb",
@@ -1456,9 +1456,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.13.3"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19d22371cfb8f132a25687f0365bae2f86a7e8ff75df5d699d7cfb4bcf079e05"
+checksum = "d608b64ec284ab267dfdfbf4b63d8b900af3bb63c933e74cdea42c5e6ce67574"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -2538,7 +2538,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2837,7 +2837,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2850,7 +2850,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3462,10 +3462,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4178,15 +4178,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets 0.52.6",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets 0.52.6",
 ]
