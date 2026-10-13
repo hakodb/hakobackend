@@ -1,9 +1,9 @@
 # hakobackend
 Universal HTTP backend gateway + plug-and-play databases (Rust + Axum)
 
-> Part of [**HakoDB**](https://github.com/hakodb/hakodb) — embedded Firestore-style document DB in Rust. The engine + C ABI live in `hakodb/hakodb`; this repo holds the universal HTTP backend gateway.
+> Part of [**HakoDB**](https://github.com/hakodb/hakodb) — embedded document DB with native vector search and multi-plane sync, written in Rust. The engine + C ABI live in `hakodb/hakodb`; this repo holds the universal HTTP backend gateway.
 
-Successor to `rethink-firestore/backend` — wire-protocol compatible so existing SDKs keep working.
+Successor to the legacy backend — wire-protocol compatible so existing SDKs keep working.
 
 - Full design notes: [`KAJIAN.md`](KAJIAN.md)
 - Database addon contract: [`DRIVER_CONTRACT.md`](DRIVER_CONTRACT.md) (+ `driver.example.toml`)

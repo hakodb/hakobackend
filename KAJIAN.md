@@ -1,4 +1,4 @@
-# Design Notes: Universal Backend (Rust + Axum) — successor to `rethink-firestore/backend`
+# Design Notes: Universal Backend (Rust + Axum) — successor to the legacy backend
 
 > Legacy backend status: ~90% mature, in production at `https://api.example.com/api`.
 > Problem: rigid security (`userrules.ts` + mandatory Firebase Auth) → hard for general developers to reuse.
