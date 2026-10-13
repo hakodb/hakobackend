@@ -213,10 +213,39 @@ impl hakobackend_core::Database for ClusterDb {
         field: &str,
         query: &[f32],
         k: usize,
-        metric: VectorMetric,
-    ) -> Result<Vec<ScoredDoc>, AppError> {
+        metric: hakobackend_core::VectorMetric,
+    ) -> Result<Vec<hakobackend_core::ScoredDoc>, AppError> {
         // Reads go to the writer (native when the writer is HakoDb).
         self.writer().vector_search(collection, field, query, k, metric).await
+    }
+
+    async fn create_traverse_index(
+        &self,
+        collection: &str,
+    ) -> Result<IndexInfo, AppError> {
+        // Same DDL fan-out rule as create_index/vector (definitions never
+        // replicate; every member tracks locally).
+        let mut out = None;
+        for m in &self.members {
+            let info = m.create_traverse_index(collection).await?;
+            if out.is_none() {
+                out = Some(info);
+            }
+        }
+        out.ok_or_else(|| AppError::Internal("no cluster members".into()))
+    }
+
+    async fn traverse_search(
+        &self,
+        collection: &str,
+        doc_id: &str,
+        direction: hakobackend_core::TraverseDirection,
+        edge: Option<&str>,
+        max_depth: usize,
+        k: usize,
+    ) -> Result<Vec<hakobackend_core::PathHit>, AppError> {
+        // Reads go to the writer (native when the writer is HakoDb).
+        self.writer().traverse_search(collection, doc_id, direction, edge, max_depth, k).await
     }
 
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError> {
