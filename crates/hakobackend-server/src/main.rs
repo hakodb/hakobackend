@@ -720,6 +720,7 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         // Graph BFS (issue #53): same static-path rule as vector.
         .route("/api/traverse-index", post(traverse_index_create))
         .route("/api/traverse-search/{*path}", post(traverse_search))
+        .route("/api/edge-index", post(edge_index_create))
         .route("/api/admin/reload", post(reload))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler));
@@ -4362,6 +4363,46 @@ async fn traverse_index_create(
     }
 }
 
+async fn edge_index_create(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<TraverseIndexBody>,
+) -> impl IntoResponse {
+    if let Some(r) = deny_if_read_only(&s) {
+        return r;
+    }
+    let collection = body.collection.trim().to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "collection required");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::Update, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    let _ = dbh.ensure_collection(&stored).await;
+    match dbh.create_edge_index(&stored).await {
+        Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct TraverseSearchBody {
     start_id: String,
@@ -4373,6 +4414,12 @@ struct TraverseSearchBody {
     max_depth: Option<usize>,
     #[serde(default)]
     k: Option<usize>,
+    /// Phase B: edge collection (docs with _from/_to join the walk).
+    #[serde(default)]
+    via: Option<String>,
+    /// Phase B: numeric prop on edge docs for Dijkstra ordering.
+    #[serde(default)]
+    weight: Option<String>,
 }
 
 async fn traverse_search(
@@ -4427,7 +4474,7 @@ async fn traverse_search(
         return forbidden();
     }
     let stored = stored(&collection);
-    match dbh.traverse_search(&stored, &body.start_id, direction, body.edge.as_deref(), max_depth, k).await {
+    match dbh.traverse_search(&stored, &body.start_id, direction, body.edge.as_deref(), body.via.as_deref(), body.weight.as_deref(), max_depth, k).await {
         Ok(hits) => Json(serde_json::json!(hits)).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
@@ -5915,6 +5962,30 @@ mod tests {
         let (s, _) = call(app.clone(), "POST", "/api/traverse-search/g",
             Some(serde_json::json!({"start_id": ""}))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+        // Weighted leg: edge docs a -1-> b -1-> c plus a -10-> c.
+        let (s, b) = call(app.clone(), "POST", "/api/edge-index",
+            Some(serde_json::json!({"collection": "rel"}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        for (id, f, t, w) in [("e1", "a", "b", 1.0), ("e2", "b", "c", 1.0), ("e3", "a", "c", 10.0)] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/rel/{id}"),
+                Some(serde_json::json!({"_from": {"__ref__": format!("n/{f}")}, "_to": {"__ref__": format!("n/{t}")}, "w": w}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        for id in ["a", "b", "c"] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/n/{id}"),
+                Some(serde_json::json!({"v": 1}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let (s, b) = call(app.clone(), "POST", "/api/traverse-search/n",
+            Some(serde_json::json!({"start_id": "a", "via": "rel", "weight": "w", "max_depth": 10, "k": 100}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let whits: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        let warr = whits.as_array().unwrap();
+        assert_eq!(warr.len(), 2);
+        assert_eq!(warr[0]["id"], "b");
+        assert!((warr[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(warr[1]["id"], "c");
+        assert!((warr[1]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9, "cheapest a-b-c: {warr:?}");
     }
 
     /// Graph on a non-hako driver: create + search both reject clearly

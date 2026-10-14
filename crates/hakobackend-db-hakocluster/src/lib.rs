@@ -241,11 +241,28 @@ impl hakobackend_core::Database for ClusterDb {
         doc_id: &str,
         direction: hakobackend_core::TraverseDirection,
         edge: Option<&str>,
+        via_edge: Option<&str>,
+        weight_field: Option<&str>,
         max_depth: usize,
         k: usize,
     ) -> Result<Vec<hakobackend_core::PathHit>, AppError> {
         // Reads go to the writer (native when the writer is HakoDb).
-        self.writer().traverse_search(collection, doc_id, direction, edge, max_depth, k).await
+        self.writer().traverse_search(collection, doc_id, direction, edge, via_edge, weight_field, max_depth, k).await
+    }
+
+    async fn create_edge_index(
+        &self,
+        collection: &str,
+    ) -> Result<IndexInfo, AppError> {
+        // Same DDL fan-out rule as create_traverse_index.
+        let mut out = None;
+        for m in &self.members {
+            let info = m.create_edge_index(collection).await?;
+            if out.is_none() {
+                out = Some(info);
+            }
+        }
+        out.ok_or_else(|| AppError::Internal("no cluster members".into()))
     }
 
     async fn drop_index(&self, collection: &str, name: &str) -> Result<(), AppError> {

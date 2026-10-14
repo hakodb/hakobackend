@@ -472,19 +472,29 @@ pub trait Database: Send + Sync {
         let _ = collection;
         Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
     }
-    /// Graph BFS from one anchor. Default: reject clearly (unlike vector
-    /// there is no bounded gateway fallback — reverse hops without an
-    /// index are full scans per level).
+    /// Register an edge collection (tracks it + `_from`/`_to` lookup).
+    /// Default: same clear rejection.
+    async fn create_edge_index(&self, collection: &str) -> Result<IndexInfo, AppError> {
+        let _ = collection;
+        Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
+    }
+    /// Graph walk from one anchor: BFS, or Dijkstra when `weight_field`
+    /// is set (Phase B: cost-ordered over `via_edge` edge docs).
+    /// Default: reject clearly (unlike vector there is no bounded
+    /// gateway fallback — reverse hops without an index are full scans
+    /// per level).
     async fn traverse_search(
         &self,
         collection: &str,
         doc_id: &str,
         direction: TraverseDirection,
         edge: Option<&str>,
+        via_edge: Option<&str>,
+        weight_field: Option<&str>,
         max_depth: usize,
         k: usize,
     ) -> Result<Vec<PathHit>, AppError> {
-        let _ = (collection, doc_id, direction, edge, max_depth, k);
+        let _ = (collection, doc_id, direction, edge, via_edge, weight_field, max_depth, k);
         Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
     }
     /// Create a vector (KNN) index. Default: reject clearly (drivers
@@ -830,6 +840,8 @@ pub struct PathHit {
     pub collection: String,
     pub id: String,
     pub depth: u64,
+    /// Accumulated cost (BFS: hops; Dijkstra: weight sum).
+    pub cost: f64,
     pub doc: Doc,
 }
 
