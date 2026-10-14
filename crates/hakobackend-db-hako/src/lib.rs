@@ -837,12 +837,33 @@ impl Database for HakoDb {
         })
     }
 
+    async fn create_edge_index(&self, collection: &str) -> Result<hakobackend_core::IndexInfo, AppError> {
+        if collection.is_empty() {
+            return Err(AppError::BadRequest("edge index needs a collection".into()));
+        }
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.create_edge_index(&c).map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        Ok(hakobackend_core::IndexInfo {
+            name: format!("edge({collection})"),
+            fields: vec!["_from".to_string(), "_to".to_string()],
+            unique: false,
+            kind: hakobackend_core::IndexKind::Traverse,
+        })
+    }
+
     async fn traverse_search(
         &self,
         collection: &str,
         doc_id: &str,
         direction: hakobackend_core::TraverseDirection,
         edge: Option<&str>,
+        via_edge: Option<&str>,
+        weight_field: Option<&str>,
         max_depth: usize,
         k: usize,
     ) -> Result<Vec<hakobackend_core::PathHit>, AppError> {
@@ -856,6 +877,8 @@ impl Database for HakoDb {
             edge_field: edge.map(str::to_string),
             max_depth,
             limit: k,
+            via_edge: via_edge.map(str::to_string),
+            weight_field: weight_field.map(str::to_string),
         };
         let db = self.inner.clone();
         let (c, i) = (collection.to_string(), doc_id.to_string());
@@ -876,6 +899,7 @@ impl Database for HakoDb {
                     collection: h.collection.clone(),
                     id: h.id.clone(),
                     depth: h.depth as u64,
+                    cost: h.cost,
                     doc: Self::to_doc(h.id, h.doc),
                 })
                 .collect())
@@ -1407,7 +1431,7 @@ mod tests {
             .await
             .unwrap();
         let hits = db
-            .traverse_search("g", "a", TraverseDirection::Outgoing, None, 10, 100)
+            .traverse_search("g", "a", TraverseDirection::Outgoing, None, None, None, 10, 100)
             .await
             .unwrap();
         assert_eq!(hits.len(), 2);
@@ -1417,8 +1441,40 @@ mod tests {
         assert_eq!(hits[1].depth, 2);
         assert_eq!(hits[1].collection, "g");
         // Untracked incoming is a loud 400.
-        let bad = db.traverse_search("u", "x", TraverseDirection::Incoming, None, 5, 10).await;
+        let bad = db.traverse_search("u", "x", TraverseDirection::Incoming, None, None, None, 5, 10).await;
         assert!(matches!(bad, Err(hakobackend_core::AppError::BadRequest(_))));
+        // Weighted via edge docs: a -1-> b -1-> c plus a -10-> c.
+        db.create_edge_index("rel").await.unwrap();
+        let edge = |f: &str, t: &str, w: f64| hakobackend_core::Doc {
+            id: format!("{f}{t}"),
+            data: [
+                ("_from".to_string(), serde_json::json!({"__ref__": format!("n/{f}")})),
+                ("_to".to_string(), serde_json::json!({"__ref__": format!("n/{t}")})),
+                ("w".to_string(), serde_json::json!(w)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        for (f, t, w) in [("a", "b", 1.0), ("b", "c", 1.0), ("a", "c", 10.0)] {
+            db.set("rel", &format!("{f}{t}"), edge(f, t, w), false).await.unwrap();
+        }
+        for id in ["a", "b", "c"] {
+            let d = hakobackend_core::Doc { id: id.into(), data: Default::default() };
+            db.set("n", id, d, false).await.unwrap();
+        }
+        let inner = db.inner.clone();
+        tokio::task::spawn_blocking(move || inner.await_quiescent(std::time::Duration::from_secs(60)))
+            .await
+            .unwrap();
+        let hits = db
+            .traverse_search("n", "a", TraverseDirection::Outgoing, None, Some("rel"), Some("w"), 10, 100)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "b");
+        assert!((hits[0].cost - 1.0).abs() < 1e-9);
+        assert_eq!(hits[1].id, "c");
+        assert!((hits[1].cost - 2.0).abs() < 1e-9, "cheapest a-b-c, not direct");
         let listed = db.list_indexes("g").await.unwrap();
         assert_eq!(
             listed.iter().filter(|i| i.kind == hakobackend_core::IndexKind::Traverse).count(),

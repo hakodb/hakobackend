@@ -68,7 +68,8 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
 | `POST /api/vector-index {collection, field, dim, metric?}` | Update | `create_vector_index` | 200 `{success, index}` / 400 |
 | `POST /api/vector-search/{collection} {field, query[], k?, metric?}` | List | `vector_search` | 200 `[{id, score, doc}]` / 400 |
 | `POST /api/traverse-index {collection}` | Update | `create_traverse_index` | 200 `{success, index}` / 400 |
-| `POST /api/traverse-search/{collection} {start_id, direction?, edge?, max_depth?, k?}` | List | `traverse_search` | 200 `[{collection, id, depth, doc}]` / 400 |
+| `POST /api/traverse-search/{collection} {start_id, direction?, edge?, max_depth?, k?, via?, weight?}` | List | `traverse_search` | 200 `[{collection, id, depth, cost, doc}]` / 400 |
+| `POST /api/edge-index {collection}` | Update | `create_edge_index` | 200 `{success, index}` / 400 |
 
 - `kind`: `simple` (default, exactly 1 field), `composite` (>1 field, requires
   `supports_composite`), `fts` (1 field, requires `supports_fts`), `vector`
@@ -91,6 +92,11 @@ writes. Result shapes: batch → every op `{id, success}`; transaction →
   BFS order with per-hop `depth`. Serving: hako only (backlink index);
   other drivers reject create + search clearly (400, never silent —
   reverse hops without an index are unbounded scans).
+- Graph Phase B: `POST /api/edge-index {collection}` registers an edge
+  collection (tracks it + `_from`/`_to` lookup, all existing machinery).
+  `traverse-search` accepts `via` (edge collection) + `weight` (numeric
+  prop) for cost-ordered Dijkstra; hits carry `cost` (BFS: hops).
+  Missing/non-numeric weights count 1.0, negatives clamp 0.
 
 - `kind`: `simple` (default, exactly 1 field), `composite` (>1 field, requires
   `supports_composite`), `fts` (1 field, requires `supports_fts`).
