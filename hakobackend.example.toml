@@ -4,10 +4,14 @@ host = "0.0.0.0"
 port = 3000
 
 # CHANGE DATABASE: edit 2 lines + POST /api/admin/reload. No rebuild.
-# hako (default, embedded) | postgres | sqlite | mysql (rethink pending)
+# hako (default, embedded) | hakocluster (N Hako dirs, comma-separated) |
+# postgres | sqlite | mysql | rethinkdb
 driver = "hako"
-# file path (hako/sqlite) or DSN (postgres/mysql)
+# file path (hako/sqlite), comma-separated dirs (hakocluster), or DSN (postgres/mysql)
 data = "./data/hako.ub"
+# Socket peering with sibling backends (hako only, unix only, single-db):
+# sync_serve = "/run/hakobackend/hako.sock"
+# sync_peer = ["/run/other/hako.sock"]
 # Co-located postgres/mysql: unix socket instead of TCP (measured
 # +65-140% gateway RPS on weak CPUs — TCP stack is the cost, not the
 # engine). Share the socket dir into the backend container, e.g.

@@ -32,7 +32,9 @@ literally (`akademik.posts/*/revisions` is a valid pattern).
 |---|---|---|---|
 | `GET` document / collection+`?options=` | Get / List | `get` / `list` + per-doc filter | 200 / 404 / 400 (malformed options) |
 | `GET /api/collections` | List (per-collection filter, issue #47) | `list_collections` | 200 |
+| `GET /api/health` | — (ungated, LB hot path: static bytes, no storage touch) | none | 200 `{"db":"hakodb","status":"ok"}` |
 | `GET /api/ready` | — (ungated, LB/K8s) | driver answers | 200 `{ready:true}` / 503 |
+| `GET /api/__wstats` | — (ungated diagnostics; 404 unless `UB_WSTATS=1`) | handler-stage timings, 1/16 sampling | 200 / 404 |
 | `POST` collection | Create | `insert` (empty id filled by driver) | 200 / 400 (wrong route kind) |
 | `PUT` document | Update | `set(merge=false)` = full replace | 200 / 400 |
 | `PATCH` document | Update | shallow merge; **404 when absent** (use PUT to create) | 200 / 400 / 404 |
@@ -324,8 +326,15 @@ today's behavior exactly.
 - Files: metadata lives in the addressed db's collection; bytes are
   content-addressed and shared; the sweeper unions all databases.
 - Unknown-db auto-create: SQL drivers (operator pre-creates or a
-  follow-up CREATEDB convenience); cluster names must pre-exist
-  (explicit registry, reload to add).
+  follow-up CREATEDB convenience). Each named database opens an
+  independent driver instance from its own path — for `hakocluster`
+  that means a separate cluster per entry (own comma-separated dirs,
+  own `<first-dir>.sync` socket dir); there is no shared cluster
+  registry, and reload re-opens all entries.
+- Sync flags (`sync_serve`/`sync_peer`, see §20) are global: they apply
+  identically to every database. Socket peering is a single-database
+  topology — multidb deployments must not set them (all instances
+  would share one serve path/peers).
 
 ## 17. Archive moves + lazy residency (issue #21 A)
 
@@ -389,3 +398,23 @@ field-path GET returns the marker as-is). Malformed markers
 (no slash, empty side) stay plain maps. `__blob__` markers
 are never client-mintable over HTTP (offsets are
 server-minted during extraction); they pass through as maps.
+
+## 20. Backend socket sync (`sync_serve` / `sync_peer`)
+
+The `hako` driver can peer with sibling backend processes over unix
+sockets (engine `socket_sync`): snapshots on connect, live tail after.
+Flags (CLI or config file, repeatable `sync_peer`):
+
+- `sync_serve = "/run/hakobackend/hako.sock"` — serve this instance's
+  database for peers (absent = no serving). Parent dirs are created.
+- `sync_peer = ["/run/other/hako.sock", …]` — dial out; retries run in
+  the background until peered, so boot order doesn't matter and peer
+  restarts self-heal. One dial direction suffices (traffic is
+  bidirectional per connection).
+
+Rules: hako-driver only (`hakocluster` refuses both flags — it meshes
+itself; SQL drivers refuse them — they need `hako`); unix-only
+(fail-closed at startup elsewhere); single-database topology (flags are
+global across `[databases]`, see §16); reload swaps peering (stop-then-
+replace, no duplicate dial tasks). No serve + no peers = no-op.
+`sync_peer_count` surfaces live peering per database for ops.
