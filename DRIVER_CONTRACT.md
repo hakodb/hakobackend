@@ -89,11 +89,25 @@ That is all. Handlers, policy, and realtime never know which driver is in use.
 | Driver | Crate | Status | Watch | Transactions |
 |---|---|---|---|---|
 | `hako` | `hakobackend-db-hako` | ✅ default (embedded, zero-setup) | yes | yes |
+| `hakocluster` | `hakobackend-db-hakocluster` | ✅ in-process N-instance dispatcher over Hako dirs (see below) | yes (via writer) | yes (via writer) |
 | `postgres` | `hakobackend-db-postgres` | ✅ via sqlx (pool, JSONB) | polling | yes |
 | `sqlite` | `hakobackend-db-sqlite` | ✅ via sqlx (file/`:memory:`, FTS5) | polling | yes |
 | `mysql` | `hakobackend-db-mysql` | ✅ via sqlx (pool, JSON, generated FTS) | polling | yes |
 | `rethinkdb` | `hakobackend-db-rethinkdb` | ✅ live-verified vs 2.4.3 (conformance + index suites; see RETHINKDB_SPIKE.md) | changefeed push (dedicated session per table) | emulated (validate+apply+rollback; see driver notes) |
 | `mongodb` | `hakobackend-db-mongo` | 🔜 next phase (official `mongodb` crate, async) | change stream | yes |
+
+### `hakocluster` driver notes
+
+`data` is comma-separated Hako dirs (`"a.ub,b.ub"`); one dir is a
+degenerate single that works everywhere including non-unix. N > 1 needs
+unix — socket peering fails closed there, same rule as the engine.
+Capabilities (watch/transactions) delegate to the designated writer, so
+the row above mirrors hako; exact reads (counts/aggregates/metadata)
+route to the writer while point reads and queries may trail the socket
+tail interval. The cluster socket dir is a sibling `<first-dir>.sync`
+(never inside a data dir — Hako would list it as a phantom collection).
+`sync_serve`/`sync_peer` flags are refused with this driver (it meshes
+itself); use them only with `hako`.
 
 ### Next phase: MongoDB
 
