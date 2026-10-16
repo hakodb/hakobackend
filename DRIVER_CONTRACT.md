@@ -107,7 +107,9 @@ route to the writer while point reads and queries may trail the socket
 tail interval. The cluster socket dir is a sibling `<first-dir>.sync`
 (never inside a data dir — Hako would list it as a phantom collection).
 `sync_serve`/`sync_peer` flags are refused with this driver (it meshes
-itself); use them only with `hako`.
+itself); use them only with `hako`. The N+1 tailer is configured via
+`[cluster.tailer_mesh]` / `[cluster.tailer_cloud]` (default database
+only, file-only, boot-time) — see `hakobackend.example.toml`.
 
 ### Next phase: MongoDB
 
