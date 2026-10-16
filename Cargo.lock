@@ -1462,7 +1462,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "axum",
  "axum-server",
