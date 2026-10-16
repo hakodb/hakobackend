@@ -28,6 +28,18 @@ pub struct ClusterDb {
 
 impl ClusterDb {
     pub fn open(dirs: &str) -> Result<Self, AppError> {
+        Self::open_with_tailer(dirs, None, None)
+    }
+
+    /// Open with an optional N+1 sync tailer (unix-only, fail-closed
+    /// elsewhere; mesh+cloud exclusive — enforced again at cluster
+    /// open, this signature just forwards). The tailer bridges this
+    /// box outward; serving reads/writes never route through it.
+    pub fn open_with_tailer(
+        dirs: &str,
+        tailer_mesh: Option<hakocluster::TailerMesh>,
+        tailer_cloud: Option<hakocluster::TailerCloud>,
+    ) -> Result<Self, AppError> {
         let paths: Vec<&str> = dirs
             .split(',')
             .map(str::trim)
@@ -45,6 +57,8 @@ impl ClusterDb {
         );
         let mut cfg = hakocluster::ClusterConfig::default();
         cfg.sock_dir = sock_dir;
+        cfg.tailer_mesh = tailer_mesh;
+        cfg.tailer_cloud = tailer_cloud;
         let cluster = hakocluster::Cluster::open_with_config(&paths, cfg)
             .map_err(AppError::Internal)?;
         let members = cluster
@@ -304,6 +318,32 @@ mod tests {
     fn open_rejects_empty_dirs() {
         assert!(ClusterDb::open("").is_err());
         assert!(ClusterDb::open("  , ").is_err());
+    }
+
+    #[test]
+    fn open_with_tailer_rejects_both_lanes() {
+        // Fail-closed before anything opens (all platforms — the
+        // validation runs ahead of the unix gate).
+        let mesh = hakocluster::TailerMesh {
+            name: "t".into(),
+            room_key: "k".into(),
+            port: 0,
+        };
+        let cloud = hakocluster::TailerCloud {
+            client_id: "t".into(),
+            auth_token: "a".into(),
+            mode: hakocluster::TailerCloudMode::Client {
+                room_name: "r".into(),
+                room_key: "k".into(),
+                server_url: "ws://127.0.0.1:9".into(),
+            },
+        };
+        let dir = tmp("bothlanes");
+        match ClusterDb::open_with_tailer(&dir, Some(mesh), Some(cloud)) {
+            Ok(_) => panic!("mesh+cloud must not coexist"),
+            Err(e) => assert!(e.to_string().contains("exclusive"), "unexpected: {e}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

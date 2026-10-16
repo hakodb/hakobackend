@@ -7,6 +7,7 @@ edition = "2021"
 hakobackend-core = { path = "../hakobackend-core" }
 hakobackend-db-hako = { path = "../hakobackend-db-hako" }
 hakobackend-db-hakocluster = { path = "../hakobackend-db-hakocluster" }
+hakocluster = "0.4"
 hakobackend-policy = { path = "../hakobackend-policy" }
 hakobackend-auth-core = { path = "../hakobackend-auth-core" }
 hakobackend-auth-local = { path = "../hakobackend-auth-local", features = ["test-utils"] }

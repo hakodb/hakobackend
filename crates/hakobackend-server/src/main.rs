@@ -585,12 +585,16 @@ fn mtime(path: &str) -> Option<SystemTime> {
 
 /// The only place that knows the driver list. New driver = 1 new arm.
 /// Unimplemented drivers return a clear message, not a panic.
+///
+/// `tailer` (cluster N+1 bridge) applies to the DEFAULT database only —
+/// callers pass None for `[databases]` extras. One bridge per box.
 async fn open_driver(
     driver: &str,
     path: &str,
     sync_serve: Option<String>,
     sync_peer: Vec<String>,
     ttl_sweep_secs: u64,
+    tailer: Option<crate::config::ClusterTailer>,
 ) -> Result<Arc<dyn Database>, String> {
     use hakobackend_core::ttl::TtlDb;
     // Every driver is wrapped once: TTL expiry filters uniformly, and the
@@ -614,8 +618,44 @@ async fn open_driver(
             if sync_serve.is_some() || !sync_peer.is_empty() {
                 return Err("sync_serve/sync_peer are hako-driver only; the hakocluster driver meshes itself".into());
             }
-            let cluster =
-                ClusterDb::open(path).map_err(|e| e.to_string())?;
+            // N+1 tailer (default database only — extras never bridge).
+            // hakocluster re-validates (unix-only, exclusive lanes).
+            let (mesh, cloud) = match tailer {
+                None => (None, None),
+                Some(crate::config::ClusterTailer::Mesh { name, room_key, port }) => (
+                    Some(hakocluster::TailerMesh { name, room_key, port }),
+                    None,
+                ),
+                Some(crate::config::ClusterTailer::Cloud {
+                    mode,
+                    client_id,
+                    auth_token,
+                    room_name,
+                    room_key,
+                    server_url,
+                    bind_addr,
+                }) => (
+                    None,
+                    Some(hakocluster::TailerCloud {
+                        client_id,
+                        auth_token,
+                        mode: match mode.as_str() {
+                            "server" => hakocluster::TailerCloudMode::Server {
+                                room_name,
+                                room_key,
+                                bind_addr,
+                            },
+                            _ => hakocluster::TailerCloudMode::Client {
+                                room_name,
+                                room_key,
+                                server_url,
+                            },
+                        },
+                    }),
+                ),
+            };
+            let cluster = hakobackend_db_hakocluster::ClusterDb::open_with_tailer(path, mesh, cloud)
+                .map_err(|e| e.to_string())?;
             Arc::new(TtlDb::new(cluster)) as Arc<dyn Database>
         }
         "postgres" | "sqlite" | "mysql" | "rethinkdb" => {
@@ -654,6 +694,7 @@ async fn open_driver(
 /// Open `default` (`data`) + every `[databases]` entry (issue #13)
 /// through the SAME driver. Each open spawns its own TTL sweeper
 /// (inside open_driver) — expiry stays per-database, never shared.
+/// The cluster tailer (if configured) attaches to `default` only.
 async fn open_dbs(
     driver: &str,
     data: &str,
@@ -661,18 +702,19 @@ async fn open_dbs(
     sync_serve: Option<String>,
     sync_peer: Vec<String>,
     ttl_sweep_secs: u64,
+    tailer: Option<crate::config::ClusterTailer>,
 ) -> Result<std::collections::HashMap<String, Arc<dyn Database>>, String> {
     let mut m = std::collections::HashMap::new();
     m.insert(
         "default".to_string(),
-        open_driver(driver, data, sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs).await?,
+        open_driver(driver, data, sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs, tailer).await?,
     );
     let mut names: Vec<&String> = extra.keys().collect();
     names.sort();
     for n in names {
         m.insert(
             n.clone(),
-            open_driver(driver, &extra[n], sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs)
+            open_driver(driver, &extra[n], sync_serve.clone(), sync_peer.clone(), ttl_sweep_secs, None)
                 .await
                 .map_err(|e| format!("database `{n}`: {e}"))?,
         );
@@ -850,7 +892,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Fail closed before opening anything (useless/broken issuance shapes).
     validate_local_modes(&cfg).map_err(|e| format!("[ub] {e}"))?;
-    let dbs_map = open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await.expect("open database");
+    let dbs_map = open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs, cfg.cluster_tailer.clone()).await.expect("open database");
     let db: Arc<dyn Database> = dbs_map["default"].clone();
     println!("[ub] driver={} data={} config={} databases=[{}]", cfg.driver, cfg.data, if cfg.source.is_empty() { "(default+flag)" } else { &cfg.source }, {
         let mut n: Vec<&String> = dbs_map.keys().collect();
@@ -2014,7 +2056,7 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
             std::env::set_var("UB_PUBLIC_URL", p);
         }
     }
-    let dbs_map = match open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs).await {
+    let dbs_map = match open_dbs(&cfg.driver, &cfg.data, &cfg.databases, cfg.sync_serve.clone(), cfg.sync_peer.clone(), cfg.ttl_sweep_secs, cfg.cluster_tailer.clone()).await {
         Ok(m) => m,
         Err(e) => {
             audit::reload(&admin, &ip, false, &e);

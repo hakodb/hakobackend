@@ -231,6 +231,10 @@ pub struct UbConfig {
     pub sync_serve: Option<String>,
     /// Socket_sync dial peers (empty = dial none; pure serve is valid).
     pub sync_peer: Vec<String>,
+    /// Cluster N+1 sync tailer, default database only (file-only,
+    /// boot-time). At most one lane; the cluster open enforces the rest
+    /// (unix-only, feature transport, exclusive lanes).
+    pub cluster_tailer: Option<ClusterTailer>,
     pub public_url: Option<String>,
     pub limit_global: (u32, u32),
     pub limit_auth: (u32, u32),
@@ -268,6 +272,63 @@ pub struct AliasDecl {
     pub target_path: String,
     #[serde(default)]
     pub target_query: String,
+}
+
+/// Cluster N+1 sync tailer (issue hakocluster#23): one bridge for the
+/// box outward. Mesh joins a LAN room; cloud joins a hub (client) or
+/// hosts this box's room (server).
+#[derive(Debug, Clone)]
+pub enum ClusterTailer {
+    Mesh {
+        name: String,
+        room_key: String,
+        port: u16,
+    },
+    Cloud {
+        mode: String,
+        client_id: String,
+        auth_token: String,
+        room_name: String,
+        room_key: String,
+        server_url: String,
+        bind_addr: String,
+    },
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct ClusterTailerMeshFile {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    room_key: String,
+    #[serde(default)]
+    port: u16,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct ClusterTailerCloudFile {
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    auth_token: String,
+    #[serde(default)]
+    room_name: String,
+    #[serde(default)]
+    room_key: String,
+    #[serde(default)]
+    server_url: String,
+    #[serde(default)]
+    bind_addr: String,
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+struct ClusterFile {
+    #[serde(default)]
+    tailer_mesh: Option<ClusterTailerMeshFile>,
+    #[serde(default)]
+    tailer_cloud: Option<ClusterTailerCloudFile>,
 }
 
 /// Default for `plain_loopback` (serde default fn): on unless opted out.
@@ -433,6 +494,11 @@ struct FileConfig {
     /// flows through the same auth/policy/limit as a direct call.
     #[serde(default)]
     aliases: Vec<AliasDecl>,
+    /// Cluster tailer (file-only, boot-time): `[cluster.tailer_mesh]`
+    /// or `[cluster.tailer_cloud]`, never both. Applies to the default
+    /// database's cluster only. See `ClusterTailerMesh/Cloud`.
+    #[serde(default)]
+    cluster: ClusterFile,
     sync_serve: Option<String>,
     #[serde(default)]
     sync_peer: Vec<String>,
@@ -710,6 +776,29 @@ pub fn resolve(args: &Args) -> UbConfig {
             v.extend(args.sync_peer.clone());
             v
         },
+        cluster_tailer: match (&file.cluster.tailer_mesh, &file.cluster.tailer_cloud) {
+            (None, None) => None,
+            (Some(m), None) => Some(ClusterTailer::Mesh {
+                name: m.name.clone(),
+                room_key: m.room_key.clone(),
+                port: m.port,
+            }),
+            (None, Some(c)) => Some(ClusterTailer::Cloud {
+                mode: c.mode.clone(),
+                client_id: c.client_id.clone(),
+                auth_token: c.auth_token.clone(),
+                room_name: c.room_name.clone(),
+                room_key: c.room_key.clone(),
+                server_url: c.server_url.clone(),
+                bind_addr: c.bind_addr.clone(),
+            }),
+            (Some(_), Some(_)) => {
+                // Fail-closed here (not just validate): resolve() feeds
+                // boot directly, and a both-lanes config must never
+                // produce a half-bridged box.
+                panic!("[ub] [cluster] tailer_mesh + tailer_cloud are exclusive")
+            }
+        },
         admin_uids: {
             let mut v = file.admin_uids;
             v.extend(args.admin_uids.clone());
@@ -809,6 +898,61 @@ pub fn validate(cfg: &UbConfig) -> Result<String, String> {
     }
     if cfg.databases.contains_key("default") {
         return Err("[databases] must not name `default` (that is `data`)".into());
+    }
+    // Cluster tailer (issue hakocluster#23): file-only, default database
+    // only, hakocluster driver only. The cluster open re-validates, but
+    // config errors deserve config-shaped messages at boot.
+    if let Some(tailer) = &cfg.cluster_tailer {
+        if cfg.driver != "hakocluster" {
+            return Err("cluster tailer needs driver `hakocluster`".into());
+        }
+        match tailer {
+            ClusterTailer::Mesh { name, room_key, .. } => {
+                if name.is_empty() || room_key.is_empty() {
+                    return Err("[cluster.tailer_mesh] needs name + room_key".into());
+                }
+            }
+            ClusterTailer::Cloud {
+                mode,
+                client_id,
+                auth_token,
+                room_name,
+                room_key,
+                server_url,
+                bind_addr,
+            } => {
+                if client_id.is_empty() || auth_token.is_empty() {
+                    return Err("[cluster.tailer_cloud] needs client_id + auth_token".into());
+                }
+                match mode.as_str() {
+                    "client" => {
+                        if room_name.is_empty()
+                            || room_key.is_empty()
+                            || server_url.is_empty()
+                        {
+                            return Err(
+                                "[cluster.tailer_cloud] client mode needs room_name + room_key + server_url".into(),
+                            );
+                        }
+                    }
+                    "server" => {
+                        if room_name.is_empty()
+                            || room_key.is_empty()
+                            || bind_addr.is_empty()
+                        {
+                            return Err(
+                                "[cluster.tailer_cloud] server mode needs room_name + room_key + bind_addr".into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "[cluster.tailer_cloud] mode must be \"client\" or \"server\"".into(),
+                        )
+                    }
+                }
+            }
+        }
     }
     match tls_pair(cfg)? {
         Some((c, k)) => {
@@ -940,6 +1084,22 @@ limit_auth_burst = 5
 # drivers (hako/sqlite) refuse this section (default only).
 # [databases]
 # app2 = "./data/app2.ub"
+# Cluster N+1 sync tailer (issue hakocluster#23; all commented = off).
+# File-only, boot-time, default database + hakocluster driver only.
+# At most one lane; the cluster open re-validates (unix-only,
+# exclusive lanes, feature transport).
+# [cluster.tailer_mesh]
+# name = "box-a"
+# room_key = "shared-room-secret"
+# port = 17891
+# [cluster.tailer_cloud]
+# mode = "client"  # or "server"
+# client_id = "box-a"
+# auth_token = "shared-secret"
+# room_name = "ops"
+# room_key = "shared-secret"
+# server_url = "ws://hub:8080"   # client mode
+# bind_addr = "0.0.0.0:8080"     # server mode
 # Realtime guards for small boxes: per-subscription snapshot doc cap
 # (over-budget subscribes 400, never silent drops), deliveries per
 # sub per second (overflow resyncs, never queues), shared poller
@@ -1079,8 +1239,54 @@ mod tests {
     }
 
     #[test]
-    fn presedensi_flag_menang_atas_file() {
-        let f = write_tmp("hakobackend_cli_test.toml", "port = 1111\ndriver = \"hako\"\n");
+    fn cluster_tailer_mesh_parses_and_validates() {
+        let f = write_tmp(
+            "hakobackend_tailer_test.toml",
+            "driver = \"hakocluster\"\ndata = \"./a.ub,./b.ub\"\n[cluster.tailer_mesh]\nname = \"box-a\"\nroom_key = \"s3cret\"\nport = 17891\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let cfg = resolve(&a);
+        match &cfg.cluster_tailer {
+            Some(ClusterTailer::Mesh { name, port, .. }) => {
+                assert_eq!(name, "box-a");
+                assert_eq!(*port, 17891);
+            }
+            other => panic!("expected mesh tailer, got {other:?}"),
+        }
+        assert!(validate(&cfg).is_ok());
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    #[should_panic(expected = "exclusive")]
+    fn cluster_tailer_rejects_both_lanes_at_resolve() {
+        let f = write_tmp(
+            "hakobackend_tailer_both_test.toml",
+            "driver = \"hakocluster\"\ndata = \"./a.ub\"\n[cluster.tailer_mesh]\nname = \"b\"\nroom_key = \"k\"\nport = 1\n[cluster.tailer_cloud]\nmode = \"client\"\nclient_id = \"b\"\nauth_token = \"t\"\nroom_name = \"r\"\nroom_key = \"k\"\nserver_url = \"ws://x\"\n",
+        );
+        let mut a = args();
+        a.config = Some(f.clone());
+        let _ = resolve(&a);
+        let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn cluster_tailer_rejects_wrong_driver_at_validate() {
+        // Single lane on a non-cluster driver: resolve ok, validate refuses.
+        let f2 = write_tmp(
+            "hakobackend_tailer_driver_test.toml",
+            "driver = \"sqlite\"\ndata = \"./x.db\"\n[cluster.tailer_mesh]\nname = \"b\"\nroom_key = \"k\"\nport = 1\n",
+        );
+        let mut a2 = args();
+        a2.config = Some(f2.clone());
+        let cfg2 = resolve(&a2);
+        assert!(validate(&cfg2).is_err());
+        let _ = std::fs::remove_file(f2);
+    }
+
+    #[test]
+    fn presedensi_flag_menang_atas_file() {        let f = write_tmp("hakobackend_cli_test.toml", "port = 1111\ndriver = \"hako\"\n");
         let mut a = args();
         a.config = Some(f.clone());
         a.port = Some(8080);

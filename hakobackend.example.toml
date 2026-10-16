@@ -12,6 +12,21 @@ data = "./data/hako.ub"
 # Socket peering with sibling backends (hako only, unix only, single-db):
 # sync_serve = "/run/hakobackend/hako.sock"
 # sync_peer = ["/run/other/hako.sock"]
+# Cluster N+1 sync tailer (hakocluster driver only, default database
+# only, file-only, boot-time). At most one lane; the cluster open
+# re-validates (unix-only, exclusive lanes).
+# [cluster.tailer_mesh]
+# name = "box-a"
+# room_key = "shared-room-secret"
+# port = 17891
+# [cluster.tailer_cloud]
+# mode = "client"  # or "server"
+# client_id = "box-a"
+# auth_token = "shared-secret"
+# room_name = "ops"
+# room_key = "shared-secret"
+# server_url = "ws://hub:8080"   # client mode
+# bind_addr = "0.0.0.0:8080"     # server mode
 # Co-located postgres/mysql: unix socket instead of TCP (measured
 # +65-140% gateway RPS on weak CPUs — TCP stack is the cost, not the
 # engine). Share the socket dir into the backend container, e.g.
