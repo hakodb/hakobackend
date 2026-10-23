@@ -462,20 +462,15 @@ impl Database for HakoDb {
         collection: &str,
         id: &str,
     ) -> Result<Option<hakobackend_core::RawDoc>, AppError> {
-        // ponytail: same direct-call rule as get (decode is µs-scale; the
-        // hop costs more). serde emit, NOT write_json: measured 101µs vs
-        // ~35µs on string-heavy docs — serde's SIMD string scan beats the
-        // byte-loop 3x when one field holds 7 KB of HTML (write_json's
-        // 1.89x win was int-heavy bench shapes). No HashMap/Doc detour:
-        // to_json + to_vec straight to the frame buffer.
+        // ponytail: same direct-call rule as get (JSON emit is µs-scale;
+        // the hop costs more). get_json writes from the pinned view with
+        // no owned decode/HashMap/DOM; blob-backed docs fall back inside
+        // the engine so bytes still match get().
         // Version mirrors doc_version (counter, else logical time) so the
         // ETag is identical whether it came pre- or post-fetch.
-        match self.inner.get(collection, id) {
-            Ok(Some(h)) => {
-                let version =
-                    self.inner.current_version(id).or_else(|| Some(h.get_logical_time() as u64));
-                let json_inner = serde_json::to_vec(&h.to_json())
-                    .map_err(|e| AppError::Internal(e.to_string()))?;
+        match self.inner.get_json(collection, id) {
+            Ok(Some((time, json_inner))) => {
+                let version = self.inner.current_version(id).or_else(|| Some(time as u64));
                 Ok(Some(hakobackend_core::RawDoc { version, json_inner }))
             }
             Ok(None) => Ok(None),
@@ -1641,8 +1636,7 @@ mod tests {
     }
 
     /// Version + raw fast path: live counter after a write, cold (None)
-    /// after a reopen (the view probe costs more than the decode it would
-    /// save — measured), time ETag from the decoded doc instead.
+    /// after a reopen, time ETag from the pinned view instead.
     /// get_json carries the same version the pre-check would see.
     #[tokio::test]
     async fn version_and_raw_json() {
@@ -1662,7 +1656,7 @@ mod tests {
         drop(db);
         // Reopen: version map is memory-only, so the counter is gone and
         // the pre-check stays cold — but get_json still ETags from the
-        // decoded doc's logical time (free, already in hand).
+        // view's logical time (free, already in hand).
         let db2 = HakoDb::open(&p).unwrap();
         assert!(db2.doc_version("t", "v1").await.unwrap().is_none());
         let raw = db2.get_json("t", "v1").await.unwrap().unwrap();
