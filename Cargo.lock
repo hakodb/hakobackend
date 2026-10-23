@@ -1500,9 +1500,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b91a1094285c0c3964a763e50c4f5be2bac2ab493577bcd28b3b1430a49fcb96"
+checksum = "dbeef552f8874c9bcd835198c692fcb3c5c6c8f461e93bd337c1cc17a0555007"
 dependencies = [
  "cbindgen",
  "hakodb",
@@ -1512,9 +1512,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.16.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e257e8cb5c6ba944d91136d4477455edfe3863a6e7bf1fdfce1a5ad2076fc324"
+checksum = "2df102bb67b759ac796832e291173e487023eacb8e7879ccfabc29b19d56e66e"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -3010,7 +3010,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
