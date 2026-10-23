@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 hakobackend-core = { path = "../hakobackend-core" }
 hakobackend-db-hako = { path = "../hakobackend-db-hako" }
-hakocluster = { version = "0.4", features = ["tailer-mesh", "tailer-cloud"] }
+hakocluster = { version = "0.5", features = ["tailer-mesh", "tailer-cloud"] }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
