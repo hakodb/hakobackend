@@ -1192,6 +1192,241 @@ limit_auth_burst = 5
 # allow = ["ai_configs:read"]    # slots "collection:read|write"; read=Get+List
 "#;
 
+// --- Admin introspection (issue #34) ---------------------------------
+//
+// One flat map is the single source for both admin endpoints: the reload
+// response diffs two snapshots, and `GET /api/admin/config` serves the
+// redacted copy. Built by hand (not derived) for two reasons: secrets are
+// opt-in (a new `UbConfig` field cannot leak by default), and nested
+// secret-bearing values (tailer room keys) are redacted by key name.
+
+/// Keys `/api/admin/reload` actually applies to the running state.
+///
+/// Everything else is reported as `requires_restart` — an unknown/new key
+/// defaults to the honest answer instead of being claimed as applied.
+/// `rules` is absent on purpose: the policy file is watched by mtime and
+/// applies without a reload, so it is reported under `watched` instead.
+pub const RELOADABLE: &[&str] = &[
+    "driver",
+    "data",
+    "databases",
+    "sync_serve",
+    "sync_peer",
+    "ttl_sweep_secs",
+    "cluster_tailer",
+    "auth",
+    "audit_level",
+    "limit_global",
+    "limit_auth",
+    "service_keys",
+    "service_allow",
+    "aliases",
+    "indexes",
+    "read_only",
+    "max_batch_ops",
+    "realtime_snapshot_docs",
+    "realtime_events_per_sec",
+    "realtime_poll_secs",
+    "realtime_max_conn_docs",
+];
+
+/// Field names whose value is a secret, wherever they appear in the tree.
+const SECRET_KEYS: &[&str] = &[
+    "file_sign_secret",
+    "room_key",
+    "auth_token",
+    "api_key",
+    "jwt_secret",
+];
+
+/// Flat, complete view of a resolved config. Contains secrets — callers
+/// must run [`config_public`] before sending it anywhere.
+pub fn config_snapshot(cfg: &UbConfig) -> serde_json::Value {
+    use serde_json::json;
+    let tailer = match &cfg.cluster_tailer {
+        None => serde_json::Value::Null,
+        Some(ClusterTailer::Mesh { name, room_key, port }) => json!({
+            "kind": "mesh", "name": name, "room_key": room_key, "port": port
+        }),
+        Some(ClusterTailer::Cloud {
+            mode,
+            client_id,
+            auth_token,
+            room_name,
+            room_key,
+            server_url,
+            bind_addr,
+        }) => json!({
+            "kind": "cloud", "mode": mode, "client_id": client_id,
+            "auth_token": auth_token, "room_name": room_name,
+            "room_key": room_key, "server_url": server_url,
+            "bind_addr": bind_addr
+        }),
+    };
+    let aliases: Vec<serde_json::Value> = cfg
+        .aliases
+        .iter()
+        .map(|a| {
+            json!({
+                "pattern": a.pattern,
+                "target_path": a.target_path,
+                "target_query": a.target_query
+            })
+        })
+        .collect();
+    let indexes: Vec<serde_json::Value> = cfg
+        .indexes
+        .iter()
+        .map(|i| {
+            json!({
+                "collection": i.collection,
+                "fields": i.fields,
+                "name": i.name,
+                "unique": i.unique,
+                "kind": i.kind
+            })
+        })
+        .collect();
+    json!({
+        "source": cfg.source,
+        "host": cfg.host,
+        "port": cfg.port,
+        "driver": cfg.driver,
+        "data": cfg.data,
+        "rules": cfg.rules,
+        "auth": cfg.auth,
+        "admin_uids": cfg.admin_uids,
+        "sock": cfg.sock,
+        "plain_loopback": cfg.plain_loopback,
+        "allowed_hosts": cfg.allowed_hosts,
+        "cors_allowed_origins": cfg.cors_allowed_origins,
+        "cookie_secure": cfg.cookie_secure,
+        "cookie_samesite": cfg.cookie_samesite,
+        "cookie_path": cfg.cookie_path,
+        "cookie_domain": cfg.cookie_domain,
+        "body_limit_mb": cfg.body_limit_mb,
+        "hsts_max_age_secs": cfg.hsts_max_age_secs,
+        "compress_min_bytes": cfg.compress_min_bytes,
+        "ws_max_msg_kb": cfg.ws_max_msg_kb,
+        "ws_max_subs": cfg.ws_max_subs,
+        "csrf_origin_check": cfg.csrf_origin_check,
+        "local_register": cfg.local_register,
+        "local_password_min_length": cfg.local_password_min_length,
+        "local_access_ttl_secs": cfg.local_access_ttl_secs,
+        "local_refresh_ttl_secs": cfg.local_refresh_ttl_secs,
+        "local_argon2_m_kb": cfg.local_argon2_m_kb,
+        "local_argon2_t_cost": cfg.local_argon2_t_cost,
+        "local_argon2_p_cost": cfg.local_argon2_p_cost,
+        "login_max_attempts": cfg.login_max_attempts,
+        "login_lockout_secs": cfg.login_lockout_secs,
+        "read_only": cfg.read_only,
+        "ttl_sweep_secs": cfg.ttl_sweep_secs,
+        "max_batch_ops": cfg.max_batch_ops,
+        "file_dir": cfg.file_dir,
+        "file_max_mb": cfg.file_max_mb,
+        "file_max_batch": cfg.file_max_batch,
+        "file_mime_allow": cfg.file_mime_allow,
+        "file_sign_secret": cfg.file_sign_secret,
+        "databases": cfg.databases,
+        "realtime_snapshot_docs": cfg.realtime_snapshot_docs,
+        "realtime_events_per_sec": cfg.realtime_events_per_sec,
+        "realtime_poll_secs": cfg.realtime_poll_secs,
+        "realtime_max_conn_docs": cfg.realtime_max_conn_docs,
+        "audit_level": cfg.audit_level,
+        "local_token_response": cfg.local_token_response,
+        "local_cookies": cfg.local_cookies,
+        "aliases": aliases,
+        "sync_serve": cfg.sync_serve,
+        "sync_peer": cfg.sync_peer,
+        "cluster_tailer": tailer,
+        "public_url": cfg.public_url,
+        "limit_global": cfg.limit_global,
+        "limit_auth": cfg.limit_auth,
+        "trust_proxy": cfg.trust_proxy,
+        "coalesce_writes": cfg.coalesce_writes,
+        "compress": cfg.compress,
+        "wstats": cfg.wstats,
+        "benchmark": cfg.benchmark,
+        "tls_cert": cfg.tls_cert,
+        "tls_key": cfg.tls_key,
+        "http2": cfg.http2,
+        "indexes": indexes,
+        "service_keys": cfg.service_keys,
+        "service_allow": cfg.service_allow
+    })
+}
+
+/// Redacted copy of [`config_snapshot`]: service keys become a count,
+/// every [`SECRET_KEYS`] value becomes `[set]` / `[unset]`.
+pub fn config_public(snapshot: &serde_json::Value) -> serde_json::Value {
+    fn walk(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map.iter_mut() {
+                    if SECRET_KEYS.contains(&key.as_str()) {
+                        let set = child.as_str().is_some_and(|s| !s.is_empty());
+                        *child = serde_json::json!(if set { "[set]" } else { "[unset]" });
+                    } else {
+                        walk(child);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(walk),
+            _ => {}
+        }
+    }
+    let mut out = snapshot.clone();
+    walk(&mut out);
+    if let Some(map) = out.as_object_mut() {
+        if let Some(keys) = map.get("service_keys") {
+            let count = keys.as_array().map(|a| a.len()).unwrap_or(0);
+            map.insert("service_keys".into(), serde_json::json!({ "count": count }));
+        }
+    }
+    out
+}
+
+/// Classify changed keys into `(applied, requires_restart)`, sorted.
+pub fn reload_diff(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::BTreeSet;
+    let mut applied = BTreeSet::new();
+    let mut restart = BTreeSet::new();
+    if let (Some(old), Some(new)) = (before.as_object(), after.as_object()) {
+        for key in old.keys().chain(new.keys()) {
+            if old.get(key) != new.get(key) {
+                if RELOADABLE.contains(&key.as_str()) {
+                    applied.insert(key.clone());
+                } else {
+                    restart.insert(key.clone());
+                }
+            }
+        }
+    }
+    (
+        applied.into_iter().collect(),
+        restart.into_iter().collect(),
+    )
+}
+
+/// The snapshot the running state should remember after a reload: new
+/// values for reloadable keys, the old values for everything else. Keeping
+/// the old values means a `requires_restart` key stays reported on every
+/// later reload until the process actually restarts.
+pub fn applied_snapshot(before: &serde_json::Value, after: &serde_json::Value) -> serde_json::Value {
+    let mut out = after.clone();
+    if let (Some(old), Some(new)) = (before.as_object(), out.as_object_mut()) {
+        for (key, value) in old {
+            if !RELOADABLE.contains(&key.as_str()) {
+                new.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1697,5 +1932,50 @@ mod tests {
         let cfg = resolve(&a);
         assert_eq!(cfg.admin_uids, vec!["local:f", "local:g"]);
         let _ = std::fs::remove_file(f);
+    }
+
+    #[test]
+    fn config_snapshot_redacts_and_reload_diff_classifies() {
+        let mut old = resolve(&args());
+        old.driver = "hako".into();
+        old.admin_uids = vec!["local:a".into()];
+        let mut new = old.clone();
+        new.driver = "hakocluster".into(); // reloadable
+        new.admin_uids = vec!["local:b".into()]; // restart-only
+        new.rules = Some("./policy.toml".into()); // watched, not reloadable
+        let (applied, restart) =
+            reload_diff(&config_snapshot(&old), &config_snapshot(&new));
+        assert_eq!(applied, vec!["driver"]);
+        assert_eq!(restart, vec!["admin_uids", "rules"]);
+
+        // A restart-only change stays reported until a real restart: the
+        // remembered snapshot keeps the old value for those keys.
+        let remembered = applied_snapshot(&config_snapshot(&old), &config_snapshot(&new));
+        let (applied, restart) = reload_diff(&remembered, &config_snapshot(&new));
+        assert!(applied.is_empty());
+        assert_eq!(restart, vec!["admin_uids", "rules"]);
+
+        // Nothing changed -> both buckets empty.
+        let (applied, restart) =
+            reload_diff(&config_snapshot(&old), &config_snapshot(&old));
+        assert!(applied.is_empty() && restart.is_empty());
+
+        // Secrets never survive the public view, including nested ones.
+        let mut cfg = new;
+        cfg.service_keys = vec!["deadbeef".into(), "cafebabe".into()];
+        cfg.file_sign_secret = "topsecret".into();
+        cfg.cluster_tailer = Some(ClusterTailer::Mesh {
+            name: "n".into(),
+            room_key: "roomsecret".into(),
+            port: 9000,
+        });
+        let public = config_public(&config_snapshot(&cfg));
+        let text = public.to_string();
+        for secret in ["deadbeef", "cafebabe", "topsecret", "roomsecret"] {
+            assert!(!text.contains(secret), "leaked {secret}: {text}");
+        }
+        assert_eq!(public["service_keys"]["count"], 2);
+        assert_eq!(public["file_sign_secret"], "[set]");
+        assert_eq!(public["cluster_tailer"]["room_key"], "[set]");
     }
 }

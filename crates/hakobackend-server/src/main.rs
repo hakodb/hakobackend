@@ -8,6 +8,10 @@
 //! Endpoint flexibility: automatic wildcard (zero-config) + `policy.toml` that
 //! **hot-reloads** (mtime checked on each request; file edits take effect immediately, no restart).
 
+// One `json!` in config.rs covers the whole resolved config (~64 keys);
+// the default 128 recursion budget is not enough for that many entries.
+#![recursion_limit = "256"]
+
 mod coalesce;
 mod config;
 mod bench;
@@ -142,6 +146,11 @@ struct AppState {
     /// Arc-swap like the hot snapshot's contents, not a RwLock — readers
     /// clone the Arc (~20 ns), reload swaps it.
     aliases: Arc<std::sync::RwLock<Arc<alias::AliasTable>>>,
+    /// Effective config the running state was built from (issue #34).
+    /// `/api/admin/reload` diffs the newly resolved config against it to
+    /// report which changed keys did not apply (secrets included, never
+    /// served: the response only names keys).
+    last_config: Arc<std::sync::Mutex<serde_json::Value>>,
     /// Bare route table (no layers) for alias redispatch (issue #5).
     /// Router::layer wraps endpoints post-match, so a rewrite middleware
     /// can never affect routing; the alias *route* therefore rewrites the
@@ -764,6 +773,7 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/traverse-search/{*path}", post(traverse_search))
         .route("/api/edge-index", post(edge_index_create))
         .route("/api/admin/reload", post(reload))
+        .route("/api/admin/config", get(admin_config))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler));
     let api = api_routes
@@ -1012,6 +1022,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::new(
             cfg.aliases.clone(),
         )))),
+        last_config: Arc::new(std::sync::Mutex::new(config::config_snapshot(&cfg))),
         bare: Arc::new(std::sync::OnceLock::new()),
     };
     if cfg.coalesce_writes {
@@ -2042,6 +2053,33 @@ async fn ready(State(s): State<AppState>) -> impl IntoResponse {
 
 /// Re-read config + driver + auth chain. "Hot-swap while running":
 /// edit the file, POST here (admin role), done — CLI flags still win.
+/// Effective-config read-back (issue #34): what the server would boot with
+/// right now, resolved through the same precedence as boot, secrets redacted.
+async fn admin_config(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> impl IntoResponse {
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let cfg = resolve(&s.cli);
+    let public = config::config_public(&config::config_snapshot(&cfg));
+    let local_secret = std::env::var("UB_LOCAL_JWT_SECRET")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    Json(serde_json::json!({
+        "config_path": cfg.source,
+        "source": if cfg.source.is_empty() { "default+flags" } else { "file+flags" },
+        "config": public,
+        "secrets": {
+            "service_keys": cfg.service_keys.len(),
+            "file_sign_secret": if cfg.file_sign_secret.is_empty() { "[unset]" } else { "[set]" },
+            "local_jwt_secret": if local_secret { "[set]" } else { "[unset]" }
+        }
+    }))
+    .into_response()
+}
+
 /// Failure at any step = 400 and the old config is fully retained.
 async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>, headers: HeaderMap) -> impl IntoResponse {
     let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
@@ -2152,10 +2190,40 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // fetches would just double that for zero freshness gain).
     let hot = s.hot().await;
     auto_provision_all(&hot.dbs, &hot.policy, &cfg.indexes).await;
+    // Honest report (issue #34): diff the config the running state was
+    // built from against the one just applied, so a key reload cannot
+    // touch (admin_uids, listeners, files, ...) is named instead of being
+    // implied by "ok". Unknown keys default to requires_restart.
+    let snapshot = config::config_snapshot(&cfg);
+    let (applied, requires_restart, effective) = {
+        let old = s.last_config.lock().unwrap();
+        let (applied, requires_restart) = config::reload_diff(&old, &snapshot);
+        (
+            applied,
+            requires_restart,
+            config::applied_snapshot(&old, &snapshot),
+        )
+    };
+    *s.last_config.lock().unwrap() = effective;
+    // Same path but edited content: the policy file is re-read by mtime,
+    // the rest only on reload — list both so the operator knows what to
+    // look at when a path did not change.
+    let watched: Vec<String> = [Some(cfg.source.clone()), cfg.rules.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|p| !p.is_empty())
+        .collect();
     let msg = format!("reload ok: driver={} data={} auth={}", cfg.driver, cfg.data, cfg.auth.as_deref().unwrap_or("off"));
     eprintln!("[ub] {msg}");
     audit::reload(&admin, &ip, true, &msg);
-    msg.into_response()
+    Json(serde_json::json!({
+        "ok": true,
+        "message": msg,
+        "applied": applied,
+        "requires_restart": requires_restart,
+        "watched": watched
+    }))
+    .into_response()
 }
 
 async fn list_collections(
@@ -7027,6 +7095,7 @@ mod tests {
             local_token_response: false,
             local_cookies: true,
             aliases: Arc::new(std::sync::RwLock::new(Arc::new(alias::AliasTable::default()))),
+            last_config: Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
             bare: Arc::new(std::sync::OnceLock::new()),
             // Files on with a temp dir (per-test tag dir above); small
             // caps keep the suite fast, secret enables the signed-URL leg.

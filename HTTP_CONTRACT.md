@@ -152,6 +152,42 @@ native drivers translate, the rest emulate with the same helpers
 `Authorization: Bearer …` else `__Host-ub_at` cookie → `Extension<Option<AuthContext>>`.
 No token / failed verification = anonymous (policy speaks; 401 vs 403 see AUTH_CONTRACT).
 `/api/admin/reload` is locked behind `admin_uids` (UID allowlist).
+`/api/admin/config` (issue #34) is gated the same way and returns the
+*resolved* config (file + flags + env precedence), secrets redacted:
+
+```json
+{
+  "config_path": "/etc/hakobackend/hakobackend.toml",
+  "source": "file+flags",
+  "config": { "driver": "hako", "max_batch_ops": 1000, "...": "..." },
+  "secrets": {
+    "service_keys": 2,
+    "file_sign_secret": "[set]",
+    "local_jwt_secret": "[unset]"
+  }
+}
+```
+
+Reload answers JSON instead of plain text:
+
+```json
+{
+  "ok": true,
+  "message": "reload ok: driver=hako data=./data auth=off",
+  "applied": ["max_batch_ops", "read_only"],
+  "requires_restart": ["admin_uids"],
+  "watched": ["/etc/hakobackend/hakobackend.toml", "/etc/hakobackend/policy.toml"]
+}
+```
+
+`applied` / `requires_restart` come from diffing the config the running
+state was built from against the newly resolved one; a key reload cannot
+touch stays in `requires_restart` on every later reload until a real
+restart. `watched` lists paths whose *content* is re-read even when the
+path did not change (the policy file is re-read by mtime; the config and
+auth files on reload). Failure semantics are unchanged: fail-closed, old
+config retained, `400` with an error string.
+
 `/api/auth/*` see AUTH_CONTRACT (local BFF, GitHub OAuth, DPoP).
 
 ## 7. Realtime (WS + SSE)
