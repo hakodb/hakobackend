@@ -774,6 +774,10 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/edge-index", post(edge_index_create))
         .route("/api/admin/reload", post(reload))
         .route("/api/admin/config", get(admin_config))
+        .route("/api/admin/restore-available", get(restore_available_list))
+        .route("/api/admin/restore", post(restore_doc))
+        .route("/api/admin/delete-queue", get(delete_queue_list))
+        .route("/api/admin/sweep", post(sweep_now_run))
         .route("/ws", get(ws_handler))
         .route("/api/stream/{*path}", get(sse_handler));
     let api = api_routes
@@ -1955,6 +1959,131 @@ fn is_admin(auth: Option<&AuthContext>, admin_uids: &[String]) -> bool {
 /// Single-user backend: collection names pass through unchanged (no tenant prefix).
 fn stored(logical: &str) -> String {
     logical.to_string()
+}
+
+// --- Soft-delete admin surface (issue #63): admin-gated, capability-gated.
+// 501 when the mounted driver has no soft-delete surface — honest per
+// DRIVER_CONTRACT.md (retention records are not emulatable). ---
+
+fn soft_unsupported(dbh: &Arc<dyn Database>) -> Option<Response> {
+    (!dbh.capabilities().supports_soft_delete).then(|| {
+        err(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "driver {} does not support soft delete",
+                dbh.capabilities().driver
+            ),
+        )
+    })
+}
+
+async fn restore_available_list(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let hot = s.hot().await;
+    let collection = q.get("collection").map(|c| c.as_str());
+    let mut rows: Vec<hakobackend_core::RestoreRecord> = Vec::new();
+    for dbh in hot.dbs.values() {
+        if !dbh.capabilities().supports_soft_delete {
+            continue; // hard drivers hold no retention records
+        }
+        match dbh.restore_available(collection).await {
+            Ok(mut r) => rows.append(&mut r),
+            Err(e) => return driver_err(e),
+        }
+    }
+    Json(rows).into_response()
+}
+
+async fn delete_queue_list(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let hot = s.hot().await;
+    let collection = q.get("collection").map(|c| c.as_str());
+    let mut rows: Vec<hakobackend_core::RestoreRecord> = Vec::new();
+    for dbh in hot.dbs.values() {
+        if !dbh.capabilities().supports_soft_delete {
+            continue;
+        }
+        match dbh.delete_queue(collection).await {
+            Ok(mut r) => rows.append(&mut r),
+            Err(e) => return driver_err(e),
+        }
+    }
+    Json(rows).into_response()
+}
+
+async fn restore_doc(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let collection = body.get("collection").and_then(|v| v.as_str());
+    let id = body.get("id").and_then(|v| v.as_str());
+    let (Some(collection), Some(id)) = (collection, id) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "body must be {\"collection\": string, \"id\": string}",
+        );
+    };
+    let (collection, id) = (collection.to_string(), id.to_string());
+    if let Some(r) = denied_internal(&collection) {
+        return r;
+    }
+    if let Some(r) = valid_names(&collection, Some(&id)) {
+        return r;
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    if let Some(r) = soft_unsupported(&dbh) {
+        return r;
+    }
+    match dbh.restore(&collection, &id).await {
+        Ok(doc) => (StatusCode::OK, Json(doc)).into_response(),
+        Err(e) => driver_err(e),
+    }
+}
+
+async fn sweep_now_run(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> impl IntoResponse {
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let hot = s.hot().await;
+    let mut purged = 0u64;
+    for dbh in hot.dbs.values() {
+        if !dbh.capabilities().supports_soft_delete {
+            continue;
+        }
+        match dbh.sweep_now().await {
+            Ok(n) => purged += n,
+            Err(e) => return driver_err(e),
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "purged": purged }))).into_response()
 }
 
 /// Claim strips applied to final write data (anti-escalation without
@@ -3521,7 +3650,23 @@ async fn remove(
                 return forbidden();
             }
             let _ = dbh.ensure_collection(&stored).await;
-            match dbh.delete(&stored, &id).await {
+            // ?mode=force = legacy tombstone-only hard delete (issue #63);
+            // unknown mode values reject clearly.
+            let force = match q.get("mode").map(|m| m.as_str()) {
+                None | Some("") => false,
+                Some("force") => true,
+                Some(other) => {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        format!("unknown delete mode {other:?}: only \"force\" is valid"),
+                    )
+                }
+            };
+            match if force {
+                dbh.delete_force(&stored, &id).await
+            } else {
+                dbh.delete(&stored, &id).await
+            } {
                 Ok(_) => {
                     // Gateway bus (subscriber snapshot supplies the old doc).
                     realtime::emit(
@@ -4086,7 +4231,9 @@ fn driver_err(e: hakobackend_core::AppError) -> Response {
         PermissionDenied => forbidden(),
         NotFound => err(StatusCode::NOT_FOUND, "not found"),
         AlreadyExists => err(StatusCode::BAD_REQUEST, "already exists"),
+        Conflict(m) => err(StatusCode::CONFLICT, m),
         Internal(m) => err(StatusCode::INTERNAL_SERVER_ERROR, m),
+        Unsupported(m) => err(StatusCode::NOT_IMPLEMENTED, m),
     }
 }
 
@@ -6989,6 +7136,61 @@ mod tests {
             HashMap::from([("default".to_string(), raw.clone())]);
         let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
         (st, raw)
+    }
+
+    /// Soft-delete admin surface (issue #63): routes exist, admin-gated,
+    /// and the delete mode param rejects unknown values before touching
+    /// the driver. Semantics (roundtrip/cancel/force) live in the db-hako
+    /// driver test.
+    #[tokio::test]
+    async fn soft_delete_admin_gates() {
+        use tower::ServiceExt;
+        let (st, _raw) = rbw_state(
+            "[defaults]\nread = \"public\"\nwrite = \"public\"\n",
+            "softdel_gates",
+        )
+        .await;
+        let app = build_router(st.clone(), vec![], false);
+        async fn call(app: Router, method: &str, uri: &str) -> StatusCode {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+        // No auth → admin gate (403) on every admin surface. Restore carries
+        // a valid JSON body because the Json extractor rejects (415) before
+        // the handler's gate otherwise.
+        assert_eq!(
+            call(app.clone(), "GET", "/api/admin/restore-available").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(app.clone(), "GET", "/api/admin/delete-queue").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(app.clone(), "POST", "/api/admin/sweep").await,
+            StatusCode::FORBIDDEN
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/admin/restore")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+        // Unknown delete mode rejects before the driver (400).
+        assert_eq!(
+            call(
+                app.clone(),
+                "DELETE",
+                "/api/collections/users/u1?mode=bogus"
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     /// Multidatabase state (issue #13): hakocluster-backed, one single-dir

@@ -97,7 +97,12 @@ impl ClusterDb {
 #[async_trait::async_trait]
 impl hakobackend_core::Database for ClusterDb {
     fn capabilities(&self) -> Capabilities {
-        self.writer().capabilities()
+        // Soft delete stays off at the cluster surface: retention records
+        // are per-replica (each member sweeps its own), so restore through
+        // the writer alone would miss the others (issue #63).
+        let mut caps = self.writer().capabilities();
+        caps.supports_soft_delete = false;
+        caps
     }
 
     async fn ensure_collection(&self, path: &str) -> Result<(), AppError> {
