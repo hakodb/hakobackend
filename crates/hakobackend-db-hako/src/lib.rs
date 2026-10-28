@@ -874,6 +874,13 @@ impl Database for HakoDb {
             limit: k,
             via_edge: via_edge.map(str::to_string),
             weight_field: weight_field.map(str::to_string),
+            // G1/F-1 additions (#168/#156): keep the v0.17 behavior — no
+            // route projections, no edge predicates, no filtered travel.
+            node_match: None,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
         };
         let db = self.inner.clone();
         let (c, i) = (collection.to_string(), doc_id.to_string());
