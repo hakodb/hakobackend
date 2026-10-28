@@ -1462,7 +1462,7 @@ version = "0.1.0"
 
 [[package]]
 name = "hakobackend-server"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -1500,9 +1500,9 @@ dependencies = [
 
 [[package]]
 name = "hakocluster"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e610b75a99c23ff1979a666b850abf15d8a63f558bb4831d1e79375c207cf318"
+checksum = "f3e5b0043d16f0a4e5161af9336569f2746ca377de55f18e606978ea8dd4c250"
 dependencies = [
  "cbindgen",
  "hakodb",
@@ -1512,9 +1512,9 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.19.6"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2bb6724a7326ffee984b4615c0aa7d745e9458f0b4d563493b60fee7ceb5a18"
+checksum = "4f378140111020f2ceb0624ce2f72fbec86c4893115aff0cb2fff9ca56f55593"
 dependencies = [
  "bincode",
  "cbindgen",
@@ -3700,7 +3700,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
