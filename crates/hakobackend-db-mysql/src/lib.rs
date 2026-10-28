@@ -498,6 +498,7 @@ impl Database for MysqlDb {
             supports_named_index: true,
             supports_native_aggregation: false,
             supports_vector: false,
+            supports_soft_delete: false,
         }
     }
 

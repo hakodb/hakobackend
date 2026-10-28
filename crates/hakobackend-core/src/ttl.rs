@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{agg_number, AppError, Capabilities, Change, Database, Doc, Filter, FilterOp, IndexInfo, IndexSpec, QueryOptions, RawDoc};
+use super::{agg_number, AppError, Capabilities, Change, Database, Doc, Filter, FilterOp, IndexInfo, IndexSpec, QueryOptions, RawDoc, RestoreRecord};
 
 /// Expiry field: microsecond epoch. Values that are not positive integers
 /// are ignored (doc stays immortal) — fail-open on malformed stamps.
@@ -152,6 +152,31 @@ impl<D: Database + Send + Sync> Database for TtlDb<D> {
     }
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
         Ok(self.inner.delete(collection, id).await?.filter(|d| !is_expired(d)))
+    }
+    async fn delete_force(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        Ok(self
+            .inner
+            .delete_force(collection, id)
+            .await?
+            .filter(|d| !is_expired(d)))
+    }
+    async fn restore(&self, collection: &str, id: &str) -> Result<Doc, AppError> {
+        self.inner.restore(collection, id).await
+    }
+    async fn restore_available(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        self.inner.restore_available(collection).await
+    }
+    async fn delete_queue(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        self.inner.delete_queue(collection).await
+    }
+    async fn sweep_now(&self) -> Result<u64, AppError> {
+        self.inner.sweep_now().await
     }
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         // COUNT(*) can't see the convention — unless the inner driver does
@@ -296,6 +321,7 @@ mod tests {
                 supports_named_index: false,
                 supports_native_aggregation: false,
                 supports_vector: false,
+                supports_soft_delete: false,
             }
         }
         async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {
@@ -391,6 +417,7 @@ mod tests {
                     supports_named_index: false,
                     supports_native_aggregation: false,
                     supports_vector: false,
+                    supports_soft_delete: false,
                 }
             }
             async fn ensure_collection(&self, _p: &str) -> Result<(), AppError> {

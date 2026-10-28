@@ -321,8 +321,12 @@ pub enum AppError {
     AlreadyExists,
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("internal: {0}")]
     Internal(String),
+    #[error("{0} not supported by this driver")]
+    Unsupported(String),
 }
 
 impl AppError {
@@ -333,7 +337,9 @@ impl AppError {
             AppError::NotFound => 404,
             AppError::AlreadyExists => 400,
             AppError::BadRequest(_) => 400,
+            AppError::Conflict(_) => 409,
             AppError::Internal(_) => 500,
+            AppError::Unsupported(_) => 501,
         }
     }
 
@@ -344,7 +350,9 @@ impl AppError {
             AppError::NotFound => "not-found",
             AppError::AlreadyExists => "already-exists",
             AppError::BadRequest(_) => "bad-request",
+            AppError::Conflict(_) => "conflict",
             AppError::Internal(_) => "internal",
+            AppError::Unsupported(_) => "unsupported",
         }
     }
 }
@@ -434,6 +442,40 @@ pub trait Database: Send + Sync {
     async fn set(&self, collection: &str, id: &str, doc: Doc, merge: bool) -> Result<Doc, AppError>;
     /// Returns the document before deletion (None when absent).
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError>;
+
+    // --- Soft delete surface (issue #63): defaults reject clearly; the
+    // hako driver overrides. `delete_force` defaults to `delete` — identical
+    // for hard-delete drivers. ---
+    /// Hard delete: skip the retention record.
+    async fn delete_force(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        self.delete(collection, id).await
+    }
+    /// Re-create a soft-deleted doc (fresh version), consuming the record.
+    /// 404 when no record, 409 when the id was re-put (cancel rule).
+    async fn restore(&self, collection: &str, id: &str) -> Result<Doc, AppError> {
+        let _ = (collection, id);
+        Err(AppError::Unsupported("restore".into()))
+    }
+    /// Restoreable retention records, all collections or one.
+    async fn restore_available(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        let _ = collection;
+        Err(AppError::Unsupported("restore_available".into()))
+    }
+    /// Due-for-sweep subset of the retention queue (same shape).
+    async fn delete_queue(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        let _ = collection;
+        Err(AppError::Unsupported("delete_queue".into()))
+    }
+    /// Run one sweep pass now; returns the purged count.
+    async fn sweep_now(&self) -> Result<u64, AppError> {
+        Err(AppError::Unsupported("sweep_now".into()))
+    }
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError>;
     /// Numeric coercion for sum/avg (JSON numbers only; strings/bools/null
     /// never coerce — matches the legacy server reduce exactly).
@@ -635,6 +677,27 @@ impl<D: Database + Send + Sync> Database for Arc<D> {
     async fn delete(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
         self.as_ref().delete(collection, id).await
     }
+    async fn delete_force(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        self.as_ref().delete_force(collection, id).await
+    }
+    async fn restore(&self, collection: &str, id: &str) -> Result<Doc, AppError> {
+        self.as_ref().restore(collection, id).await
+    }
+    async fn restore_available(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        self.as_ref().restore_available(collection).await
+    }
+    async fn delete_queue(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<RestoreRecord>, AppError> {
+        self.as_ref().delete_queue(collection).await
+    }
+    async fn sweep_now(&self) -> Result<u64, AppError> {
+        self.as_ref().sweep_now().await
+    }
     async fn count(&self, collection: &str, q: &QueryOptions) -> Result<u64, AppError> {
         self.as_ref().count(collection, q).await
     }
@@ -734,6 +797,24 @@ pub struct Capabilities {
     /// `vector_search` from an index; when false the trait-default exact
     /// scan serves it, capped by MAX_VECTOR_SCAN_DOCS).
     pub supports_vector: bool,
+    /// Soft delete / restore / sweeper surface (issue #63): when false,
+    /// the admin soft-delete endpoints reject with 501 and `?mode=force`
+    /// delete degrades to a plain `delete`.
+    pub supports_soft_delete: bool,
+}
+
+/// One soft-delete retention record (issue #63 admin surface). Shape
+/// mirrors the engine's `__hako_softdel` entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RestoreRecord {
+    pub col: String,
+    pub id: String,
+    /// Unix seconds when the delete happened.
+    pub deleted_at: i64,
+    /// Unix seconds when the sweeper may purge the record.
+    pub scheduled_at: i64,
+    /// Encoded payload size in bytes.
+    pub bytes: u64,
 }
 
 // --- Index: simple/composite/FTS management contract (HTTP_CONTRACT.md §index) ---
@@ -1602,6 +1683,7 @@ pub mod conformance {
                 supports_named_index: true,
                 supports_native_aggregation: false,
                 supports_vector: false,
+                supports_soft_delete: false,
             }
         }
         async fn ensure_collection(&self, _path: &str) -> Result<(), AppError> {

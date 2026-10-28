@@ -36,6 +36,17 @@ fn uniq_collection(coll: &str) -> String {
     format!("__uniq_{coll}")
 }
 
+/// Engine retention entry → wire record (issue #63).
+fn restore_record(e: hakodb::engine::softdel::SoftDelEntry) -> hakobackend_core::RestoreRecord {
+    hakobackend_core::RestoreRecord {
+        col: e.col,
+        id: e.id,
+        deleted_at: e.deleted_at,
+        scheduled_at: e.scheduled_at,
+        bytes: e.bytes as u64,
+    }
+}
+
 /// Canonical key for a unique value. Missing/null exempt (SQL parity).
 fn uniq_key(v: &serde_json::Value) -> Option<String> {
     match v {
@@ -409,7 +420,10 @@ impl Database for HakoDb {
             supports_named_index: false,
             // Native count/sum/avg (index/sweep, no doc fetch).
             supports_native_aggregation: true,
+            // Native vector index + KNN.
             supports_vector: true,
+            // Soft delete + restore + sweeper (core 0.20.0; issue #63).
+            supports_soft_delete: true,
         }
     }
 
@@ -597,6 +611,96 @@ impl Database for HakoDb {
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
         Ok(prev)
+    }
+
+    async fn delete_force(&self, collection: &str, id: &str) -> Result<Option<Doc>, AppError> {
+        // Route through the soft path first — it owns the atomic unique-
+        // shadow unlink — then hard-delete the tombstone so nothing is
+        // restoreable, and hard-remove the retention record the soft pass
+        // wrote (force = no restoreable trace, not a stale-listed record).
+        let prev = self.delete(collection, id).await?;
+        let db = self.inner.clone();
+        let (c, i) = (collection.to_string(), id.to_string());
+        tokio::task::spawn_blocking(move || {
+            db.delete_force(&c, &i)
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            db.delete_force("__hako_softdel", &format!("{c}/{i}"))
+                .map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        Ok(prev)
+    }
+
+    async fn restore(&self, collection: &str, id: &str) -> Result<Doc, AppError> {
+        // 404 up front when there is no record; anything the engine refuses
+        // after the record existed = the cancel rule → 409.
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        let i = id.to_string();
+        let present = tokio::task::spawn_blocking(move || {
+            Ok(db
+                .restore_available(Some(&c))
+                .map_err(|e| AppError::Internal(e.to_string()))?
+                .iter()
+                .any(|e| e.id == i))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        if !present {
+            return Err(AppError::NotFound);
+        }
+        let db = self.inner.clone();
+        let (c, i) = (collection.to_string(), id.to_string());
+        tokio::task::spawn_blocking(move || {
+            db.restore(&c, &i).map_err(|e| AppError::Conflict(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))??;
+        self.get(collection, id)
+            .await?
+            .ok_or_else(|| AppError::Internal("restore: doc missing after restore".into()))
+    }
+
+    async fn restore_available(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<hakobackend_core::RestoreRecord>, AppError> {
+        let db = self.inner.clone();
+        let col = collection.map(|c| c.to_string());
+        tokio::task::spawn_blocking(move || {
+            let rows = db
+                .restore_available(col.as_deref())
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(rows.into_iter().map(restore_record).collect())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn delete_queue(
+        &self,
+        collection: Option<&str>,
+    ) -> Result<Vec<hakobackend_core::RestoreRecord>, AppError> {
+        let db = self.inner.clone();
+        let col = collection.map(|c| c.to_string());
+        tokio::task::spawn_blocking(move || {
+            let rows = db
+                .delete_queue(col.as_deref())
+                .map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok(rows.into_iter().map(restore_record).collect())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn sweep_now(&self) -> Result<u64, AppError> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.sweep_now().map_err(|e| AppError::Internal(e.to_string()))
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
     }
 
     /// Engine refusal strings (`relocate: …`, `unload: …`) are operator
@@ -1676,6 +1780,59 @@ mod tests {
         let owned = db2.get("t", "v1").await.unwrap().unwrap();
         let classic: serde_json::Value = serde_json::to_value(&owned).unwrap();
         assert_eq!(framed, classic);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Soft-delete admin surface (issue #63): record → restore roundtrip,
+    /// consumed record, cancel rule (409), force leaves no trace, missing
+    /// record = 404, sweep leaves fresh records alone.
+    #[tokio::test]
+    async fn soft_delete_restore_surface() {
+        let dir =
+            std::env::temp_dir().join(format!("hakobackend_hako_softdel_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let db = HakoDb::open(dir.to_string_lossy().as_ref()).unwrap();
+        let doc = |name: &str| Doc {
+            id: String::new(),
+            data: std::collections::HashMap::from([("name".to_string(), serde_json::json!(name))]),
+        };
+        db.set("users", "u1", doc("Alice"), false).await.unwrap();
+
+        // Soft delete: record present, doc gone.
+        assert!(db.delete("users", "u1").await.unwrap().is_some());
+        let avail = db.restore_available(Some("users")).await.unwrap();
+        assert_eq!(avail.len(), 1);
+        assert_eq!((avail[0].col.as_str(), avail[0].id.as_str()), ("users", "u1"));
+        assert!(avail[0].bytes > 0);
+        assert!(db.get("users", "u1").await.unwrap().is_none());
+
+        // Restore: doc back (fresh version), record consumed.
+        db.restore("users", "u1").await.unwrap();
+        assert_eq!(
+            db.get("users", "u1").await.unwrap().unwrap().data["name"],
+            serde_json::json!("Alice")
+        );
+        assert!(db.restore_available(Some("users")).await.unwrap().is_empty());
+
+        // Cancel rule: soft-delete then re-put — the record exists but the
+        // tombstone moved, so restore refuses (409) and keeps the record.
+        db.delete("users", "u1").await.unwrap();
+        db.set("users", "u1", doc("Alice2"), false).await.unwrap();
+        let e = db.restore("users", "u1").await.unwrap_err();
+        assert_eq!(e.status_code(), 409);
+        assert_eq!(db.restore_available(Some("users")).await.unwrap().len(), 1);
+
+        // Force: no record, no trace (the stale one above goes too).
+        assert!(db.delete_force("users", "u1").await.unwrap().is_some());
+        assert!(db.get("users", "u1").await.unwrap().is_none());
+        assert!(db.restore_available(Some("users")).await.unwrap().is_empty());
+
+        // Missing record → 404. A fresh record isn't due → sweep purges 0.
+        db.set("users", "u2", doc("Bob"), false).await.unwrap();
+        db.delete("users", "u2").await.unwrap();
+        let e = db.restore("users", "ghost").await.unwrap_err();
+        assert_eq!(e.status_code(), 404);
+        assert_eq!(db.sweep_now().await.unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
