@@ -69,7 +69,12 @@ Endpoints (same as the legacy backend):
 - `POST /api/collections/{*path}` — add (collections only)
 - `PUT /api/collections/{*path}` — set (documents only)
 - `PATCH /api/collections/{*path}` — merge (documents only)
-- `DELETE /api/collections/{*path}` — remove (documents only)
+- `DELETE /api/collections/{*path}` — remove (documents only); soft by default
+  (restoreable until the sweeper purges the retention record), `?mode=force` purges now
+- `GET /api/admin/restore-available?collection=` — list restoreable docs
+- `POST /api/admin/restore {collection, id}` — undo a soft delete
+- `GET /api/admin/delete-queue?collection=` — what the next sweep will purge
+- `POST /api/admin/sweep` — run one retention sweep pass now
 - `POST /api/indexes {collection, fields[], name?, unique?, kind?}` — create index
 - `GET /api/indexes?collection=` — list indexes
 - `DELETE /api/indexes?collection=&name=` — drop index
