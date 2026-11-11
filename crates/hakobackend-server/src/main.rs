@@ -801,6 +801,7 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/traverse-search/{*path}", post(traverse_search))
         .route("/api/edge-index", post(edge_index_create))
         .route("/api/admin/reload", post(reload))
+        .route("/api/admin/backend/{section}", get(admin_backend_get).put(admin_backend_put))
         .route("/api/admin/config", get(admin_config))
         .route("/api/admin/restore-available", get(restore_available_list))
         .route("/api/admin/restore", post(restore_doc))
@@ -2275,9 +2276,87 @@ async fn admin_config(
     .into_response()
 }
 
+/// `__backend` config sections (issue #68): the `__` prefix is reserved on
+/// the data plane, so the docs are managed here — admin only, validated at
+/// write time. Apply = `POST /api/admin/reload` (same discipline as every
+/// other hot-reload surface).
+const BACKEND_SECTIONS: [&str; 3] = ["policy", "aliases", "service"];
+
+async fn admin_backend_get(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    axum::extract::Path(section): axum::extract::Path<String>,
+) -> Response {
+    if !BACKEND_SECTIONS.contains(&section.as_str()) {
+        return err(StatusCode::BAD_REQUEST, format!("unknown section (one of {BACKEND_SECTIONS:?})"));
+    }
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    let db = s.hot().await.db.clone();
+    match db.get(dbconf::COLL, &section).await {
+        Ok(Some(doc)) => Json(serde_json::Value::Object(doc.data.into_iter().collect())).into_response(),
+        Ok(None) => err(StatusCode::NOT_FOUND, "section not set"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn admin_backend_put(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    axum::extract::Path(section): axum::extract::Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if !BACKEND_SECTIONS.contains(&section.as_str()) {
+        return err(StatusCode::BAD_REQUEST, format!("unknown section (one of {BACKEND_SECTIONS:?})"));
+    }
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        return forbidden();
+    }
+    // Validate at write time: a bad section must be rejected here, not
+    // discovered at reload (where it 400s and keeps the old world anyway).
+    let mut data: std::collections::HashMap<String, serde_json::Value> = body
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    data.remove("id");
+    let outcome: Result<(), String> = match section.as_str() {
+        "policy" => match data.get("toml").and_then(serde_json::Value::as_str) {
+            Some(t) if !t.trim().is_empty() => PolicyFile::load_str(t).map(|f| { let _ = &f; () }).map_err(|e| e),
+            _ => Err("policy doc needs a non-empty `toml` string".into()),
+        },
+        "aliases" => match data.get("decl") {
+            Some(v) => serde_json::from_value::<Vec<crate::config::AliasDecl>>(v.clone())
+                .map_err(|e| format!("malformed `decl`: {e}"))
+                .and_then(|a| dbconf::compile_aliases(&a).map(|_| ())),
+            None => Err("aliases doc needs a `decl` array".into()),
+        },
+        "service" => match data.get("keys") {
+            Some(v) => serde_json::from_value::<Vec<String>>(v.clone())
+                .map_err(|e| format!("malformed `keys`: {e}"))
+                .and_then(|k| if k.is_empty() { Err("`keys` cannot be empty (omit the doc to keep file keys)".into()) } else { Ok(()) }),
+            None => Err("service doc needs a `keys` array".into()),
+        },
+        _ => unreachable!(),
+    };
+    if let Err(e) = outcome {
+        return err(StatusCode::BAD_REQUEST, e);
+    }
+    let db = s.hot().await.db.clone();
+    if let Err(e) = db.ensure_collection(dbconf::COLL).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    let doc = Doc { id: section.clone(), data };
+    if let Err(e) = db.set(dbconf::COLL, &section, doc, false).await {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    Json(serde_json::json!({ "stored": section, "apply": "POST /api/admin/reload" })).into_response()
+}
+
 /// Failure at any step = 400 and the old config is fully retained.
-async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>, headers: HeaderMap) -> impl IntoResponse {
-    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
+async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<AuthContext>>, headers: HeaderMap) -> impl IntoResponse {    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
     let ip = audit_ip(&headers, s.limits.trust_proxy);
     if !is_admin(auth.as_ref(), &s.admin_uids) {
         audit::reload(&admin, &ip, false, "forbidden");

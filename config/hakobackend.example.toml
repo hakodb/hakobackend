@@ -29,4 +29,10 @@ access_ttl_secs = 600
 #   __backend/service = { "keys": ["<hex>"], "allow": ["coll:read"] }
 #
 # Bootstrap: seed the docs while a policy file still grants write on
-# __backend (e.g. to admins), then reload — the DB policy takes over.
+# __backend, or via the admin endpoint (the `__` prefix is reserved on the
+# data plane):
+#
+#   GET /api/admin/backend/{policy|aliases|service}
+#   PUT /api/admin/backend/{policy|aliases|service}   (validated, admin-only)
+#
+# then POST /api/admin/reload — the DB sections take over.
