@@ -21,6 +21,7 @@ mod loginguard;
 mod audit;
 mod alias;
 mod files;
+mod enrich;
 
 use axum::{
     Json, Router,
@@ -101,6 +102,9 @@ struct AppState {
     /// Resolved-token cache (verify once, reuse to exp/idle; flushed on
     /// reload, revoked on logout; DPoP still enforced per request).
     tokcache: Arc<tokcache::TokenCache>,
+    /// Server-side claim enrichment (issue #68): allowlisted user-doc
+    /// fields ride verified contexts; short TTL, flushed on reload.
+    enrich: Arc<enrich::EnrichCache>,
     /// Hot snapshot of the five per-request Arcs (see hot()).
     hot_cache: Arc<HotCache>,
     /// CORS strict allowlist (empty = legacy echo-any). Boot-time.
@@ -991,6 +995,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         coalesce_on: cfg.coalesce_writes,
         service: service_handle,
         tokcache: Arc::new(tokcache::TokenCache::new()),
+        enrich: Arc::new(enrich::EnrichCache::new()),
         hot_cache,
         cors_allowed: Arc::new(cfg.cors_allowed_origins.clone()),
         cookies: Arc::new(CookieConf::build(&cfg)),
@@ -1478,15 +1483,24 @@ fn dpop_action(mode: DpopMode, is_local_token: bool, has_proof: bool) -> DpopAct
 /// + HTTPS) AND the Arc snapshots below. DPoP/CSRF enforcement stays
 /// downstream, untouched by caching.
 async fn resolve_token(s: &AppState, token: &str) -> Option<AuthContext> {
-    if let Some(hit) = s.tokcache.get(token) {
-        return hit;
+    let mut ctx = if let Some(hit) = s.tokcache.get(token) {
+        hit
+    } else {
+        // One snapshot fetch serves policy + db + auth (a single mutex, not
+        // three contended locks + a stat call).
+        let hot = s.hot().await;
+        let db_ref: &dyn Database = &*hot.db;
+        let ctx = hot.auth.resolve(&hot.policy.identity, Some(db_ref), token).await;
+        s.tokcache.put(token, ctx.clone());
+        ctx
+    };
+    // Enrichment sits AFTER the token cache: the cached context is per-token,
+    // the enriched fields are per-user (short TTL), so they must re-apply on
+    // every request even on a cache hit (issue #68).
+    if let Some(c) = ctx.as_mut() {
+        let hot = s.hot().await;
+        enrich::apply(hot.db.as_ref(), &hot.policy.identity, c, &s.enrich).await;
     }
-    // One snapshot fetch serves policy + db + auth (a single mutex, not
-    // three contended locks + a stat call).
-    let hot = s.hot().await;
-    let db_ref: &dyn Database = &*hot.db;
-    let ctx = hot.auth.resolve(&hot.policy.identity, Some(db_ref), token).await;
-    s.tokcache.put(token, ctx.clone());
     ctx
 }
 
@@ -2252,6 +2266,8 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // Chain/mapping may have changed: cached contexts reference the old
     // world (uid mapping, provider set). Flush; clients re-resolve once.
     s.tokcache.clear();
+    // Enrichment may see a new `[identity]` allowlist: drop doc snapshots.
+    s.enrich.clear();
     // Hot snapshot may hold pre-reload Arcs (policy/db/auth/service/local):
     // expire it so the next request refetches. ≤1s staleness otherwise.
     s.hot_cache.invalidate().await;
@@ -7267,6 +7283,7 @@ mod tests {
             coalesce_on: false,
             service: Arc::new(tokio::sync::RwLock::new(ServiceAuth::build(&[], &[]))),
             tokcache: Arc::new(tokcache::TokenCache::new()),
+            enrich: Arc::new(enrich::EnrichCache::new()),
             hot_cache: Arc::new(HotCache::new(Hot {
                 policy: policy_hot.get().await,
                 db: raw.clone(),
