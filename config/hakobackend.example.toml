@@ -16,3 +16,17 @@ access_ttl_secs = 600
 # [[resources]]
 # path = "posts"
 # max_limit = 100
+
+# __backend reserved collection (issue #68): policy, path aliases and service
+# keys can live as docs in the default database, overriding the file per
+# section when present and valid (file stays bootstrap; secrets stay env-only;
+# admin_uids stays file-only). Reload-driven via POST /api/admin/reload.
+#
+#   __backend/policy  = { "toml": "<policy.toml content>" }   (file watch disabled when adopted)
+#   __backend/aliases = { "decl": [ { "pattern": "/api/alias/x/:id",
+#                                     "target_path": "/api/collections/x",
+#                                     "target_query": "" } ] }
+#   __backend/service = { "keys": ["<hex>"], "allow": ["coll:read"] }
+#
+# Bootstrap: seed the docs while a policy file still grants write on
+# __backend (e.g. to admins), then reload — the DB policy takes over.

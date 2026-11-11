@@ -22,6 +22,7 @@ mod audit;
 mod alias;
 mod files;
 mod enrich;
+mod dbconf;
 
 use axum::{
     Json, Router,
@@ -529,7 +530,10 @@ struct LimitLayers {
 
 /// Self-reloading policy when the file changes (checks mtime each request — 1 stat call).
 struct PolicyHot {
-    path: Option<String>,
+    /// File source for the per-request mtime watch. `None` after a DB
+    /// policy was adopted (`__backend/policy`): the doc owns the policy and
+    /// `/api/admin/reload` re-reads it (file edits are then ignored).
+    path: std::sync::RwLock<Option<String>>,
     cached: tokio::sync::RwLock<(Option<SystemTime>, Arc<PolicyFile>)>,
 }
 
@@ -541,10 +545,7 @@ impl PolicyHot {
                 // No token = anonymous; policy rules decide (fail-closed
                 // when a policy file exists). Full SessionIssuer follows (phase C).
                 eprintln!("[ub] WARN: without policy file — all endpoints OPEN (dev mode). Set `policy_file` in hakobackend.toml for production.");
-                Self {
-                    path: None,
-                    cached: tokio::sync::RwLock::new((None, Arc::new(PolicyFile::open()))),
-                }
+                Self::open_dev()
             }
             Some(p) => {
                 let file = PolicyFile::load(&p).unwrap_or_else(|e| {
@@ -553,30 +554,53 @@ impl PolicyHot {
                 });
                 let m = mtime(&p);
                 Self {
-                    path: Some(p),
+                    path: std::sync::RwLock::new(Some(p)),
                     cached: tokio::sync::RwLock::new((m, Arc::new(file))),
                 }
             }
         }
     }
 
-    async fn get(&self) -> Arc<PolicyFile> {        let Some(path) = &self.path else {
+    /// Dev-open mode (no source at all).
+    fn open_dev() -> Self {
+        Self {
+            path: std::sync::RwLock::new(None),
+            cached: tokio::sync::RwLock::new((None, Arc::new(PolicyFile::open()))),
+        }
+    }
+
+    /// DB-sourced policy (`__backend/policy`): no file watch, reload-driven.
+    fn from_policy(file: PolicyFile) -> Self {
+        Self {
+            path: std::sync::RwLock::new(None),
+            cached: tokio::sync::RwLock::new((None, Arc::new(file))),
+        }
+    }
+
+    /// Adopt a DB policy at reload: disable the file watch, swap the cache.
+    async fn adopt(&self, file: PolicyFile) {
+        *self.path.write().unwrap() = None;
+        *self.cached.write().await = (None, Arc::new(file));
+    }
+
+    async fn get(&self) -> Arc<PolicyFile> {
+        let Some(path) = self.path.read().unwrap().clone() else {
             return self.cached.read().await.1.clone();
         };
-        let current = mtime(path);
+        let current = mtime(&path);
         // Reload only when mtime changes (user edits take effect immediately).
         if self.cached.read().await.0 != current {
             let mut w = self.cached.write().await;
             if w.0 != current {
-                match PolicyFile::load(path) {
+                match PolicyFile::load(&path) {
                     Ok(f) => {
                         eprintln!("[ub] policy reload: {path}");
-                        audit::policy_reload(path, true);
+                audit::policy_reload(&path, true);
                         *w = (current, Arc::new(f));
                     }
                     Err(e) => {
                         eprintln!("[ub] policy reload FAILED ({e}); keeping old policy");
-                        audit::policy_reload(path, false);
+                audit::policy_reload(&path, false);
                     }
                 }
             }
@@ -939,7 +963,35 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let policy = Arc::new(PolicyHot::new(cfg.rules.clone()));
+    // __backend reserved collection (issue #68): DB sections win over the
+    // file per section where present and valid; file stays bootstrap.
+    let dbc = dbconf::load(&*db).await;
+    let mut cfg = cfg;
+    if !dbc.aliases.is_empty() {
+        cfg.aliases = dbconf::compile_aliases(&dbc.aliases)
+            .unwrap_or_else(|e| panic!("[ub] __backend/aliases: {e}"));
+    }
+    if !dbc.service_keys.is_empty() {
+        cfg.service_keys = dbc.service_keys.clone();
+        if !dbc.service_allow.is_empty() {
+            cfg.service_allow = dbc.service_allow.clone();
+        }
+    }
+
+    let policy = match &dbc.policy_toml {
+        Some(t) => match PolicyFile::load_str(t) {
+            Ok(f) => {
+                println!("[ub] policy source: __backend/policy (file watch disabled)");
+                Arc::new(PolicyHot::from_policy(f))
+            }
+            // Fail-closed boot: malformed DB policy = fall back to the file.
+            Err(e) => {
+                eprintln!("[ub] WARN: __backend/policy malformed ({e}); falling back to file policy");
+                Arc::new(PolicyHot::new(cfg.rules.clone()))
+            }
+        },
+        None => Arc::new(PolicyHot::new(cfg.rules.clone())),
+    };
     bridge_local_env(&cfg);
     // Audit verbosity (unknown values warn + fall back to all — never
     // fail boot on a logging typo).
@@ -2245,7 +2297,39 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
         }
     };
     let db: Arc<dyn Database> = dbs_map["default"].clone();
-    let identity = s.hot().await.policy.identity.clone();
+    // __backend sections (issue #68): a DB section present and valid wins
+    // over the file; malformed = reload fails 400 before anything swaps.
+    let dbc = dbconf::load(&*db).await;
+    let mut cfg = cfg;
+    let db_policy = match &dbc.policy_toml {
+        Some(t) => match PolicyFile::load_str(t) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                audit::reload(&admin, &ip, false, &format!("__backend/policy: {e}"));
+                return err(StatusCode::BAD_REQUEST, format!("[ub] __backend/policy: {e}"));
+            }
+        },
+        None => None,
+    };
+    if !dbc.aliases.is_empty() {
+        match dbconf::compile_aliases(&dbc.aliases) {
+            Ok(a) => cfg.aliases = a,
+            Err(e) => {
+                audit::reload(&admin, &ip, false, &format!("__backend/aliases: {e}"));
+                return err(StatusCode::BAD_REQUEST, format!("[ub] __backend/aliases: {e}"));
+            }
+        }
+    }
+    if !dbc.service_keys.is_empty() {
+        cfg.service_keys = dbc.service_keys.clone();
+        if !dbc.service_allow.is_empty() {
+            cfg.service_allow = dbc.service_allow.clone();
+        }
+    }
+    let identity = match db_policy.as_ref() {
+        Some(f) => f.identity.clone(),
+        None => s.hot().await.policy.identity.clone(),
+    };
     bridge_local_env(&cfg);
     match audit::parse_level(&cfg.audit_level) {
         Ok(level) => audit::set_level(level),
@@ -2271,6 +2355,11 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // Hot snapshot may hold pre-reload Arcs (policy/db/auth/service/local):
     // expire it so the next request refetches. ≤1s staleness otherwise.
     s.hot_cache.invalidate().await;
+    // All failure points passed: adopt the DB policy if present (file watch
+    // off; the DB section owns the policy until the next reload).
+    if let Some(f) = db_policy {
+        s.policy.adopt(f).await;
+    }
     // Drain coalesced PATCHes into the fresh driver before serving it.
     // Keys are dotted (db.collection) since writes; split on the first
     // dot against the FRESH map (unknown prefix = default + full key,
