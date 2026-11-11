@@ -39,6 +39,9 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio-stream = { workspace = true }
 mime = { workspace = true }
 
+[dev-dependencies]
+async-trait = { workspace = true }
+
 # jemalloc only where it builds (Linux/macOS): MSVC is unsupported
 # upstream. Windows keeps the system allocator.
 [target.'cfg(not(windows))'.dependencies]

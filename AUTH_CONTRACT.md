@@ -43,6 +43,26 @@ Names that are not available (phases B/C) **fail fast at startup**, never bypass
    and surface in `Claims.extra` on verify — the fuel for `claim:` and
    `fields:` policy rules. One read at issuance, zero per request.
    Reserved `provider`/`email` markers always win on collision.
+5. External providers (firebase/oidc/github, verifier-only) carry two
+   claim sources, both feeding `claim:` rules through `Claims.extra`:
+
+   - **IDP custom claims** (blessed, zero-backend-config): whatever the
+     identity provider minted (e.g. Firebase Admin SDK custom claims
+     `role`/`status`) passes through on verify. The IDP is the source
+     of truth; values change when the token is re-issued (Firebase ID
+     tokens ~1h, client-driven refresh).
+   - **Server-side enrichment** (db-driven, preferred for dynamic
+     fields): after verify, the allowlisted `[identity].attrs` fields
+     are read from the caller's user doc (`[identity].users_collection`,
+     keyed by the namespaced uid) and override their token counterparts
+     — doc wins per field, server-minted. No doc / missing field =
+     token claim stands; no auto-provisioning (create docs via the API
+     as admin). A 60s TTL cache bounds this at one user-doc read per
+     minute per user; doc edits apply within that window, no token
+     re-issue. `local` tokens skip enrichment (the issuer already
+     minted attrs; local docs are keyed by the raw login name). Reload
+     flushes the cache (new allowlist). Best-effort: a db hiccup never
+     fails a verified request.
 
 ## 4. Declarative mapping file (`--auth ./custom.toml`)
 
