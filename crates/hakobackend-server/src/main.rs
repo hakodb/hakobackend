@@ -534,6 +534,10 @@ struct PolicyHot {
     /// policy was adopted (`__backend/policy`): the doc owns the policy and
     /// `/api/admin/reload` re-reads it (file edits are then ignored).
     path: std::sync::RwLock<Option<String>>,
+    /// True while a `__backend/policy` doc owns the policy (file watch
+    /// off). Distinguishes DB-ownership from plain dev-open (both have
+    /// `path = None`) so a section removal can hand the policy back.
+    db_owned: std::sync::atomic::AtomicBool,
     cached: tokio::sync::RwLock<(Option<SystemTime>, Arc<PolicyFile>)>,
 }
 
@@ -555,6 +559,7 @@ impl PolicyHot {
                 let m = mtime(&p);
                 Self {
                     path: std::sync::RwLock::new(Some(p)),
+                    db_owned: std::sync::atomic::AtomicBool::new(false),
                     cached: tokio::sync::RwLock::new((m, Arc::new(file))),
                 }
             }
@@ -565,6 +570,7 @@ impl PolicyHot {
     fn open_dev() -> Self {
         Self {
             path: std::sync::RwLock::new(None),
+            db_owned: std::sync::atomic::AtomicBool::new(false),
             cached: tokio::sync::RwLock::new((None, Arc::new(PolicyFile::open()))),
         }
     }
@@ -573,6 +579,7 @@ impl PolicyHot {
     fn from_policy(file: PolicyFile) -> Self {
         Self {
             path: std::sync::RwLock::new(None),
+            db_owned: std::sync::atomic::AtomicBool::new(true),
             cached: tokio::sync::RwLock::new((None, Arc::new(file))),
         }
     }
@@ -580,7 +587,34 @@ impl PolicyHot {
     /// Adopt a DB policy at reload: disable the file watch, swap the cache.
     async fn adopt(&self, file: PolicyFile) {
         *self.path.write().unwrap() = None;
+        self.db_owned.store(true, std::sync::atomic::Ordering::Relaxed);
         *self.cached.write().await = (None, Arc::new(file));
+    }
+
+    /// Currently owned by a `__backend/policy` doc?
+    fn is_db_owned(&self) -> bool {
+        self.db_owned.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hand the policy back to the file after the DB section was removed
+    /// (DELETE + reload). `None` = no policy file configured: dev-open mode
+    /// (loud WARN, same discipline as boot without a policy file).
+    async fn restore_file(&self, path: Option<String>) {
+        self.db_owned.store(false, std::sync::atomic::Ordering::Relaxed);
+        *self.path.write().unwrap() = path.clone();
+        match path {
+            Some(p) => {
+                let file = PolicyFile::load(&p).unwrap_or_else(|e| {
+                    eprintln!("[ub] WARN: {e}; using open policy temporarily");
+                    PolicyFile::open()
+                });
+                *self.cached.write().await = (mtime(&p), Arc::new(file));
+            }
+            None => {
+                eprintln!("[ub] WARN: DB policy removed and no policy file configured — all endpoints OPEN (dev mode)");
+                *self.cached.write().await = (None, Arc::new(PolicyFile::open()));
+            }
+        }
     }
 
     async fn get(&self) -> Arc<PolicyFile> {
@@ -2479,10 +2513,14 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // expire it so the next request refetches. ≤1s staleness otherwise.
     s.hot_cache.invalidate().await;
     // All failure points passed: adopt the DB policy if present (file watch
-    // off; the DB section owns the policy until the next reload).
+    // off; the DB section owns the policy until the next reload). Section
+    // removed while DB-owned = hand the policy back to the file.
     if let Some(f) = db_policy {
         s.policy.adopt(f).await;
         audit::policy_reload("__backend/policy", true);
+    } else if s.policy.is_db_owned() {
+        s.policy.restore_file(cfg.rules.clone()).await;
+        audit::policy_reload("file (db section removed)", true);
     }
     // Loud trace of which config sections came from the DB this round.
     let mut from_db: Vec<&str> = Vec::new();
@@ -7921,6 +7959,19 @@ mod tests {
         let hot = PolicyHot::from_policy(PolicyFile::load_str("[defaults]\nread = \"deny\"\nwrite = \"deny\"\n").unwrap());
         hot.adopt(PolicyFile::load_str("[collections.posts]\nread = \"auth\"\n").unwrap()).await;
         assert!(hot.get().await.collections.contains_key("posts"));
+        assert!(hot.is_db_owned());
+        // Section removed: file takes over again (watch restored); no file
+        // configured at all = dev-open with a loud WARN.
+        let dir = std::env::temp_dir().join(format!("hakobackend_bcfg_rs_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("p.toml");
+        std::fs::write(&pol, "[collections.anchors]\nread = \"auth\"\n").unwrap();
+        hot.restore_file(Some(pol.to_string_lossy().into_owned())).await;
+        assert!(!hot.is_db_owned());
+        assert!(hot.get().await.collections.contains_key("anchors"));
+        hot.restore_file(None).await;
+        assert!(!hot.is_db_owned());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }
