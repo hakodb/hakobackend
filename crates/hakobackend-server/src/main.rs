@@ -801,7 +801,7 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         .route("/api/traverse-search/{*path}", post(traverse_search))
         .route("/api/edge-index", post(edge_index_create))
         .route("/api/admin/reload", post(reload))
-        .route("/api/admin/backend/{section}", get(admin_backend_get).put(admin_backend_put))
+        .route("/api/admin/backend/{section}", get(admin_backend_get).put(admin_backend_put).delete(admin_backend_delete))
         .route("/api/admin/config", get(admin_config))
         .route("/api/admin/restore-available", get(restore_available_list))
         .route("/api/admin/restore", post(restore_doc))
@@ -983,6 +983,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         Some(t) => match PolicyFile::load_str(t) {
             Ok(f) => {
                 println!("[ub] policy source: __backend/policy (file watch disabled)");
+                audit::policy_reload("__backend/policy", true);
                 Arc::new(PolicyHot::from_policy(f))
             }
             // Fail-closed boot: malformed DB policy = fall back to the file.
@@ -2285,17 +2286,26 @@ const BACKEND_SECTIONS: [&str; 3] = ["policy", "aliases", "service"];
 async fn admin_backend_get(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
     axum::extract::Path(section): axum::extract::Path<String>,
 ) -> Response {
+    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     if !BACKEND_SECTIONS.contains(&section.as_str()) {
         return err(StatusCode::BAD_REQUEST, format!("unknown section (one of {BACKEND_SECTIONS:?})"));
     }
     if !is_admin(auth.as_ref(), &s.admin_uids) {
+        audit::backend_cfg(&admin, &ip, "read", &section, false, "forbidden");
         return forbidden();
     }
     let db = s.hot().await.db.clone();
     match db.get(dbconf::COLL, &section).await {
-        Ok(Some(doc)) => Json(serde_json::Value::Object(doc.data.into_iter().collect())).into_response(),
+        Ok(Some(doc)) => {
+            // Sections carry server config (service keys included): reads
+            // are audited too, same trust level as reading the config file.
+            audit::backend_cfg(&admin, &ip, "read", &section, true, "served");
+            Json(serde_json::Value::Object(doc.data.into_iter().collect())).into_response()
+        }
         Ok(None) => err(StatusCode::NOT_FOUND, "section not set"),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -2304,13 +2314,17 @@ async fn admin_backend_get(
 async fn admin_backend_put(
     State(s): State<AppState>,
     Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
     axum::extract::Path(section): axum::extract::Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
     if !BACKEND_SECTIONS.contains(&section.as_str()) {
         return err(StatusCode::BAD_REQUEST, format!("unknown section (one of {BACKEND_SECTIONS:?})"));
     }
     if !is_admin(auth.as_ref(), &s.admin_uids) {
+        audit::backend_cfg(&admin, &ip, "write", &section, false, "forbidden");
         return forbidden();
     }
     // Validate at write time: a bad section must be rejected here, not
@@ -2342,6 +2356,7 @@ async fn admin_backend_put(
         _ => unreachable!(),
     };
     if let Err(e) = outcome {
+        audit::backend_cfg(&admin, &ip, "write", &section, false, "rejected");
         return err(StatusCode::BAD_REQUEST, e);
     }
     let db = s.hot().await.db.clone();
@@ -2352,7 +2367,36 @@ async fn admin_backend_put(
     if let Err(e) = db.set(dbconf::COLL, &section, doc, false).await {
         return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
     }
+    audit::backend_cfg(&admin, &ip, "write", &section, true, "stored");
     Json(serde_json::json!({ "stored": section, "apply": "POST /api/admin/reload" })).into_response()
+}
+
+/// Remove a section: the next reload drops it and the config file's value
+/// for that section takes over again (the rollback path for DB config).
+async fn admin_backend_delete(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    headers: HeaderMap,
+    axum::extract::Path(section): axum::extract::Path<String>,
+) -> Response {
+    let admin = auth.as_ref().map(|a| a.uid.clone()).unwrap_or_else(|| "-".into());
+    let ip = audit_ip(&headers, s.limits.trust_proxy);
+    if !BACKEND_SECTIONS.contains(&section.as_str()) {
+        return err(StatusCode::BAD_REQUEST, format!("unknown section (one of {BACKEND_SECTIONS:?})"));
+    }
+    if !is_admin(auth.as_ref(), &s.admin_uids) {
+        audit::backend_cfg(&admin, &ip, "delete", &section, false, "forbidden");
+        return forbidden();
+    }
+    let db = s.hot().await.db.clone();
+    match db.delete(dbconf::COLL, &section).await {
+        Ok(Some(_)) => {
+            audit::backend_cfg(&admin, &ip, "delete", &section, true, "removed");
+            Json(serde_json::json!({ "removed": section, "apply": "POST /api/admin/reload" })).into_response()
+        }
+        Ok(None) => err(StatusCode::NOT_FOUND, "section not set"),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
 }
 
 /// Failure at any step = 400 and the old config is fully retained.
@@ -2438,6 +2482,21 @@ async fn reload(State(s): State<AppState>, Extension(auth): Extension<Option<Aut
     // off; the DB section owns the policy until the next reload).
     if let Some(f) = db_policy {
         s.policy.adopt(f).await;
+        audit::policy_reload("__backend/policy", true);
+    }
+    // Loud trace of which config sections came from the DB this round.
+    let mut from_db: Vec<&str> = Vec::new();
+    if dbc.policy_toml.is_some() {
+        from_db.push("policy");
+    }
+    if !dbc.aliases.is_empty() {
+        from_db.push("aliases");
+    }
+    if !dbc.service_keys.is_empty() {
+        from_db.push("service");
+    }
+    if !from_db.is_empty() {
+        eprintln!("[ub] reload: __backend sections applied: {}", from_db.join(", "));
     }
     // Drain coalesced PATCHes into the fresh driver before serving it.
     // Keys are dotted (db.collection) since writes; split on the first
@@ -7799,6 +7858,69 @@ mod tests {
         assert_eq!(a.data.get("u"), Some(&serde_json::json!(7)));
         assert_eq!(a.data.get("w"), Some(&serde_json::json!(9)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// __backend admin endpoints (issue #68): gate, validate, store, remove.
+    /// Handlers called directly (the auth middleware only threads the
+    /// Extension; the gate itself is `is_admin` in the handler).
+    #[tokio::test]
+    async fn backend_cfg_endpoints_gate_validate_store_delete() {
+        let (mut st, db) = rbw_state("[defaults]\nread = \"deny\"\nwrite = \"deny\"\n", "backendcfg").await;
+        st.admin_uids = Arc::new(vec!["local:root".into()]);
+        let admin = || Some(AuthContext { uid: "local:root".into(), extra: Default::default() });
+        let peer = || Some(AuthContext { uid: "local:peer".into(), extra: Default::default() });
+        let hdr = HeaderMap::new();
+        let pol_toml = "[defaults]\nread = \"deny\"\nwrite = \"deny\"\n";
+
+        // Non-admin rejected before anything touches the db.
+        let res = admin_backend_put(
+            State(st.clone()), Extension(peer()), hdr.clone(), axum::extract::Path("policy".into()),
+            Json(serde_json::json!({ "toml": pol_toml })),
+        ).await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        // Unknown section = 400 even for the admin.
+        let res = admin_backend_put(
+            State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("users".into()),
+            Json(serde_json::json!({ "toml": pol_toml })),
+        ).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        // Bad policy TOML → 400, nothing stored.
+        let res = admin_backend_put(
+            State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("policy".into()),
+            Json(serde_json::json!({ "toml": "nonsense =[" })),
+        ).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(matches!(db.get(dbconf::COLL, "policy").await, Ok(None) | Err(_)));
+        // Empty service keys → 400 (would silently disable the file keys).
+        let res = admin_backend_put(
+            State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("service".into()),
+            Json(serde_json::json!({ "keys": [] })),
+        ).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Valid policy stored (id stripped from the doc data).
+        let res = admin_backend_put(
+            State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("policy".into()),
+            Json(serde_json::json!({ "id": "policy", "toml": pol_toml })),
+        ).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let doc = db.get(dbconf::COLL, "policy").await.unwrap().unwrap();
+        assert!(doc.data.get("toml").unwrap().is_string());
+
+        // Round-trip read, then removal (rollback path), then 404s.
+        let res = admin_backend_get(State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("policy".into())).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = admin_backend_delete(State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("policy".into())).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = admin_backend_delete(State(st.clone()), Extension(admin()), hdr.clone(), axum::extract::Path("policy".into())).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = admin_backend_get(State(st.clone()), Extension(admin()), hdr, axum::extract::Path("policy".into())).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Adopt: DB policy replaces the cache and the file watch stays off.
+        let hot = PolicyHot::from_policy(PolicyFile::load_str("[defaults]\nread = \"deny\"\nwrite = \"deny\"\n").unwrap());
+        hot.adopt(PolicyFile::load_str("[collections.posts]\nread = \"auth\"\n").unwrap()).await;
+        assert!(hot.get().await.collections.contains_key("posts"));
     }
 
 }

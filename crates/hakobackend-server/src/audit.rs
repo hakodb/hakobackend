@@ -169,6 +169,22 @@ pub fn policy_reload(path: &str, ok: bool) {
         &[("path", path.into()), ("ok", ok.to_string())],
     );
 }
+/// `__backend` config section reads/writes/removals (admin API): the DB now
+/// carries server config, so every touch gets a trail — including reads
+/// (the docs hold secrets) and rejected attempts.
+pub fn backend_cfg(admin: &str, ip: &str, op: &str, section: &str, ok: bool, detail: &str) {
+    emit(
+        "admin.backend",
+        &[
+            ("admin", admin.into()),
+            ("ip", ip.into()),
+            ("op", op.into()),
+            ("section", section.into()),
+            ("ok", ok.to_string()),
+            ("detail", detail.into()),
+        ],
+    );
+}
 
 #[cfg(test)]
 mod tests {
