@@ -32,7 +32,8 @@ access_ttl_secs = 600
 # __backend, or via the admin endpoint (the `__` prefix is reserved on the
 # data plane):
 #
-#   GET /api/admin/backend/{policy|aliases|service}
-#   PUT /api/admin/backend/{policy|aliases|service}   (validated, admin-only)
+#   GET    /api/admin/backend/{policy|aliases|service}
+#   PUT    /api/admin/backend/{policy|aliases|service}   (validated, admin-only)
+#   DELETE /api/admin/backend/{section}                  (rollback: file takes over on next reload)
 #
 # then POST /api/admin/reload — the DB sections take over.
