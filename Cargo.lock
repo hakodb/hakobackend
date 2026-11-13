@@ -1513,12 +1513,11 @@ dependencies = [
 
 [[package]]
 name = "hakodb"
-version = "0.20.1"
+version = "0.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8949a7af396d83df6fbcbd0d22524017dbe0dbc6ee14cd5f83a3374640384389"
+checksum = "ffc9ded7042bf052275bb4789f7dcc169146f5a0638628f42c81cdf0f31d5b11"
 dependencies = [
  "bincode",
- "cbindgen",
  "chacha20poly1305",
  "crc32fast",
  "crossbeam-channel",
@@ -3701,7 +3700,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
