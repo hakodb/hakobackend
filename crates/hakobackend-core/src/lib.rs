@@ -545,6 +545,52 @@ pub trait Database: Send + Sync {
         let _ = (collection, spec);
         Err(AppError::BadRequest(format!("driver {} has no vector-index support", self.capabilities().driver)))
     }
+    /// Hybrid retrieval (#193): FTS (sparse) + KNN (dense) fused with
+    /// RRF; rows fused-score desc. Default: reject clearly (needs both
+    /// an FTS and a vector index; no gateway fallback exists).
+    async fn hybrid_search(
+        &self,
+        collection: &str,
+        text_field: &str,
+        text_query: &str,
+        vec_field: &str,
+        query: &[f32],
+        k: usize,
+        rrf_k: usize,
+    ) -> Result<Vec<HybridDoc>, AppError> {
+        let _ = (collection, text_field, text_query, vec_field, query, k, rrf_k);
+        Err(AppError::BadRequest(format!("driver {} has no hybrid-search support", self.capabilities().driver)))
+    }
+    /// Personalized PageRank (#196): teleport mass `1 - damping` on the
+    /// seed set (empty = classic PageRank); damping 0 = engine default
+    /// 0.85; top 0 = all nodes. Default: reject clearly.
+    async fn graph_pagerank(
+        &self,
+        collection: &str,
+        seeds: &[String],
+        direction: TraverseDirection,
+        edge: Option<&str>,
+        via_edge: Option<&str>,
+        damping: f64,
+        top: usize,
+    ) -> Result<Vec<PagerankRow>, AppError> {
+        let _ = (collection, seeds, direction, edge, via_edge, damping, top);
+        Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
+    }
+    /// Seed-scoped N-hop subgraph (#198): `{nodes, edges}` around one
+    /// seed, same shape as a graph export. Default: reject clearly.
+    async fn subgraph(
+        &self,
+        collection: &str,
+        seed_id: &str,
+        direction: TraverseDirection,
+        edge: Option<&str>,
+        via_edge: Option<&str>,
+        max_depth: usize,
+    ) -> Result<serde_json::Value, AppError> {
+        let _ = (collection, seed_id, direction, edge, via_edge, max_depth);
+        Err(AppError::BadRequest(format!("driver {} has no graph support", self.capabilities().driver)))
+    }
     /// KNN search, nearest-first. Default: gateway exact scan (uniform
     /// across drivers — same rule as the sum/avg list-and-reduce
     /// defaults); native drivers override (hako: index/ANN, no doc
@@ -893,6 +939,8 @@ pub struct VectorIndexSpec {
     pub field: String,
     pub dim: u32,
     pub metric: VectorMetric,
+    /// Popcount stage-1 (#190); false = int8 stage-1 (engine default).
+    pub binary_stage1: bool,
 }
 
 /// One KNN hit: doc id, exact metric distance (lower is nearer), and
@@ -902,6 +950,22 @@ pub struct ScoredDoc {
     pub id: String,
     pub score: f64,
     pub doc: Doc,
+}
+
+/// One hybrid-retrieval row (#193): fused RRF score (HIGHER is better,
+/// unlike ScoredDoc's distance) and the doc.
+#[derive(Debug, Clone, Serialize)]
+pub struct HybridDoc {
+    pub id: String,
+    pub score: f64,
+    pub doc: Doc,
+}
+
+/// One PageRank row (#196): node as "col/id", score desc then node asc.
+#[derive(Debug, Clone, Serialize)]
+pub struct PagerankRow {
+    pub node: String,
+    pub score: f64,
 }
 
 // --- Graph traversal (uniform contract, native-only serving) ---
@@ -1841,7 +1905,7 @@ pub mod conformance {
         assert!((l2[1].score - 0.25).abs() < 1e-9, "{}", l2[1].score);
         assert_eq!(l2[2].id, "b");
         assert!(db
-            .create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine })
+            .create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine, binary_stage1: false })
             .await
             .is_err());
     }

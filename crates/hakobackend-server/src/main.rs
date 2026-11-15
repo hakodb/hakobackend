@@ -830,10 +830,15 @@ fn build_router(state: AppState, allowed_hosts: Vec<String>, compress_cfg: bool)
         // them exactly like direct calls.
         .route("/api/vector-index", post(vector_index_create))
         .route("/api/vector-search/{*path}", post(vector_search))
+        // Hybrid retrieval (#193): FTS + KNN fused with RRF; native-only.
+        .route("/api/hybrid-search/{*path}", post(hybrid_search))
         // Graph BFS (issue #53): same static-path rule as vector.
         .route("/api/traverse-index", post(traverse_index_create))
         .route("/api/traverse-search/{*path}", post(traverse_search))
         .route("/api/edge-index", post(edge_index_create))
+        // GraphRAG primitives (#196/#198): native-only, read-side.
+        .route("/api/graph-pagerank/{*path}", post(graph_pagerank))
+        .route("/api/subgraph/{*path}", post(subgraph))
         .route("/api/admin/reload", post(reload))
         .route("/api/admin/backend/{section}", get(admin_backend_get).put(admin_backend_put).delete(admin_backend_delete))
         .route("/api/admin/config", get(admin_config))
@@ -4698,6 +4703,9 @@ struct VectorIndexBody {
     dim: u32,
     #[serde(default)]
     metric: Option<String>,
+    /// Popcount stage-1 (#190); omitted = int8 stage-1.
+    #[serde(default)]
+    binary_stage1: bool,
 }
 
 fn parse_vector_metric(raw: Option<&str>) -> Result<hakobackend_core::VectorMetric, Response> {
@@ -4759,7 +4767,7 @@ async fn vector_index_create(
     }
     let stored = stored(&collection);
     let _ = dbh.ensure_collection(&stored).await;
-    let spec = hakobackend_core::VectorIndexSpec { field: body.field, dim: body.dim, metric };
+    let spec = hakobackend_core::VectorIndexSpec { field: body.field, dim: body.dim, metric, binary_stage1: body.binary_stage1 };
     match dbh.create_vector_index(&stored, &spec).await {
         Ok(info) => Json(serde_json::json!({ "success": true, "index": info })).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
@@ -5014,6 +5022,203 @@ async fn traverse_search(
     let stored = stored(&collection);
     match dbh.traverse_search(&stored, &body.start_id, direction, body.edge.as_deref(), body.via.as_deref(), body.weight.as_deref(), max_depth, k).await {
         Ok(hits) => Json(serde_json::json!(hits)).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HybridSearchBody {
+    text_field: String,
+    text_query: String,
+    vec_field: String,
+    query: Vec<f64>,
+    #[serde(default)]
+    k: Option<usize>,
+    /// 0 = engine default 60.
+    #[serde(default)]
+    rrf_k: Option<usize>,
+}
+
+async fn hybrid_search(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<HybridSearchBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "hybrid-search needs a collection path");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if body.text_field.is_empty() || body.vec_field.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "text_field and vec_field required");
+    }
+    if body.text_query.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "text_query required");
+    }
+    if body.query.is_empty() || body.query.iter().any(|f| !f.is_finite()) {
+        return err(StatusCode::BAD_REQUEST, "query needs finite floats");
+    }
+    let k = body.k.unwrap_or(10);
+    if k == 0 || k > hakobackend_core::MAX_VECTOR_K {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("k out of range 1..={}", hakobackend_core::MAX_VECTOR_K),
+        );
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    let query: Vec<f32> = body.query.iter().map(|f| *f as f32).collect();
+    match dbh.hybrid_search(&stored, &body.text_field, &body.text_query, &body.vec_field, &query, k, body.rrf_k.unwrap_or(0)).await {
+        Ok(hits) => Json(serde_json::json!(hits)).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GraphPagerankBody {
+    #[serde(default)]
+    seeds: Option<Vec<String>>,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    edge: Option<String>,
+    #[serde(default)]
+    via: Option<String>,
+    /// 0 = engine default 0.85.
+    #[serde(default)]
+    damping: Option<f64>,
+    /// 0 = all nodes.
+    #[serde(default)]
+    top: Option<usize>,
+}
+
+async fn graph_pagerank(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<GraphPagerankBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "graph-pagerank needs a collection path");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if let Some(d) = body.damping {
+        if !(0.0..=1.0).contains(&d) {
+            return err(StatusCode::BAD_REQUEST, format!("damping out of range [0, 1]: {d}"));
+        }
+    }
+    let direction = match parse_traverse_direction(body.direction.as_deref()) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    let seeds = body.seeds.unwrap_or_default();
+    match dbh.graph_pagerank(&stored, &seeds, direction, body.edge.as_deref(), body.via.as_deref(), body.damping.unwrap_or(0.0), body.top.unwrap_or(0)).await {
+        Ok(rows) => Json(serde_json::json!(rows)).into_response(),
+        Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SubgraphBody {
+    seed_id: String,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(default)]
+    edge: Option<String>,
+    /// Edge collection hop (#140-7).
+    #[serde(default)]
+    via: Option<String>,
+    #[serde(default)]
+    max_depth: Option<usize>,
+}
+
+async fn subgraph(
+    State(s): State<AppState>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(path): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+    Json(body): Json<SubgraphBody>,
+) -> impl IntoResponse {
+    let collection = path.trim_matches('/').to_string();
+    if collection.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "subgraph needs a collection path");
+    }
+    if denied_internal(&collection).is_some() {
+        return err(StatusCode::FORBIDDEN, "reserved __ prefix");
+    }
+    if let Some(r) = valid_names(&collection, None) {
+        return r;
+    }
+    if body.seed_id.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "seed_id required");
+    }
+    let direction = match parse_traverse_direction(body.direction.as_deref()) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let max_depth = body.max_depth.unwrap_or(10);
+    if max_depth == 0 || max_depth > hakobackend_core::MAX_TRAVERSE_DEPTH {
+        return err(
+            StatusCode::BAD_REQUEST,
+            format!("max_depth out of range 1..={}", hakobackend_core::MAX_TRAVERSE_DEPTH),
+        );
+    }
+    let dbname = match resolve_db_name(&q) {
+        Ok(d) => d,
+        Err(r) => return r,
+    };
+    let hot = s.hot().await;
+    let dbh = match hot.db_for(&dbname) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let pol = dotted(&dbname, &collection);
+    if !hot.policy.allow(auth.as_ref(), &pol, Method::List, None) {
+        return forbidden();
+    }
+    let stored = stored(&collection);
+    match dbh.subgraph(&stored, &body.seed_id, direction, body.edge.as_deref(), body.via.as_deref(), max_depth).await {
+        Ok(value) => Json(value).into_response(),
         Err(e) => err_code(StatusCode::from_u16(e.status_code()).unwrap(), e.to_string(), e.code()),
     }
 }
@@ -6524,6 +6729,121 @@ mod tests {
         assert!((warr[0]["cost"].as_f64().unwrap() - 1.0).abs() < 1e-9);
         assert_eq!(warr[1]["id"], "c");
         assert!((warr[1]["cost"].as_f64().unwrap() - 2.0).abs() < 1e-9, "cheapest a-b-c: {warr:?}");
+    }
+
+    /// GraphRAG HTTP loop (hako native): pagerank over the ref chain,
+    /// seed-scoped subgraph, hybrid FTS+KNN. Settle polling mirrors the
+    /// traverse loop (429-tolerant).
+    #[tokio::test]
+    async fn graphrag_http_native() {
+        use tower::ServiceExt;
+        async fn call(
+            app: Router,
+            method: &str,
+            uri: &str,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, Vec<u8>) {
+            let b = Request::builder().method(method).uri(uri);
+            let req = match body {
+                Some(v) => b
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(v.to_string()))
+                    .unwrap(),
+                None => b.body(axum::body::Body::empty()).unwrap(),
+            };
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            (status, body)
+        }
+        let dir = std::env::temp_dir().join(format!("hakobackend_rbw_grag_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pol = dir.join("policy.toml");
+        std::fs::write(&pol, "[defaults]\nread = \"public\"\nwrite = \"public\"\n").unwrap();
+        let raw: Arc<dyn Database> =
+            Arc::new(HakoDb::open(dir.join("h.ub").to_string_lossy().as_ref()).unwrap());
+        let policy_hot = Arc::new(PolicyHot::new(Some(pol.to_string_lossy().into_owned())));
+        let chain_root: Arc<AuthChain> =
+            Arc::new(open_chain(&AuthSpec::Off, None, None).expect("off chain builds"));
+        let dbs: HashMap<String, Arc<dyn Database>> =
+            HashMap::from([("default".to_string(), raw.clone())]);
+        let st = finish_state(raw.clone(), dbs, policy_hot, chain_root, dir).await;
+        let app = build_router(st.clone(), vec![], false);
+        let (s, b) = call(app.clone(), "POST", "/api/traverse-index",
+            Some(serde_json::json!({"collection": "g"}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        for (id, tgt) in [("a", "g/b"), ("b", "g/c")] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/g/{id}"),
+                Some(serde_json::json!({"link": {"__ref__": tgt}}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let (s, _) = call(app.clone(), "PUT", "/api/collections/g/c",
+            Some(serde_json::json!({"v": 1}))).await;
+        assert_eq!(s, StatusCode::OK);
+        // Pagerank (classic): settles once the graph backfills.
+        let rank = || call(app.clone(), "POST", "/api/graph-pagerank/g", Some(serde_json::json!({})));
+        let mut rows = serde_json::Value::Null;
+        for _ in 0..90 {
+            let (s, b) = rank().await;
+            if s == StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            rows = serde_json::from_slice(&b).unwrap();
+            if rows.as_array().is_some_and(|a| a.len() == 3) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let arr = rows.as_array().expect("3 ranked nodes after settle");
+        assert!(arr[0]["score"].as_f64().unwrap() >= arr[2]["score"].as_f64().unwrap());
+        assert!(arr.iter().any(|r| r["node"] == "g/c"));
+        // Subgraph from the head: both hops present.
+        let (s, b) = call(app.clone(), "POST", "/api/subgraph/g",
+            Some(serde_json::json!({"seed_id": "a", "max_depth": 2}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let sg: serde_json::Value = serde_json::from_slice(&b).unwrap();
+        assert_eq!(sg["nodes"].as_array().map(|a| a.len()), Some(3), "{sg}");
+        // Hybrid: FTS (sparse) + KNN (dense) over one collection.
+        let (s, b) = call(app.clone(), "POST", "/api/indexes",
+            Some(serde_json::json!({"collection": "docs", "fields": ["title"], "kind": "fts"}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let (s, b) = call(app.clone(), "POST", "/api/vector-index",
+            Some(serde_json::json!({"collection": "docs", "field": "emb", "dim": 2}))).await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        for (id, title, emb) in [
+            ("d1", "red apple", "[1.0,0.0]"),
+            ("d2", "blue sky", "[0.0,1.0]"),
+            ("d3", "red sky", "[0.9,0.1]"),
+        ] {
+            let (s, _) = call(app.clone(), "PUT", &format!("/api/collections/docs/{id}"),
+                Some(serde_json::json!({"title": title, "emb": serde_json::from_str::<serde_json::Value>(emb).unwrap()}))).await;
+            assert_eq!(s, StatusCode::OK);
+        }
+        let hyb = || call(app.clone(), "POST", "/api/hybrid-search/docs",
+            Some(serde_json::json!({"text_field": "title", "text_query": "red", "vec_field": "emb", "query": [1.0, 0.0], "k": 2})));
+        let mut hits = serde_json::Value::Null;
+        for _ in 0..90 {
+            let (s, b) = hyb().await;
+            if s == StatusCode::TOO_MANY_REQUESTS {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+            assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+            hits = serde_json::from_slice(&b).unwrap();
+            if hits.as_array().is_some_and(|a| !a.is_empty()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let harr = hits.as_array().expect("hybrid hits after settle");
+        assert!(harr.len() <= 2);
+        assert!(harr.iter().all(|h| h["id"] != "d2"), "red-dominant fusion: {harr:?}");
     }
 
     /// Graph on a non-hako driver: create + search both reject clearly

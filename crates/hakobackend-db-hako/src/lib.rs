@@ -250,8 +250,36 @@ impl HakoDb {
         self.unique.lock().unwrap().get(collection).cloned().unwrap_or_default()
     }
 
-    fn to_doc(id: String, hako: hakodb::document::hako_doc::HakoDoc) -> Doc {
-        // HakoDoc::to_json() -> serde_json::Value::Object; take its map directly.
+    /// TraverseSpec for the graph-analytics endpoints: hops capped by
+    /// `max_depth` at the engine, no predicates/projections (same level
+    /// of exposure as traverse_search). PageRank ignores depth/limit.
+    fn graph_spec(
+        direction: hakobackend_core::TraverseDirection,
+        edge: Option<&str>,
+        via_edge: Option<&str>,
+        max_depth: usize,
+    ) -> Result<hakodb::index::traverse::TraverseSpec, AppError> {
+        let dir = match direction {
+            hakobackend_core::TraverseDirection::Outgoing => hakodb::index::traverse::TraverseDir::Outgoing,
+            hakobackend_core::TraverseDirection::Incoming => hakodb::index::traverse::TraverseDir::Incoming,
+            hakobackend_core::TraverseDirection::Both => hakodb::index::traverse::TraverseDir::Both,
+        };
+        Ok(hakodb::index::traverse::TraverseSpec {
+            direction: dir,
+            edge_field: edge.map(str::to_string),
+            max_depth,
+            limit: hakobackend_core::MAX_TRAVERSE_K,
+            via_edge: via_edge.map(str::to_string),
+            weight_field: None,
+            node_match: None,
+            edge_type: None,
+            edge_match: None,
+            include_path: false,
+            include_via: false,
+        })
+    }
+
+    fn to_doc(id: String, hako: hakodb::document::hako_doc::HakoDoc) -> Doc {        // HakoDoc::to_json() -> serde_json::Value::Object; take its map directly.
         let data = match hako.to_json() {
             serde_json::Value::Object(m) => m.into_iter().collect(),
             other => {
@@ -1014,8 +1042,7 @@ impl Database for HakoDb {
         .map_err(|e| AppError::Internal(e.to_string()))?
     }
 
-    async fn create_vector_index(&self, collection: &str, spec: &hakobackend_core::VectorIndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {
-        // Engine range first (400, not 500): dim is operator input.
+    async fn create_vector_index(&self, collection: &str, spec: &hakobackend_core::VectorIndexSpec) -> Result<hakobackend_core::IndexInfo, AppError> {        // Engine range first (400, not 500): dim is operator input.
         if spec.dim == 0 || spec.dim > 4096 {
             return Err(AppError::BadRequest(format!("vector dim {} out of range 1..=4096", spec.dim)));
         }
@@ -1029,8 +1056,14 @@ impl Database for HakoDb {
         let db = self.inner.clone();
         let (c, f) = (collection.to_string(), spec.field.clone());
         let (dim, m) = (spec.dim, metric);
+        let params = hakodb::index::vector::HnswParams {
+            m: None,
+            ef_construction: None,
+            ef_search: None,
+            binary_stage1: spec.binary_stage1,
+        };
         tokio::task::spawn_blocking(move || {
-            db.create_vector_index(&c, &f, dim, m).map_err(|e| AppError::Internal(e.to_string()))
+            db.create_vector_index_with_params(&c, &f, dim, m, params).map_err(|e| AppError::Internal(e.to_string()))
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))??;
@@ -1090,6 +1123,96 @@ impl Database for HakoDb {
                     hakobackend_core::ScoredDoc { id: id.clone(), score, doc: Self::to_doc(id, doc) }
                 })
                 .collect())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn hybrid_search(
+        &self,
+        collection: &str,
+        text_field: &str,
+        text_query: &str,
+        vec_field: &str,
+        query: &[f32],
+        k: usize,
+        rrf_k: usize,
+    ) -> Result<Vec<hakobackend_core::HybridDoc>, AppError> {
+        // 0 rides the engine default, mirroring the FFI contract.
+        let rrf_k = if rrf_k == 0 { 60 } else { rrf_k };
+        let db = self.inner.clone();
+        let (c, tf, tq, vf) = (
+            collection.to_string(),
+            text_field.to_string(),
+            text_query.to_string(),
+            vec_field.to_string(),
+        );
+        let q = query.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let rows = db.hybrid_search(&c, &tf, &tq, &vf, &q, k, rrf_k).map_err(|e| {
+                let m = e.to_string();
+                if m.contains("must be") || m.contains("dim mismatch") {
+                    AppError::BadRequest(m)
+                } else {
+                    AppError::Internal(m)
+                }
+            })?;
+            Ok::<_, AppError>(rows
+                .into_iter()
+                .map(|(id, score, doc)| hakobackend_core::HybridDoc { id: id.clone(), score, doc: Self::to_doc(id, doc) })
+                .collect())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn graph_pagerank(
+        &self,
+        collection: &str,
+        seeds: &[String],
+        direction: hakobackend_core::TraverseDirection,
+        edge: Option<&str>,
+        via_edge: Option<&str>,
+        damping: f64,
+        top: usize,
+    ) -> Result<Vec<hakobackend_core::PagerankRow>, AppError> {
+        let spec = Self::graph_spec(direction, edge, via_edge, hakobackend_core::MAX_TRAVERSE_DEPTH)?;
+        // "col/id" seeds, like the FFI's seeds_json entries.
+        let seed_nodes: Vec<(String, String)> = seeds
+            .iter()
+            .filter_map(|s| s.split_once('/').map(|(c, id)| (c.to_string(), id.to_string())))
+            .collect();
+        // 0 rides the engine default, mirroring the FFI contract.
+        let damping = if damping == 0.0 { 0.85 } else { damping };
+        let db = self.inner.clone();
+        let c = collection.to_string();
+        let seeds_owned = seed_nodes.clone();
+        tokio::task::spawn_blocking(move || {
+            let rows = db.graph_pagerank(&c, &seeds_owned, &spec, damping, top).map_err(|e| AppError::Internal(e.to_string()))?;
+            Ok::<_, AppError>(rows
+                .into_iter()
+                .map(|((col, id), score)| hakobackend_core::PagerankRow { node: format!("{col}/{id}"), score })
+                .collect())
+        })
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    }
+
+    async fn subgraph(
+        &self,
+        collection: &str,
+        seed_id: &str,
+        direction: hakobackend_core::TraverseDirection,
+        edge: Option<&str>,
+        via_edge: Option<&str>,
+        max_depth: usize,
+    ) -> Result<serde_json::Value, AppError> {
+        let spec = Self::graph_spec(direction, edge, via_edge, max_depth)?;
+        let db = self.inner.clone();
+        let (c, s) = (collection.to_string(), seed_id.to_string());
+        tokio::task::spawn_blocking(move || {
+            let json = db.subgraph_json(&c, &s, &spec).map_err(|e| AppError::Internal(e.to_string()))?;
+            serde_json::from_str(&json).map_err(|e| AppError::Internal(e.to_string()))
         })
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -1479,7 +1602,7 @@ mod tests {
         // backfill picks up Binary-encoded docs, earlier array docs stay
         // unindexed (documented: create the index before writing, or
         // rewrite). Write after creating so conversion applies.
-        db.create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine })
+        db.create_vector_index("pts", &VectorIndexSpec { field: "emb".into(), dim: 2, metric: VectorMetric::Cosine, binary_stage1: false })
             .await
             .unwrap();
         db.set("pts", "a", doc("a", serde_json::json!([1.0, 0.0])), false).await.unwrap();
@@ -1501,7 +1624,7 @@ mod tests {
         let bad = db.vector_search("pts", "emb", &[1.0, 0.5, 0.0], 2, VectorMetric::Cosine).await;
         assert!(matches!(bad, Err(hakobackend_core::AppError::BadRequest(_))));
         // Second vector field coexists; listing shows both as kind vector.
-        db.create_vector_index("pts", &VectorIndexSpec { field: "emb2".into(), dim: 2, metric: VectorMetric::L2 })
+        db.create_vector_index("pts", &VectorIndexSpec { field: "emb2".into(), dim: 2, metric: VectorMetric::L2, binary_stage1: false })
             .await
             .unwrap();
         let listed = db.list_indexes("pts").await.unwrap();
